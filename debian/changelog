@@ -1,0 +1,48 @@
+passt (0.0~git20230309.7c7625d-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20230309.7c7625d
+  * Fix cross-build and armhf build reproducibility by using the
+    target declared by the compiler to build seccomp profiles, not
+    the current machine type
+  * Fix build on sh4 by correcting the AUDIT_ARCH target name
+  * Fix signedness warning reported on 32-bit architectures
+  * Terminate gracefully if open files quota is reached
+  * Fix inbound TCP Maximum Segment Size used to queue data to tap
+    interface, in pasta mode
+  * Fix accidental gap in slirp4netns compatibility by introducing
+    trivial options to actually set outbound interfaces and addresses
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Thu, 09 Mar 2023 09:29:19 +0100
+
+passt (0.0~git20230227.c538ee8-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20230227.c538ee8
+  * Most rules from the AppArmor profile are now divided into two
+    abstractions for passt(1) and pasta(1), and the usr.bin.passt
+    profile sources them. This makes it easier for frameworks
+    such as libvirt to source the required parts in subprofiles
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Mon, 27 Feb 2023 23:29:43 +0100
+
+passt (0.0~git20230216.4663ccc-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20230216.4663ccc
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 17 Feb 2023 12:48:47 +0100
+
+passt (0.0~git20221116.ace074c-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20221116.ace074c. Most relevant
+    change: AppArmor profile actually covers both pasta(1) and
+    passt(1)
+  * Fix Vcs-Browser and Vcs-Git links in debian/control
+  * Build with -DVERSION corresponding to current package version
+  * Move copy of AppArmor profile to debian/passt.install
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 16 Nov 2022 22:42:50 +0100
+
+passt (0.0~git20221104.e308018-1) unstable; urgency=medium
+
+  * Initial release. Closes: #1010498
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 04 Nov 2022 18:26:31 +0100

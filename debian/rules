@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+override_dh_auto_install:
+	dh_auto_install -- prefix=/usr
+	dh_apparmor --profile-name=usr.bin.passt -ppasst
+
+ifneq (,$(findstring amd64,$(DEB_BUILD_ARCH)))
+override_dh_link:
+	dh_link usr/share/man/man1/passt.1 usr/share/man/man1/passt.avx2.1
+	dh_link usr/share/man/man1/pasta.1 usr/share/man/man1/pasta.avx2.1
+endif
+
+%:
+	export VERSION="$(DEB_UPSTREAM_VERSION)"
+	dh $@
