@@ -3,7 +3,7 @@
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
 override_dh_auto_install:
-	dh_auto_install -- prefix=/usr
+	dh_auto_install -- prefix=/usr TARGET=$(DEB_BUILD_ARCH)
 	dh_apparmor --profile-name=usr.bin.passt -ppasst
 
 ifneq (,$(findstring amd64,$(DEB_BUILD_ARCH)))
