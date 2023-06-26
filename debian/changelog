@@ -1,3 +1,13 @@
+passt (0.0~git20230625.32660ce-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20230625.32660ce
+  * Update licensing information to new licensing terms from upstream
+    (GPLv2+ instead of AGPLv3+)
+  * Fix cross-build in Debian package itself by overriding TARGET via
+    dh_auto_install with target architecture
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Thu, 26 Mar 2023 20:20:47 +0200
+
 passt (0.0~git20230309.7c7625d-1pexip1) pexip; urgency=medium
 
   * Prepare Pexip packaging
