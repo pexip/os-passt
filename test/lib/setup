@@ -1,0 +1,392 @@
+#!/bin/sh
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# PASST - Plug A Simple Socket Transport
+#  for qemu/UNIX domain socket mode
+#
+# PASTA - Pack A Subtle Tap Abstraction
+#  for network namespace/tap device mode
+#
+# test/lib/setup - Set up and tear down passt and pasta environments
+#
+# Copyright (c) 2021 Red Hat GmbH
+# Author: Stefano Brivio <sbrivio@redhat.com>
+
+INITRAMFS="${BASEPATH}/mbuto.img"
+VCPUS="$( [ $(nproc) -ge 8 ] && echo 6 || echo $(( $(nproc) / 2 + 1 )) )"
+__mem_kib="$(sed -n 's/MemTotal:[ ]*\([0-9]*\) kB/\1/p' /proc/meminfo)"
+VMEM="$((${__mem_kib} / 1024 / 4))"
+NSHOLDER="${BASEPATH}/nsholder"
+
+# setup_build() - Set up pane layout for build tests
+setup_build() {
+	context_setup_host host
+
+	layout_host
+}
+
+# setup_passt() - Start qemu and passt
+setup_passt() {
+	context_setup_host host
+	context_setup_host passt
+	context_setup_host qemu
+
+	layout_passt
+
+	# Ports:
+	#
+	#              guest    |        host
+	#         --------------|---------------------
+	#  10001     as server  |  forwarded to guest
+	#  10003                |      as server
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/passt.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+
+	context_run passt "make clean"
+	context_run passt "make valgrind"
+	context_run_bg passt "valgrind --max-stackframe=$((4 * 1024 * 1024)) --trace-children=yes --vgdb=no --error-exitcode=1 --suppressions=test/valgrind.supp ./passt ${__opts} -s ${STATESETUP}/passt.socket -f -t 10001 -u 10001 -P ${STATESETUP}/passt.pid"
+
+	# pidfile isn't created until passt is listening
+	wait_for [ -f "${STATESETUP}/passt.pid" ]
+
+	GUEST_CID=94557
+	context_run_bg qemu 'qemu-system-$(uname -m)'			   \
+		' -machine accel=kvm'                                      \
+		' -m '${VMEM}' -cpu host -smp '${VCPUS}                    \
+		' -kernel ' "/boot/vmlinuz-$(uname -r)"			   \
+		' -initrd '${INITRAMFS}' -nographic -serial stdio'	   \
+		' -nodefaults'						   \
+		' -append "console=ttyS0 mitigations=off apparmor=0" '	   \
+		' -device virtio-net-pci,netdev=s0 '			   \
+		" -netdev stream,id=s0,server=off,addr.type=unix,addr.path=${STATESETUP}/passt.socket " \
+		" -pidfile ${STATESETUP}/qemu.pid"			   \
+		" -device vhost-vsock-pci,guest-cid=$GUEST_CID"
+
+	context_setup_guest guest $GUEST_CID
+}
+
+# setup_pasta() - Create a network and user namespace, connect pasta to it
+setup_pasta() {
+	context_setup_host host
+	context_setup_host passt
+	context_setup_host unshare
+
+	layout_pasta
+
+	context_run_bg unshare "unshare -rUnpf ${NSHOLDER} ${STATESETUP}/ns.hold hold"
+	__target_pid=$(${NSHOLDER} ${STATESETUP}/ns.hold pid)
+
+	context_setup_nsenter ns -U -n -p --preserve-credentials -t ${__target_pid}
+
+	# Ports:
+	#
+	#                 ns        |         host
+	#         ------------------|---------------------
+	#  10002      as server     |    spliced to ns
+	#  10003   spliced to init  |      as server
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/pasta.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+
+	context_run_bg passt "./pasta ${__opts} -f -t 10002 -T 10003 -u 10002 -U 10003 -P ${STATESETUP}/passt.pid ${__target_pid}"
+
+	# pidfile isn't created until pasta is ready
+	wait_for [ -f "${STATESETUP}/passt.pid" ]
+}
+
+# setup_passt_in_ns() - Set up namespace (with pasta), run qemu and passt into it
+setup_passt_in_ns() {
+	context_setup_host host
+	context_setup_host pasta
+
+	layout_passt_in_pasta
+
+	# Ports:
+	#
+	#             guest    |         ns         |       host
+	#         -------------|--------------------|-----------------
+	#  10001    as server  | forwarded to guest |  spliced to ns
+	#  10002               |     as server      |  spliced to ns
+	#  10003               |   spliced to init  |    as server
+	#  10011    as server  | forwarded to guest |  spliced to ns
+	#  10012               |     as server      |  spliced to ns
+	#  10013               |   spliced to init  |    as server
+	#
+	#  10021    as server  | forwarded to guest |
+	#  10031    as server  | forwarded to guest |
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/pasta_with_passt.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+
+	context_run_bg pasta "./pasta ${__opts} -t 10001,10002,10011,10012 -T 10003,10013 -u 10001,10002,10011,10012 -U 10003,10013 -P ${STATESETUP}/pasta.pid --config-net ${NSHOLDER} ${STATESETUP}/ns.hold hold"
+	wait_for [ -f "${STATESETUP}/pasta.pid" ]
+	__ns_pid=$(${NSHOLDER} ${STATESETUP}/ns.hold pid)
+
+	context_setup_nsenter qemu "-t ${__ns_pid} -U -n -p --preserve-credentials"
+	context_setup_nsenter ns "-t ${__ns_pid} -U -n -p --preserve-credentials"
+	context_setup_nsenter passt "-t ${__ns_pid} -U -n -p --preserve-credentials"
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/passt_in_pasta.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+
+	if [ ${VALGRIND} -eq 1 ]; then
+		context_run passt "make clean"
+		context_run passt "make valgrind"
+		context_run_bg passt "valgrind --max-stackframe=$((4 * 1024 * 1024)) --trace-children=yes --vgdb=no --error-exitcode=1 --suppressions=test/valgrind.supp ./passt -f ${__opts} -s ${STATESETUP}/passt.socket -t 10001,10011,10021,10031 -u 10001,10011,10021,10031 -P ${STATESETUP}/passt.pid"
+	else
+		context_run passt "make clean"
+		context_run passt "make"
+		context_run_bg passt "./passt -f ${__opts} -s ${STATESETUP}/passt.socket -t 10001,10011,10021,10031 -u 10001,10011,10021,10031 -P ${STATESETUP}/passt.pid"
+	fi
+	wait_for [ -f "${STATESETUP}/passt.pid" ]
+
+	GUEST_CID=94557
+	context_run_bg qemu 'qemu-system-$(uname -m)'			   \
+		' -machine accel=kvm'                                      \
+		' -M accel=kvm:tcg'                                        \
+		' -m '${VMEM}' -cpu host -smp '${VCPUS}                    \
+		' -kernel ' "/boot/vmlinuz-$(uname -r)"			   \
+		' -initrd '${INITRAMFS}' -nographic -serial stdio'	   \
+		' -nodefaults'						   \
+		' -append "console=ttyS0 mitigations=off apparmor=0" '	   \
+		' -device virtio-net-pci,netdev=s0 '			   \
+		" -netdev stream,id=s0,server=off,addr.type=unix,addr.path=${STATESETUP}/passt.socket " \
+		" -pidfile ${STATESETUP}/qemu.pid"			   \
+		" -device vhost-vsock-pci,guest-cid=$GUEST_CID"
+
+	context_setup_guest guest $GUEST_CID
+}
+
+# setup_two_guests() - Set up two namespace, run qemu and passt in both of them
+setup_two_guests() {
+	context_setup_host host
+	context_setup_host pasta_1
+	context_setup_host pasta_2
+
+	layout_two_guests
+
+	# Ports:
+	#
+	#         guest #1  |  guest #2 |   ns #1   |    ns #2   |    host
+	#         --------- |-----------|-----------|------------|------------
+	#  10001  as server |           | to guest  |  to init   |  to ns #1
+	#  10002            |           | as server |            |  to ns #1
+	#  10003            |           |  to init  |  to init   |  as server
+	#  10004            | as server |  to init  |  to guest  |  to ns #2
+	#  10005            |           |           |  as server |  to ns #2
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/pasta_1.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+	context_run_bg pasta_1 "./pasta ${__opts} --trace -l /tmp/pasta1.log -P ${STATESETUP}/pasta_1.pid -t 10001,10002 -T 10003,10004 -u 10001,10002 -U 10003,10004 --config-net ${NSHOLDER} ${STATESETUP}/ns1.hold hold"
+	__ns1_pid=$(${NSHOLDER} ${STATESETUP}/ns1.hold pid)
+	context_setup_nsenter passt_1 -U -n -p --preserve-credentials -t ${__ns1_pid}
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/pasta_2.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+	context_run_bg pasta_2 "./pasta ${__opts} --trace -l /tmp/pasta2.log -P ${STATESETUP}/pasta_2.pid -t 10004,10005 -T 10003,10001 -u 10004,10005 -U 10003,10001 --config-net ${NSHOLDER} ${STATESETUP}/ns2.hold hold"
+	__ns2_pid=$(${NSHOLDER} ${STATESETUP}/ns2.hold pid)
+	context_setup_nsenter passt_2 -U -n -p --preserve-credentials -t ${__ns2_pid}
+
+	context_setup_nsenter qemu_1 -U -n -p --preserve-credentials -t ${__ns1_pid}
+	context_setup_nsenter qemu_2 -U -n -p --preserve-credentials -t ${__ns2_pid}
+
+	__ifname="$(context_run qemu_1 "ip -j link show | jq -rM '.[] | select(.link_type == \"ether\").ifname'")"
+
+	sleep 1
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/passt_1.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+
+	context_run_bg passt_1 "./passt -s ${STATESETUP}/passt_1.socket -P ${STATESETUP}/passt_1.pid -f ${__opts} -t 10001 -u 10001"
+	wait_for [ -f "${STATESETUP}/passt_1.pid" ]
+
+	__opts=
+	[ ${PCAP} -eq 1 ] && __opts="${__opts} -p ${LOGDIR}/passt_2.pcap"
+	[ ${DEBUG} -eq 1 ] && __opts="${__opts} -d"
+	[ ${TRACE} -eq 1 ] && __opts="${__opts} --trace"
+
+	context_run_bg passt_2 "./passt -s ${STATESETUP}/passt_2.socket -P ${STATESETUP}/passt_2.pid -f ${__opts} -t 10004 -u 10004"
+	wait_for [ -f "${STATESETUP}/passt_2.pid" ]
+
+	GUEST_1_CID=94557
+	context_run_bg qemu_1 'qemu-system-$(uname -m)'			     \
+		' -M accel=kvm:tcg'                                          \
+		' -m '${VMEM}' -cpu host -smp '${VCPUS}                      \
+		' -kernel ' "/boot/vmlinuz-$(uname -r)"			     \
+		' -initrd '${INITRAMFS}' -nographic -serial stdio'	     \
+		' -nodefaults'						     \
+		' -append "console=ttyS0 mitigations=off apparmor=0" '	     \
+		' -device virtio-net-pci,netdev=s0 '			     \
+		" -netdev stream,id=s0,server=off,addr.type=unix,addr.path=${STATESETUP}/passt_1.socket " \
+		" -pidfile ${STATESETUP}/qemu_1.pid"			     \
+		" -device vhost-vsock-pci,guest-cid=$GUEST_1_CID"
+
+	GUEST_2_CID=94558
+	context_run_bg qemu_2 'qemu-system-$(uname -m)'			     \
+		' -M accel=kvm:tcg'                                          \
+		' -m '${VMEM}' -cpu host -smp '${VCPUS}                      \
+		' -kernel ' "/boot/vmlinuz-$(uname -r)"			     \
+		' -initrd '${INITRAMFS}' -nographic -serial stdio'	     \
+		' -nodefaults'						     \
+		' -append "console=ttyS0 mitigations=off apparmor=0" '	     \
+		' -device virtio-net-pci,netdev=s0 '			     \
+		" -netdev stream,id=s0,server=off,addr.type=unix,addr.path=${STATESETUP}/passt_2.socket " \
+		" -pidfile ${STATESETUP}/qemu_2.pid"			     \
+		" -device vhost-vsock-pci,guest-cid=$GUEST_2_CID"
+
+	context_setup_guest guest_1 ${GUEST_1_CID}
+	context_setup_guest guest_2 ${GUEST_2_CID}
+}
+
+# teardown_context_watch() - Remove contexts and stop panes watching them
+# $1:	Pane number watching
+# $@:	Context names
+teardown_context_watch() {
+	__pane="$1"
+	shift
+	for __c; do
+		context_teardown "${__c}"
+	done
+	tmux send-keys -t ${__pane} "C-c"
+}
+
+# teardown_build() - Nothing to do, yet
+teardown_build() {
+	teardown_context_watch ${PANE_HOST} host
+}
+
+# teardown_passt() - Kill qemu, remove passt PID file
+teardown_passt() {
+	kill $(cat "${STATESETUP}/qemu.pid")
+
+	rm "${STATESETUP}/passt.pid"
+
+	teardown_context_watch ${PANE_HOST} host
+	teardown_context_watch ${PANE_PASST} passt
+	teardown_context_watch ${PANE_GUEST} qemu guest
+}
+
+# teardown_pasta() - Exit namespace, kill pasta process
+teardown_pasta() {
+	${NSHOLDER} "${STATESETUP}/ns.hold" stop
+	context_wait unshare
+
+	teardown_context_watch ${PANE_HOST} host
+	teardown_context_watch ${PANE_PASST} passt
+	teardown_context_watch ${PANE_NS} unshare ns
+}
+
+# teardown_passt_in_ns() - Exit namespace, kill qemu and pasta, remove pid file
+teardown_passt_in_ns() {
+	context_run ns kill $(cat "${STATESETUP}/qemu.pid")
+	context_wait qemu
+
+	${NSHOLDER} "${STATESETUP}/ns.hold" stop
+	context_wait pasta
+
+	rm "${STATESETUP}/passt.pid" "${STATESETUP}/pasta.pid"
+
+	teardown_context_watch ${PANE_HOST} host
+	teardown_context_watch ${PANE_PASST} pasta passt
+	teardown_context_watch ${PANE_NS} ns
+	teardown_context_watch ${PANE_GUEST} qemu guest
+}
+
+# teardown_two_guests() - Exit namespaces, kill qemu processes, passt and pasta
+teardown_two_guests() {
+	__ns1_pid=$(${NSHOLDER} "${STATESETUP}/ns1.hold" pid)
+	__ns2_pid=$(${NSHOLDER} "${STATESETUP}/ns2.hold" pid)
+	nsenter -U -p --preserve-credentials -t ${__ns1_pid} kill $(cat "${STATESETUP}/qemu_1.pid")
+	nsenter -U -p --preserve-credentials -t ${__ns2_pid} kill $(cat "${STATESETUP}/qemu_2.pid")
+	context_wait qemu_1
+	context_wait qemu_2
+
+	nsenter -U -p --preserve-credentials -t ${__ns1_pid} kill $(cat "${STATESETUP}/passt_1.pid")
+	nsenter -U -p --preserve-credentials -t ${__ns2_pid} kill $(cat "${STATESETUP}/passt_2.pid")
+	context_wait passt_1
+	context_wait passt_2
+	${NSHOLDER} "${STATESETUP}/ns1.hold" stop
+	${NSHOLDER} "${STATESETUP}/ns2.hold" stop
+	context_wait pasta_1
+	context_wait pasta_2
+
+	rm -f "${STATESETUP}/passt__[12].pid" "${STATESETUP}/pasta_[12].pid"
+
+	teardown_context_watch ${PANE_HOST} host
+	teardown_context_watch ${PANE_GUEST_1} qemu_1 guest_1
+	teardown_context_watch ${PANE_GUEST_2} qemu_2 guest_2
+	teardown_context_watch ${PANE_PASST_1} pasta_1 passt_1
+	teardown_context_watch ${PANE_PASST_2} pasta_2 passt_2
+}
+
+# teardown_demo_passt() - Exit namespace, kill qemu, passt and pasta
+teardown_demo_passt() {
+	tmux send-keys -t ${PANE_GUEST} "C-c"
+	pane_wait GUEST
+
+	tmux send-keys -t ${PANE_GUEST} "C-d"
+	tmux send-keys -t ${PANE_PASST} "C-c"
+
+	pane_wait GUEST
+	pane_wait HOST
+	pane_wait PASST
+
+	tmux kill-pane -a -t 0
+	tmux send-keys -t 0 "C-c"
+}
+
+# teardown_demo_pasta() - Exit perf and namespace from remaining pane
+teardown_demo_pasta() {
+	tmux send-keys -t ${PANE_NS} "q"
+	pane_wait NS
+	tmux send-keys -t ${PANE_NS} "C-d"
+	pane_wait NS
+
+	tmux kill-pane -a -t 0
+	tmux send-keys -t 0 "C-c"
+}
+
+# teardown_demo_podman() - Exit namespaces
+teardown_demo_podman() {
+	tmux send-keys -t ${PANE_NS1} "C-d"
+	tmux send-keys -t ${PANE_NS2} "C-d"
+	pane_wait NS1
+	pane_wait NS2
+
+	tmux kill-pane -a -t 0
+	tmux send-keys -t 0 "C-c"
+}
+
+# setup() - Run setup_*() functions
+# $*:	Suffix list of setup_*() functions to be called
+setup() {
+	for arg do
+		STATESETUP="${STATEBASE}/${arg}"
+		mkdir -p "${STATESETUP}"
+		eval setup_${arg}
+	done
+}
+
+# teardown() - Run teardown_*() functions
+# $*:	Suffix list of teardown_*() functions to be called
+teardown() {
+	for arg do
+		eval teardown_${arg}
+	done
+}

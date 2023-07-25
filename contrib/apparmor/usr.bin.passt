@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# PASST - Plug A Simple Socket Transport
+#  for qemu/UNIX domain socket mode
+#
+# PASTA - Pack A Subtle Tap Abstraction
+#  for network namespace/tap device mode
+#
+# contrib/apparmor/usr.bin.passt - AppArmor profile for passt(1) and pasta(1)
+#
+# Copyright (c) 2022 Red Hat GmbH
+# Author: Stefano Brivio <sbrivio@redhat.com>
+
+abi <abi/3.0>,
+
+include <tunables/global>
+
+profile passt /usr/bin/passt{,.avx2} flags=(attach_disconnected) {
+  ### TODO: AppArmor doesn't give us the chance to attach a separate profile
+  ### depending on the executable symlink. That's possible with SELinux. Two
+  ### alternatives: implement that in AppArmor, or consider aa_change_hat(2).
+  ### With this, rules for passt(1) could be restricted significantly. Note that
+  ### the attach_disconnected flag is not needed for passt(1).
+
+  include <abstractions/passt>
+
+  # Alternatively: include <abstractions/user-tmp>
+  owner /tmp/**				w,	# tap_sock_unix_init(), pcap(),
+						# write_pidfile(),
+						# logfile_init()
+
+  owner @{HOME}/**			w,	# pcap(), write_pidfile()
+
+  include <abstractions/pasta>
+}
