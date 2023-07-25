@@ -1,13 +1,15 @@
 Source: passt
 Section: net
 Priority: optional
-Maintainer: Stefano Brivio <sbrivio@redhat.com>
+Maintainer: Pexip AS <packaging@pexip.com>
+XSBC-Pexip-Original-Maintainer: Stefano Brivio <sbrivio@redhat.com>
 Build-Depends: debhelper-compat (= 13), dh-apparmor
 Rules-Requires-Root: no
 Standards-Version: 4.6.2
 Homepage: https://passt.top/
 Vcs-Browser: https://salsa.debian.org/sbrivio/passt
 Vcs-Git: https://salsa.debian.org/sbrivio/passt.git
+XS-Pexip-Upstream: http://ftp.debian.org/debian/ bookworm
 
 Package: passt
 Architecture: any

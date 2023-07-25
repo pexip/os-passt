@@ -1,3 +1,9 @@
+passt (0.0~git20230309.7c7625d-1pexip1) pexip; urgency=medium
+
+  * Prepare Pexip packaging
+
+ -- John-Mark Bell <jmb@pexip.com>  Tue, 25 Jul 2023 11:10:54 +0000
+
 passt (0.0~git20230309.7c7625d-1) unstable; urgency=medium
 
   * New upstream version 0.0~git20230309.7c7625d
