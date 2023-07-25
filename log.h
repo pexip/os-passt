@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: AGPL-3.0-or-later
+/* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2022 Red Hat GmbH
  * Author: Stefano Brivio <sbrivio@redhat.com>
  */
@@ -22,6 +22,7 @@ void debug(const char *format, ...);
 	} while (0)
 
 extern int log_trace;
+extern int log_to_stdout;
 void trace_init(int enable);
 #define trace(...)							\
 	do {								\

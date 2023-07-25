@@ -1,4 +1,4 @@
-.\" SPDX-License-Identifier: AGPL-3.0-or-later
+.\" SPDX-License-Identifier: GPL-2.0-or-later
 .\" Copyright (c) 2020-2022 Red Hat GmbH
 .\" Author: Stefano Brivio <sbrivio@redhat.com>
 .TH passt 1
@@ -135,8 +135,10 @@ background (if configured to do so).
 
 .TP
 .BR \-m ", " \-\-mtu " " \fImtu
-Assign \fImtu\fR via DHCP (option 26) and NDP (option type 5).
-By default, no MTU options will be sent.
+Assign \fImtu\fR via DHCP (option 26) and NDP (option type 5). A zero value
+disables assignment.
+By default, the advertised MTU is 65520 bytes, that is, the maximum 802.3 MTU
+minus the length of a 802.3 header, rounded to 32 bits (IPv4 words).
 
 .TP
 .BR \-a ", " \-\-address " " \fIaddr
@@ -279,7 +281,8 @@ guest or target namespace will be silently dropped.
 .TP
 .BR \-\-no-dhcp
 Disable the DHCP server. DHCP client requests coming from guest or target
-namespace will be silently dropped.
+namespace will be silently dropped. Implied if there is no gateway on the
+selected IPv4 default route.
 
 .TP
 .BR \-\-no-ndp
@@ -299,7 +302,8 @@ namespace will be ignored.
 .TP
 .BR \-\-no-map-gw
 Don't remap TCP connections and untracked UDP traffic, with the gateway address
-as destination, to the host.
+as destination, to the host. Implied if there is no gateway on the selected
+default route for any of the enabled address families.
 
 .TP
 .BR \-4 ", " \-\-ipv4-only
@@ -308,7 +312,7 @@ By default, IPv6 operation is enabled as long as at least an IPv6 default route
 and an interface address are configured on a given host interface.
 
 .TP
-.BR \-4 ", " \-\-ipv6-only
+.BR \-6 ", " \-\-ipv6-only
 Enable IPv6-only operation. IPv4 traffic will be ignored.
 By default, IPv4 operation is enabled as long as at least an IPv4 default route
 and an interface address are configured on a given host interface.
@@ -382,6 +386,9 @@ Forward local port 22, bound to 192.0.2.1, to port 22 on the guest
 .TP
 -t 192.0.2.1%eth0/22
 Forward local port 22, bound to 192.0.2.1 and interface eth0, to port 22
+.TP
+-t %eth0/22
+Forward local port 22, bound to any address on interface eth0, to port 22
 .TP
 -t 2000-5000,~3000-3010
 Forward local ports between 2000 and 5000, except for those between 3000 and
@@ -465,6 +472,9 @@ Forward local port 22, bound to 192.0.2.1, to port 22 in the target namespace
 -t 192.0.2.1%eth0/22
 Forward local port 22, bound to 192.0.2.1 and interface eth0, to port 22
 .TP
+-t %eth0/22
+Forward local port 22, bound to any address on interface eth0, to port 22
+.TP
 -t 2000-5000,~3000-3010
 Forward local ports between 2000 and 5000, except for those between 3000 and
 3010
@@ -537,6 +547,35 @@ NAME are given as target), do not exit once the network namespace is deleted.
 .BR \-\-config-net
 Configure networking in the namespace: set up addresses and routes as configured
 or sourced from the host, and bring up the tap interface.
+
+.TP
+.BR \-\-no-copy-routes " " (DEPRECATED)
+With \-\-config-net, do not copy all the routes associated to the interface we
+derive addresses and routes from: set up only the default gateway. Implied by
+-g, \-\-gateway.
+
+Default is to copy all the routing entries from the interface in the outer
+namespace to the target namespace, translating the output interface attribute to
+the outbound interface in the namespace.
+
+Note that this configuration option is \fBdeprecated\fR and will be removed in a
+future version. It is not expected to be of any use, and it simply reflects a
+legacy behaviour. If you have any use for this, refer to \fBREPORTING BUGS\fR
+below.
+
+.TP
+.BR \-\-no-copy-addrs " " (DEPRECATED)
+With \-\-config-net, do not copy all the addresses associated to the interface
+we derive addresses and routes from: set up a single one. Implied by \-a,
+\-\-address.
+
+Default is to copy all the addresses, except for link-local ones, from the
+interface from the outer namespace to the target namespace.
+
+Note that this configuration option is \fBdeprecated\fR and will be removed in a
+future version. It is not expected to be of any use, and it simply reflects a
+legacy behaviour. If you have any use for this, refer to \fBREPORTING BUGS\fR
+below.
 
 .TP
 .BR \-\-ns-mac-addr " " \fIaddr

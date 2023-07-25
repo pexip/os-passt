@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: AGPL-3.0-or-later
+/* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2021 Red Hat GmbH
  * Author: Stefano Brivio <sbrivio@redhat.com>
  */
@@ -8,6 +8,7 @@
 
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdbool.h>
 
 #include "log.h"
 
@@ -216,6 +217,7 @@ char *line_read(char *buf, size_t len, int fd);
 void procfs_scan_listen(struct ctx *c, uint8_t proto, int ip_version, int ns,
 			uint8_t *map, uint8_t *exclude);
 int ns_enter(const struct ctx *c);
+bool ns_is_init(void);
 void write_pidfile(int fd, pid_t pid);
 int __daemon(int pidfile_fd, int devnull_fd);
 int fls(unsigned long x);

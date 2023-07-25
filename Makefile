@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -20,7 +20,7 @@ ifeq ($(RLIMIT_STACK_VAL),unlimited)
 RLIMIT_STACK_VAL := 1024
 endif
 
-TARGET := $(shell $(CC) -dumpmachine)
+TARGET ?= $(shell $(CC) -dumpmachine)
 # Get 'uname -m'-like architecture description for target
 TARGET_ARCH := $(shell echo $(TARGET) | cut -f1 -d- | tr [A-Z] [a-z])
 TARGET_ARCH := $(shell echo $(TARGET_ARCH) | sed 's/powerpc/ppc/')

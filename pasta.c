@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -29,6 +29,7 @@
 #include <syslog.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/mount.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -94,10 +95,13 @@ static int pasta_wait_for_ns(void *arg)
 	char ns[PATH_MAX];
 
 	snprintf(ns, PATH_MAX, "/proc/%i/ns/net", pasta_child_pid);
-	do
-		while ((c->pasta_netns_fd = open(ns, flags)) < 0);
-	while (setns(c->pasta_netns_fd, CLONE_NEWNET) &&
-	       !close(c->pasta_netns_fd));
+	do {
+		while ((c->pasta_netns_fd = open(ns, flags)) < 0) {
+			if (errno != ENOENT)
+				return 0;
+		}
+	} while (setns(c->pasta_netns_fd, CLONE_NEWNET) &&
+		 !close(c->pasta_netns_fd));
 
 	return 0;
 }
@@ -131,15 +135,17 @@ void pasta_open_ns(struct ctx *c, const char *netns)
 	int nfd = -1;
 
 	nfd = open(netns, O_RDONLY | O_CLOEXEC);
-	if (nfd < 0)
-		die("Couldn't open network namespace %s", netns);
+	if (nfd < 0) {
+		die("Couldn't open network namespace %s: %s",
+		    netns, strerror(errno));
+	}
 
 	c->pasta_netns_fd = nfd;
 
 	NS_CALL(ns_check, c);
 
 	if (c->pasta_netns_fd < 0)
-		die("Couldn't switch to pasta namespaces");
+		die("Couldn't switch to pasta namespaces: %s", strerror(errno));
 
 	if (!c->no_netns_quit) {
 		char buf[PATH_MAX] = { 0 };
@@ -171,6 +177,10 @@ static int pasta_spawn_cmd(void *arg)
 {
 	const struct pasta_spawn_cmd_arg *a;
 	sigset_t set;
+
+	/* We run in a detached PID and mount namespace: mount /proc over */
+	if (mount("", "/proc", "proc", 0, NULL))
+		warn("Couldn't mount /proc: %s", strerror(errno));
 
 	if (write_file("/proc/sys/net/ipv4/ping_group_range", "0 0"))
 		warn("Cannot set ping_group_range, ICMP requests might fail");
@@ -243,7 +253,7 @@ void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
 	pasta_child_pid = do_clone(pasta_spawn_cmd, ns_fn_stack,
 				   sizeof(ns_fn_stack),
 				   CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET |
-				   CLONE_NEWUTS | SIGCHLD,
+				   CLONE_NEWUTS | CLONE_NEWNS  | SIGCHLD,
 				   (void *)&arg);
 
 	if (pasta_child_pid == -1) {
@@ -252,6 +262,8 @@ void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
 	}
 
 	NS_CALL(pasta_wait_for_ns, c);
+	if (c->pasta_netns_fd < 0)
+		die("Failed to join network namespace: %s", strerror(errno));
 }
 
 /**
@@ -263,19 +275,24 @@ void pasta_ns_conf(struct ctx *c)
 	nl_link(1, 1 /* lo */, MAC_ZERO, 1, 0);
 
 	if (c->pasta_conf_ns) {
+		enum nl_op op_routes = c->no_copy_routes ? NL_SET : NL_DUP;
+		enum nl_op op_addrs =  c->no_copy_addrs  ? NL_SET : NL_DUP;
+
 		nl_link(1, c->pasta_ifi, c->mac_guest, 1, c->mtu);
 
 		if (c->ifi4) {
-			nl_addr(1, c->pasta_ifi, AF_INET, &c->ip4.addr,
-				&c->ip4.prefix_len, NULL);
-			nl_route(1, c->pasta_ifi, AF_INET, &c->ip4.gw);
+			nl_addr(op_addrs, c->ifi4, c->pasta_ifi, AF_INET,
+				&c->ip4.addr, &c->ip4.prefix_len, NULL);
+			nl_route(op_routes, c->ifi4, c->pasta_ifi, AF_INET,
+				 &c->ip4.gw);
 		}
 
 		if (c->ifi6) {
 			int prefix_len = 64;
-			nl_addr(1, c->pasta_ifi, AF_INET6, &c->ip6.addr,
-				&prefix_len, NULL);
-			nl_route(1, c->pasta_ifi, AF_INET6, &c->ip6.gw);
+			nl_addr(op_addrs, c->ifi6, c->pasta_ifi, AF_INET6,
+				&c->ip6.addr, &prefix_len, NULL);
+			nl_route(op_routes, c->ifi6, c->pasta_ifi, AF_INET6,
+				 &c->ip6.gw);
 		}
 	} else {
 		nl_link(1, c->pasta_ifi, c->mac_guest, 0, 0);

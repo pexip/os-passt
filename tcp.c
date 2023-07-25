@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -89,7 +89,7 @@
  * No port translation is needed for connections initiated remotely or by the
  * local host: source port from socket is reused while establishing connections
  * to the guest.
- * 
+ *
  * For connections initiated by the guest, it's not possible to force the same
  * source port as connections are established by the host kernel: that's the
  * only port translation needed.
@@ -173,7 +173,7 @@
  *   new socket is created and mapped in connection tracking table, setting
  *   MSS and window clamping from header and option of the observed SYN segment
  *
- * 
+ *
  * Aging and timeout
  * -----------------
  *
@@ -267,6 +267,7 @@
 #include <sched.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -287,7 +288,6 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
-#include <unistd.h>
 #include <time.h>
 
 #include <linux/tcp.h> /* For struct tcp_info */
@@ -364,7 +364,7 @@ struct tcp6_l2_head {	/* For MSS6 macro: keep in sync with tcp6_l2_buf_t */
 # define KERNEL_REPORTS_SND_WND(c)	(0 && (c))
 #endif
 
-#define ACK_INTERVAL			50		/* ms */
+#define ACK_INTERVAL			10		/* ms */
 #define SYN_TIMEOUT			10		/* s */
 #define ACK_TIMEOUT			2
 #define FIN_TIMEOUT			60
@@ -560,7 +560,7 @@ static struct tcp6_l2_flags_buf_t {
 #endif
 	struct tap_hdr taph;	/* 14					   2 */
 	struct ipv6hdr ip6h;	/* 32					  20 */
-	struct tcphdr th	/* 72 */ __attribute__ ((aligned(4))); /* 60 */ 
+	struct tcphdr th	/* 72 */ __attribute__ ((aligned(4))); /* 60 */
 	char opts[OPT_MSS_LEN + OPT_WS_LEN + 1];
 #ifdef __AVX2__
 } __attribute__ ((packed, aligned(32)))
@@ -758,7 +758,7 @@ static void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
 			      tcp_flag_str[flag_index]);
 		}
 	} else {
-		int flag_index = fls(~flag);
+		int flag_index = fls(flag);
 
 		if (conn->flags & flag) {
 			/* Special case: setting ACK_FROM_TAP_DUE on a
@@ -1610,10 +1610,12 @@ out:
 static void tcp_update_seqack_from_tap(const struct ctx *c,
 				       struct tcp_tap_conn *conn, uint32_t seq)
 {
+	if (seq == conn->seq_to_tap)
+		conn_flag(c, conn, ~ACK_FROM_TAP_DUE);
+
 	if (SEQ_GT(seq, conn->seq_ack_from_tap)) {
-		if (seq == conn->seq_to_tap)
-			conn_flag(c, conn, ~ACK_FROM_TAP_DUE);
-		else
+		/* Forward progress, but more data to acknowledge: reschedule */
+		if (SEQ_LT(seq, conn->seq_to_tap))
 			conn_flag(c, conn, ACK_FROM_TAP_DUE);
 
 		conn->retrans = 0;
@@ -1730,8 +1732,12 @@ static int tcp_send_flag(struct ctx *c, struct tcp_tap_conn *conn, int flags)
 	iov->iov_len = tcp_l2_buf_fill_headers(c, conn, p, optlen,
 					       NULL, conn->seq_to_tap);
 
-	if (th->ack)
-		conn_flag(c, conn, ~ACK_TO_TAP_DUE);
+	if (th->ack) {
+		if (SEQ_GE(conn->seq_ack_to_tap, conn->seq_from_tap))
+			conn_flag(c, conn, ~ACK_TO_TAP_DUE);
+		else
+			conn_flag(c, conn, ACK_TO_TAP_DUE);
+	}
 
 	if (th->fin)
 		conn_flag(c, conn, ACK_FROM_TAP_DUE);
@@ -1822,7 +1828,7 @@ static void tcp_clamp_window(const struct ctx *c, struct tcp_tap_conn *conn,
 		 *
 		 * drop this suppression once that's resolved.
 		 */
-		/* cppcheck-suppress knownConditionTrueFalse */
+		/* cppcheck-suppress [knownConditionTrueFalse, unmatchedSuppression] */
 		if ((wnd > prev_scaled && wnd * 99 / 100 < prev_scaled) ||
 		    (wnd < prev_scaled && wnd * 101 / 100 > prev_scaled))
 			return;
@@ -2092,7 +2098,7 @@ static void tcp_conn_from_tap(struct ctx *c, int af, const void *addr,
 	conn->seq_ack_to_tap = conn->seq_from_tap;
 
 	tcp_seq_init(c, conn, now);
-	conn->seq_ack_from_tap = conn->seq_to_tap + 1;
+	conn->seq_ack_from_tap = conn->seq_to_tap;
 
 	tcp_hash_insert(c, conn);
 
@@ -2332,6 +2338,11 @@ static void tcp_data_from_tap(struct ctx *c, struct tcp_tap_conn *conn,
 	struct msghdr mh = { .msg_iov = tcp_iov };
 	size_t len;
 	ssize_t n;
+
+	if (conn->events == CLOSED)
+		return;
+
+	ASSERT(conn->events & ESTABLISHED);
 
 	for (i = 0, iov_i = 0; i < (int)p->count; i++) {
 		uint32_t seq, seq_offset, ack_seq;
@@ -2745,7 +2756,7 @@ static void tcp_tap_conn_from_sock(struct ctx *c, union epoll_ref ref,
 	tcp_seq_init(c, conn, now);
 	tcp_hash_insert(c, conn);
 
-	conn->seq_ack_from_tap = conn->seq_to_tap + 1;
+	conn->seq_ack_from_tap = conn->seq_to_tap;
 
 	conn->wnd_from_tap = WINDOW_DEFAULT;
 
@@ -2820,7 +2831,7 @@ static void tcp_timer_handler(struct ctx *c, union epoll_ref ref)
 
 	if (conn->flags & ACK_TO_TAP_DUE) {
 		tcp_send_flag(c, conn, ACK_IF_NEEDED);
-		conn_flag(c, conn, ~ACK_TO_TAP_DUE);
+		tcp_timer_ctl(c, conn);
 	} else if (conn->flags & ACK_FROM_TAP_DUE) {
 		if (!(conn->events & ESTABLISHED)) {
 			debug("TCP: index %li, handshake timeout", CONN_IDX(conn));
@@ -3308,14 +3319,14 @@ void tcp_timer(struct ctx *c, const struct timespec *ts)
 		struct tcp_port_detect_arg detect_arg = { c, 0 };
 		struct tcp_port_rebind_arg rebind_arg = { c, 0 };
 
-		if (c->tcp.fwd_in.mode == FWD_AUTO) {
+		if (c->tcp.fwd_out.mode == FWD_AUTO) {
 			detect_arg.detect_in_ns = 0;
 			tcp_port_detect(&detect_arg);
 			rebind_arg.bind_in_ns = 1;
 			NS_CALL(tcp_port_rebind, &rebind_arg);
 		}
 
-		if (c->tcp.fwd_out.mode == FWD_AUTO) {
+		if (c->tcp.fwd_in.mode == FWD_AUTO) {
 			detect_arg.detect_in_ns = 1;
 			NS_CALL(tcp_port_detect, &detect_arg);
 			rebind_arg.bind_in_ns = 0;
