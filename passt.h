@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: AGPL-3.0-or-later
+/* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2021 Red Hat GmbH
  * Author: Stefano Brivio <sbrivio@redhat.com>
  */
@@ -180,8 +180,10 @@ struct ip6_ctx {
  * @ifi6:		Index of template interface for IPv6, 0 if IPv6 disabled
  * @ip6:		IPv6 configuration
  * @pasta_ifn:		Name of namespace interface for pasta
- * @pasta_ifn:		Index of namespace interface for pasta
- * @pasta_conf_ns:	Configure namespace interface after creating it
+ * @pasta_ifi:		Index of namespace interface for pasta
+ * @pasta_conf_ns:	Configure namespace after creating it
+ * @no_copy_routes:	Don't copy all routes when configuring target namespace
+ * @no_copy_addrs:	Don't copy all addresses when configuring namespace
  * @no_tcp:		Disable TCP operation
  * @tcp:		Context for TCP protocol handler
  * @no_tcp:		Disable UDP operation
@@ -240,6 +242,8 @@ struct ctx {
 	char pasta_ifn[IF_NAMESIZE];
 	unsigned int pasta_ifi;
 	int pasta_conf_ns;
+	int no_copy_routes;
+	int no_copy_addrs;
 
 	int no_tcp;
 	struct tcp_ctx tcp;

@@ -1,6 +1,6 @@
 #!/bin/sh -e
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -32,15 +32,18 @@ FAST=${FAST:-1}
 # If set, run passt and pasta with debug options
 DEBUG=${DEBUG:-0}
 
+# If set, run passt and pasta with trace options
+TRACE=${TRACE:-0}
+
 # If set, tell passt and pasta to take packet captures
 PCAP=${PCAP:-0}
 
 COMMIT="$(git log --oneline --no-decorate -1)"
 
 . lib/util
+. lib/context
 . lib/setup
 . lib/setup_ugly
-. lib/context
 . lib/term
 . lib/perf_report
 . lib/layout

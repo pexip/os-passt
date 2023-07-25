@@ -1,9 +1,9 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
 #
-# contrib/selinux/passt.te - SELinux profile example: Type Enforcement for passt
+# contrib/selinux/passt.te - SELinux profile: Type Enforcement for passt
 #
 # Copyright (c) 2022 Red Hat GmbH
 # Author: Stefano Brivio <sbrivio@redhat.com>

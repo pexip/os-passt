@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -43,19 +43,21 @@ static char	log_header[BUFSIZ];	/* File header, written back on cuts */
 
 static time_t	log_start;		/* Start timestamp */
 int		log_trace;		/* --trace mode enabled */
+int		log_to_stdout;		/* Print to stdout instead of stderr */
 
 #define BEFORE_DAEMON		(setlogmask(0) == LOG_MASK(LOG_EMERG))
 
 #define logfn(name, level)						\
 void name(const char *format, ...) {					\
+	FILE *out = log_to_stdout ? stdout : stderr;			\
 	struct timespec tp;						\
 	va_list args;							\
 									\
 	if (setlogmask(0) & LOG_MASK(LOG_DEBUG) && log_file == -1) {	\
 		clock_gettime(CLOCK_REALTIME, &tp);			\
-		fprintf(stderr, "%li.%04li: ",				\
-			tp.tv_sec - log_start,				\
-			tp.tv_nsec / (100L * 1000));			\
+		fprintf(out, "%lli.%04lli: ",				\
+			(long long int)tp.tv_sec - log_start,		\
+			(long long int)tp.tv_nsec / (100L * 1000));	\
 	}								\
 									\
 	if ((LOG_MASK(LOG_PRI(level)) & log_mask) || BEFORE_DAEMON) {	\
@@ -70,10 +72,10 @@ void name(const char *format, ...) {					\
 	if ((setlogmask(0) & LOG_MASK(LOG_DEBUG) && log_file == -1) ||	\
 	    (BEFORE_DAEMON && !(log_opt & LOG_PERROR))) {		\
 		va_start(args, format);					\
-		(void)vfprintf(stderr, format, args); 			\
+		(void)vfprintf(out, format, args); 			\
 		va_end(args);						\
 		if (format[strlen(format)] != '\n')			\
-			fprintf(stderr, "\n");				\
+			fprintf(out, "\n");				\
 	}								\
 }
 
@@ -225,8 +227,9 @@ static void logfile_rotate_fallocate(int fd, struct timespec *ts)
 		return;
 
 	n = snprintf(buf, BUFSIZ,
-		     "%s - log truncated at %li.%04li", log_header,
-		     ts->tv_sec - log_start, ts->tv_nsec / (100L * 1000));
+		     "%s - log truncated at %lli.%04lli", log_header,
+		     (long long int)(ts->tv_sec - log_start),
+		     (long long int)(ts->tv_nsec / (100L * 1000)));
 
 	/* Avoid partial lines by padding the header with spaces */
 	nl = memchr(buf + n + 1, '\n', BUFSIZ - n - 1);
@@ -256,9 +259,9 @@ static void logfile_rotate_move(int fd, struct timespec *ts)
 	char buf[BUFSIZ], *nl;
 
 	header_len = snprintf(buf, BUFSIZ,
-			      "%s - log truncated at %li.%04li\n", log_header,
-			      ts->tv_sec - log_start,
-			      ts->tv_nsec / (100L * 1000));
+			      "%s - log truncated at %lli.%04lli\n", log_header,
+			      (long long int)(ts->tv_sec - log_start),
+			      (long long int)(ts->tv_nsec / (100L * 1000)));
 	if (lseek(fd, 0, SEEK_SET) == -1)
 		return;
 	if (write(fd, buf, header_len) == -1)
@@ -349,8 +352,9 @@ void logfile_write(int pri, const char *format, va_list ap)
 	if (clock_gettime(CLOCK_REALTIME, &ts))
 		return;
 
-	n = snprintf(buf, BUFSIZ, "%li.%04li: %s",
-		     ts.tv_sec - log_start, ts.tv_nsec / (100L * 1000),
+	n = snprintf(buf, BUFSIZ, "%lli.%04lli: %s",
+		     (long long int)(ts.tv_sec - log_start),
+		     (long long int)(ts.tv_nsec / (100L * 1000)),
 		     logfile_prefix[pri]);
 
 	n += vsnprintf(buf + n, BUFSIZ - n, format, ap);

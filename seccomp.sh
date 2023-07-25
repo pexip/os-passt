@@ -1,6 +1,6 @@
 #!/bin/sh -eu
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -15,7 +15,7 @@
 
 TMP="$(mktemp)"
 IN="$@"
-OUT="seccomp.h"
+OUT="$(mktemp)"
 
 [ -z "${ARCH}" ] && ARCH="$(uname -m)"
 [ -z "${CC}" ] && CC="cc"
@@ -53,7 +53,7 @@ BST='	BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, @NR@, @R@, @L@),'
 
 # cleanup() - Remove temporary file if it exists
 cleanup() {
-	rm -f "${TMP}"
+	rm -f "${TMP}" "${OUT}"
 }
 trap "cleanup" EXIT
 
@@ -254,3 +254,5 @@ for __p in ${__profiles}; do
 
 	gen_profile "${__p}" ${__calls}
 done
+
+mv "${OUT}" seccomp.h

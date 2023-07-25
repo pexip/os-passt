@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASTA - Pack A Subtle Tap Abstraction
  *  for network namespace/tap device mode
@@ -32,6 +32,7 @@
  */
 
 #include <sched.h>
+#include <unistd.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -40,7 +41,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include <net/ethernet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>

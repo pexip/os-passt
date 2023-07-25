@@ -8,17 +8,19 @@
 # Author: Stefano Brivio <sbrivio@redhat.com>
 
 %global git_hash {{{ git_head }}}
+%global selinuxtype targeted
 
 Name:		passt
 Version:	{{{ git_version }}}
 Release:	1%{?dist}
 Summary:	User-mode networking daemons for virtual machines and namespaces
-License:	AGPLv3+ and BSD
+License:	GPLv2+ and BSD
 Group:		System Environment/Daemons
 URL:		https://passt.top/
 Source:		https://passt.top/passt/snapshot/passt-%{git_hash}.tar.xz
 
 BuildRequires:	gcc, make, checkpolicy, selinux-policy-devel
+Requires:	(%{name}-selinux = %{version}-%{release} if selinux-policy-%{selinuxtype})
 
 %description
 passt implements a translation layer between a Layer-2 network interface and
@@ -60,20 +62,29 @@ ln -sr %{buildroot}%{_mandir}/man1/pasta.1 %{buildroot}%{_mandir}/man1/pasta.avx
 
 pushd contrib/selinux
 make -f %{_datadir}/selinux/devel/Makefile
-install -p -m 644 -D passt.pp %{buildroot}%{_datadir}/selinux/packages/%{name}/passt.pp
-install -p -m 644 -D pasta.pp %{buildroot}%{_datadir}/selinux/packages/%{name}/pasta.pp
+install -p -m 644 -D passt.pp %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/passt.pp
+install -p -m 644 -D passt.if %{buildroot}%{_datadir}/selinux/devel/include/distributed/passt.if
+install -p -m 644 -D pasta.pp %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/pasta.pp
 popd
 
-%post selinux
-semodule -i %{_datadir}/selinux/packages/%{name}/passt.pp 2>/dev/null || :
-semodule -i %{_datadir}/selinux/packages/%{name}/pasta.pp 2>/dev/null || :
+%pre selinux
+%selinux_relabel_pre -s %{selinuxtype}
 
-%preun selinux
-semodule -r passt 2>/dev/null || :
-semodule -r pasta 2>/dev/null || :
+%post selinux
+%selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/%{selinuxtype}/passt.pp
+%selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/%{selinuxtype}/pasta.pp
+
+%postun selinux
+if [ $1 -eq 0 ]; then
+	%selinux_modules_uninstall -s %{selinuxtype} passt
+	%selinux_modules_uninstall -s %{selinuxtype} pasta
+fi
+
+%posttrans selinux
+%selinux_relabel_post -s %{selinuxtype}
 
 %files
-%license LICENSES/{AGPL-3.0-or-later.txt,BSD-3-Clause.txt}
+%license LICENSES/{GPL-2.0-or-later.txt,BSD-3-Clause.txt}
 %dir %{_docdir}/%{name}
 %doc %{_docdir}/%{name}/README.md
 %doc %{_docdir}/%{name}/demo.sh
@@ -91,9 +102,9 @@ semodule -r pasta 2>/dev/null || :
 %endif
 
 %files selinux
-%dir %{_datadir}/selinux/packages/%{name}
-%{_datadir}/selinux/packages/%{name}/passt.pp
-%{_datadir}/selinux/packages/%{name}/pasta.pp
+%{_datadir}/selinux/packages/%{selinuxtype}/passt.pp
+%{_datadir}/selinux/devel/include/distributed/passt.if
+%{_datadir}/selinux/packages/%{selinuxtype}/pasta.pp
 
 %changelog
 {{{ passt_git_changelog }}}

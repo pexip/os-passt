@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -14,6 +14,7 @@
  */
 
 #include <sched.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <errno.h>
@@ -33,7 +34,6 @@
 #include <sys/uio.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
@@ -320,12 +320,23 @@ static size_t tap_send_frames_pasta(struct ctx *c,
 	size_t i;
 
 	for (i = 0; i < n; i++) {
-		if (write(c->fd_tap, (char *)iov[i].iov_base,
-			  iov[i].iov_len) < 0) {
+		if (write(c->fd_tap, iov[i].iov_base, iov[i].iov_len) < 0) {
 			debug("tap write: %s", strerror(errno));
-			if (errno != EAGAIN && errno != EWOULDBLOCK)
-				tap_handler(c, c->fd_tap, EPOLLERR, NULL);
-			i--;
+
+			switch (errno) {
+			case EAGAIN:
+#if EAGAIN != EWOULDBLOCK
+			case EWOULDBLOCK:
+#endif
+			case EINTR:
+				i--;
+				break;
+			case ENOBUFS:
+			case ENOSPC:
+				break;
+			default:
+				die("Write error on tap device, exiting");
+			}
 		}
 	}
 
@@ -739,7 +750,7 @@ resume:
 			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_seen)) {
 				c->ip6.addr_seen = *saddr;
 			}
-		} else {
+		} else if (!IN6_IS_ADDR_UNSPECIFIED(saddr)){
 			c->ip6.addr_seen = *saddr;
 		}
 
@@ -1236,6 +1247,9 @@ void tap_handler(struct ctx *c, int fd, uint32_t events,
 			info("Client closed connection, exiting");
 			exit(EXIT_SUCCESS);
 		}
+
+		if (c->mode == MODE_PASTA)
+			die("Error on tap device, exiting");
 
 		tap_sock_init(c);
 	}

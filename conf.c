@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -23,12 +23,12 @@
 #include <limits.h>
 #include <grp.h>
 #include <pwd.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <unistd.h>
 #include <syslog.h>
 #include <time.h>
 #include <netinet/in.h>
@@ -263,7 +263,9 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 			ifname++;
 		}
 
-		if (inet_pton(AF_INET, buf, addr))
+		if (ifname == buf + 1)		/* Interface without address */
+			addr = NULL;
+		else if (inet_pton(AF_INET, buf, addr))
 			af = AF_INET;
 		else if (inet_pton(AF_INET6, buf, addr))
 			af = AF_INET6;
@@ -632,9 +634,6 @@ static int conf_ip4_prefix(const char *arg)
 static unsigned int conf_ip4(unsigned int ifi,
 			     struct ip4_ctx *ip4, unsigned char *mac)
 {
-	in_addr_t addr, gw;
-	int shift;
-
 	if (!ifi)
 		ifi = nl_get_ext_if(AF_INET);
 
@@ -644,15 +643,15 @@ static unsigned int conf_ip4(unsigned int ifi,
 	}
 
 	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->gw))
-		nl_route(0, ifi, AF_INET, &ip4->gw);
+		nl_route(NL_GET, ifi, 0, AF_INET, &ip4->gw);
 
-	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->addr))
-		nl_addr(0, ifi, AF_INET, &ip4->addr, &ip4->prefix_len, NULL);
-
-	addr = ntohl(ip4->addr.s_addr);
-	gw = ntohl(ip4->gw.s_addr);
+	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->addr)) {
+		nl_addr(NL_GET, ifi, 0, AF_INET,
+			&ip4->addr, &ip4->prefix_len, NULL);
+	}
 
 	if (!ip4->prefix_len) {
+		in_addr_t addr = ntohl(ip4->addr.s_addr);
 		if (IN_CLASSA(addr))
 			ip4->prefix_len = (32 - IN_CLASSA_NSHIFT);
 		else if (IN_CLASSB(addr))
@@ -663,31 +662,12 @@ static unsigned int conf_ip4(unsigned int ifi,
 			ip4->prefix_len = 32;
 	}
 
-	/* We might get an address with a netmask that makes the default
-	 * gateway unreachable, and in that case we would fail to configure
-	 * the default route, with --config-net, or presumably a DHCP client
-	 * in the guest or container would face the same issue.
-	 *
-	 * The host might have another route, to the default gateway itself,
-	 * fixing the situation, but we only read default routes.
-	 *
-	 * Fix up the mask to allow reaching the default gateway from our
-	 * configured address, if needed, and only if we find a non-zero
-	 * mask that makes the gateway reachable.
-	 */
-	shift = 32 - ip4->prefix_len;
-	while (shift < 32 && addr >> shift != gw >> shift)
-		shift++;
-	if (shift < 32)
-		ip4->prefix_len = 32 - shift;
-
 	memcpy(&ip4->addr_seen, &ip4->addr, sizeof(ip4->addr_seen));
 
 	if (MAC_IS_ZERO(mac))
 		nl_link(0, ifi, mac, 0, 0);
 
-	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->gw) ||
-	    IN4_IS_ADDR_UNSPECIFIED(&ip4->addr) ||
+	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->addr) ||
 	    MAC_IS_ZERO(mac))
 		return 0;
 
@@ -716,9 +696,9 @@ static unsigned int conf_ip6(unsigned int ifi,
 	}
 
 	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->gw))
-		nl_route(0, ifi, AF_INET6, &ip6->gw);
+		nl_route(NL_GET, ifi, 0, AF_INET6, &ip6->gw);
 
-	nl_addr(0, ifi, AF_INET6,
+	nl_addr(NL_GET, ifi, 0, AF_INET6,
 		IN6_IS_ADDR_UNSPECIFIED(&ip6->addr) ? &ip6->addr : NULL,
 		&prefix_len, &ip6->addr_ll);
 
@@ -728,8 +708,7 @@ static unsigned int conf_ip6(unsigned int ifi,
 	if (MAC_IS_ZERO(mac))
 		nl_link(0, ifi, mac, 0, 0);
 
-	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->gw) ||
-	    IN6_IS_ADDR_UNSPECIFIED(&ip6->addr) ||
+	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->addr) ||
 	    IN6_IS_ADDR_UNSPECIFIED(&ip6->addr_ll) ||
 	    MAC_IS_ZERO(mac))
 		return 0;
@@ -738,10 +717,11 @@ static unsigned int conf_ip6(unsigned int ifi,
 }
 
 /**
- * usage() - Print usage and exit
+ * print_usage() - Print usage, exit with given status code
  * @name:	Executable name
+ * @status:	Status code for exit()
  */
-static void usage(const char *name)
+static void print_usage(const char *name, int status)
 {
 	if (strstr(name, "pasta")) {
 		info("Usage: %s [OPTION]... [COMMAND] [ARGS]...", name);
@@ -877,7 +857,7 @@ static void usage(const char *name)
 	info(   "    SPEC is as described for TCP above");
 	info(   "    default: none");
 
-	exit(EXIT_FAILURE);
+	exit(status);
 
 pasta_opts:
 
@@ -921,9 +901,22 @@ pasta_opts:
 	info(   "  --no-netns-quit	Don't quit if filesystem-bound target");
 	info(   "  			network namespace is deleted");
 	info(   "  --config-net		Configure tap interface in namespace");
+	info(   "  --no-copy-routes	DEPRECATED:");
+	info(   "			Don't copy all routes to namespace");
+	info(   "  --no-copy-addrs	DEPRECATED:");
+	info(   "			Don't copy all addresses to namespace");
 	info(   "  --ns-mac-addr ADDR	Set MAC address on tap interface");
 
-	exit(EXIT_FAILURE);
+	exit(status);
+}
+
+/**
+ * usage() - Print usage and exit with failure
+ * @name:	Executable name
+ */
+static void usage(const char *name)
+{
+	print_usage(name, EXIT_FAILURE);
 }
 
 /**
@@ -1094,10 +1087,6 @@ static int conf_runas(char *opt, unsigned int *uid, unsigned int *gid)
  */
 static void conf_ugid(char *runas, uid_t *uid, gid_t *gid)
 {
-	const char root_uid_map[] = "         0          0 4294967295";
-	char buf[BUFSIZ];
-	int fd;
-
 	/* If user has specified --runas, that takes precedence... */
 	if (runas) {
 		if (conf_runas(runas, uid, gid))
@@ -1114,18 +1103,8 @@ static void conf_ugid(char *runas, uid_t *uid, gid_t *gid)
 		return;
 
 	/* ...or at least not root in the init namespace... */
-	if ((fd = open("/proc/self/uid_map", O_RDONLY | O_CLOEXEC)) < 0) {
-		die("Can't determine if we're in init namespace: %s",
-		    strerror(errno));
-	}
-
-	if (read(fd, buf, BUFSIZ) != sizeof(root_uid_map) ||
-	    strncmp(buf, root_uid_map, sizeof(root_uid_map) - 1)) {
-		close(fd);
+	if (!ns_is_init())
 		return;
-	}
-
-	close(fd);
 
 	/* ...otherwise use nobody:nobody */
 	warn("Don't run as root. Changing to nobody...");
@@ -1196,7 +1175,6 @@ void conf(struct ctx *c, int argc, char **argv)
 		{"userns",	required_argument,	NULL,		2 },
 		{"netns",	required_argument,	NULL,		3 },
 		{"netns-only",	no_argument,		&netns_only,	1 },
-		{"config-net",	no_argument,		&c->pasta_conf_ns, 1 },
 		{"ns-mac-addr",	required_argument,	NULL,		4 },
 		{"dhcp-dns",	no_argument,		NULL,		5 },
 		{"no-dhcp-dns",	no_argument,		NULL,		6 },
@@ -1210,10 +1188,14 @@ void conf(struct ctx *c, int argc, char **argv)
 		{"version",	no_argument,		NULL,		14 },
 		{"outbound-if4", required_argument,	NULL,		15 },
 		{"outbound-if6", required_argument,	NULL,		16 },
+		{"config-net",	no_argument,		NULL,		17 },
+		{"no-copy-routes", no_argument,		NULL,		18 },
+		{"no-copy-addrs", no_argument,		NULL,		19 },
 		{ 0 },
 	};
 	struct get_bound_ports_ns_arg ns_ports_arg = { .c = c };
 	char userns[PATH_MAX] = { 0 }, netns[PATH_MAX] = { 0 };
+	bool copy_addrs_opt = false, copy_routes_opt = false;
 	bool v4_only = false, v6_only = false;
 	char *runas = NULL, *logfile = NULL;
 	struct in6_addr *dns6 = c->ip6.dns;
@@ -1368,6 +1350,26 @@ void conf(struct ctx *c, int argc, char **argv)
 				die("Invalid interface name: %s", optarg);
 
 			break;
+		case 17:
+			if (c->mode != MODE_PASTA)
+				die("--config-net is for pasta mode only");
+
+			c->pasta_conf_ns = 1;
+			break;
+		case 18:
+			if (c->mode != MODE_PASTA)
+				die("--no-copy-routes is for pasta mode only");
+
+			warn("--no-copy-routes will be dropped soon");
+			c->no_copy_routes = copy_routes_opt = true;
+			break;
+		case 19:
+			if (c->mode != MODE_PASTA)
+				die("--no-copy-addrs is for pasta mode only");
+
+			warn("--no-copy-addrs will be dropped soon");
+			c->no_copy_addrs = copy_addrs_opt = true;
+			break;
 		case 'd':
 			if (c->debug)
 				die("Multiple --debug options given");
@@ -1480,6 +1482,9 @@ void conf(struct ctx *c, int argc, char **argv)
 
 			break;
 		case 'a':
+			if (c->mode == MODE_PASTA)
+				c->no_copy_addrs = 1;
+
 			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr)	&&
 			    inet_pton(AF_INET6, optarg, &c->ip6.addr)	&&
 			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr)	&&
@@ -1516,6 +1521,9 @@ void conf(struct ctx *c, int argc, char **argv)
 			}
 			break;
 		case 'g':
+			if (c->mode == MODE_PASTA)
+				c->no_copy_routes = 1;
+
 			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.gw)		&&
 			    inet_pton(AF_INET6, optarg, &c->ip6.gw)	&&
 			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.gw)	&&
@@ -1636,8 +1644,11 @@ void conf(struct ctx *c, int argc, char **argv)
 		case 'U':
 			/* Handle these later, once addresses are configured */
 			break;
-		case '?':
 		case 'h':
+			log_to_stdout = 1;
+			print_usage(argv[0], EXIT_SUCCESS);
+			break;
+		case '?':
 		default:
 			usage(argv[0]);
 			break;
@@ -1649,6 +1660,13 @@ void conf(struct ctx *c, int argc, char **argv)
 
 	if (*c->sock_path && c->fd_tap >= 0)
 		die("Options --socket and --fd are mutually exclusive");
+
+	if (c->mode == MODE_PASTA && !c->pasta_conf_ns) {
+		if (copy_routes_opt)
+			die("--no-copy-routes needs --config-net");
+		if (copy_addrs_opt)
+			die("--no-copy-addrs needs --config-net");
+	}
 
 	if (!ifi4 && *c->ip4.ifname_out)
 		ifi4 = if_nametoindex(c->ip4.ifname_out);
@@ -1672,6 +1690,12 @@ void conf(struct ctx *c, int argc, char **argv)
 	    (*c->ip4.ifname_out && !c->ifi4) ||
 	    (*c->ip6.ifname_out && !c->ifi6))
 		die("External interface not usable");
+
+	if (c->ifi4 && IN4_IS_ADDR_UNSPECIFIED(&c->ip4.gw))
+		c->no_map_gw = c->no_dhcp = 1;
+
+	if (c->ifi6 && IN6_IS_ADDR_UNSPECIFIED(&c->ip6.gw))
+		c->no_map_gw = 1;
 
 	/* Inbound port options can be parsed now (after IPv4/IPv6 settings) */
 	optind = 1;
