@@ -1,3 +1,4 @@
 keep-ptrace.patch
 reap-children.patch
 wait-for-nscall.patch
+setsid-first-on-daemonize.patch

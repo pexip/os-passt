@@ -1,0 +1,17 @@
+diff --git a/util.c b/util.c
+index 1d00404..6fbd013 100644
+--- a/util.c
++++ b/util.c
+@@ -447,8 +447,11 @@ void write_pidfile(int fd, pid_t pid)
+  */
+ int __daemon(int pidfile_fd, int devnull_fd)
+ {
+-	pid_t pid = fork();
++	pid_t pid;
+ 
++	setsid();
++
++	pid = fork();
+ 	if (pid == -1) {
+ 		perror("fork");
+ 		exit(EXIT_FAILURE);
