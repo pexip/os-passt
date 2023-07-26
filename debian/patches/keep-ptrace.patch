@@ -1,0 +1,29 @@
+diff --git a/isolation.c b/isolation.c
+index 1866724..60b4657 100644
+--- a/isolation.c
++++ b/isolation.c
+@@ -194,19 +194,20 @@ void isolate_initial(void)
+ 	 * retain SETUID and SYS_ADMIN, but we might as well.  We drop
+ 	 * further capabilites in isolate_user() and
+ 	 * isolate_prefork().
++	 *
++	 * We also need to keep CAP_SYS_PTRACE in order to join an existing netns
++	 * path under /proc/$pid/ns/net which was created in the same userns.
+ 	 */
+ 	keep = BIT(CAP_NET_BIND_SERVICE) | BIT(CAP_SETUID) | BIT(CAP_SETGID) |
+-	       BIT(CAP_SYS_ADMIN) | BIT(CAP_NET_ADMIN);
++	       BIT(CAP_SYS_ADMIN) | BIT(CAP_NET_ADMIN) | BIT(CAP_SYS_PTRACE);
+ 
+ 	/* Since Linux 5.12, if we want to update /proc/self/uid_map to create
+ 	 * a mapping from UID 0, which only happens with pasta spawning a child
+ 	 * from a non-init user namespace (pasta can't run as root), we need to
+ 	 * retain CAP_SETFCAP too.
+-	 * We also need to keep CAP_SYS_PTRACE in order to join an existing netns
+-	 * path under /proc/$pid/ns/net which was created in the same userns.
+ 	 */
+ 	if (!ns_is_init() && !geteuid())
+-		keep |= BIT(CAP_SETFCAP) | BIT(CAP_SYS_PTRACE);
++		keep |= BIT(CAP_SETFCAP);
+ 
+ 	drop_caps_ep_except(keep);
+ }
