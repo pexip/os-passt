@@ -1,1 +1,2 @@
 keep-ptrace.patch
+reap-children.patch

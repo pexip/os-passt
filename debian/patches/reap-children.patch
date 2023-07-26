@@ -1,0 +1,24 @@
+diff --git a/pasta.c b/pasta.c
+index 8c85546..0ad9457 100644
+--- a/pasta.c
++++ b/pasta.c
+@@ -78,8 +78,17 @@ void pasta_child_handler(int signal)
+ 		}
+ 	}
+ 
+-	waitid(P_ALL, 0, NULL, WEXITED | WNOHANG);
+-	waitid(P_ALL, 0, NULL, WEXITED | WNOHANG);
++	/* Reap all exited children */
++	info("Received SIGCHLD: waiting for children");
++	do {
++		infop.si_pid = 0;
++		if (waitid(P_ALL, 0, &infop, WEXITED | WNOHANG) < 0) {
++			/* waitid returned an error: give up */
++			break;
++		}
++		info("Reaped child %d", infop.si_pid);
++	} while(infop.si_pid != 0);
++	info("Received SIGCHLD: waited for children");
+ }
+ 
+ /**
