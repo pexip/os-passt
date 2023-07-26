@@ -1,0 +1,29 @@
+diff --git a/util.h b/util.h
+index 26892aa..a1c910e 100644
+--- a/util.h
++++ b/util.h
+@@ -9,6 +9,7 @@
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <stdbool.h>
++#include <sys/wait.h>
+ 
+ #include "log.h"
+ 
+@@ -127,10 +128,15 @@ int do_clone(int (*fn)(void *), char *stack_area, size_t stack_size, int flags,
+ #define NS_CALL(fn, arg)						\
+ 	do {								\
+ 		char ns_fn_stack[NS_FN_STACK_SIZE];			\
++		int __pid;						\
+ 									\
+-		do_clone((fn), ns_fn_stack, sizeof(ns_fn_stack),	\
++		__pid = do_clone((fn), ns_fn_stack, sizeof(ns_fn_stack),\
+ 			 CLONE_VM | CLONE_VFORK | CLONE_FILES | SIGCHLD,\
+ 			 (void *)(arg));				\
++		if (__pid == -1) {					\
++			die("Failed to clone for ns call");		\
++		}							\
++		waitid(P_PID, __pid, NULL, WEXITED);			\
+ 	} while (0)
+ 
+ #define L2_BUF_IP4_INIT(proto)						\

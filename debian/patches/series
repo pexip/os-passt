@@ -1,2 +1,3 @@
 keep-ptrace.patch
 reap-children.patch
+wait-for-nscall.patch
