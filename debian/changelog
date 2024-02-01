@@ -1,3 +1,9 @@
+passt (0.0~git20230627.289301b-1+pexip24u4) pexip-bookworm; urgency=medium
+
+  * New versioning scheme
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Thu, 01 Feb 2024 16:15:39 +0000
+
 passt (0.0~git20230627.289301b-1pexip3) pexip-bookworm; urgency=medium
 
   * Bookworm build for product distribution
