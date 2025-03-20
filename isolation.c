@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -29,7 +29,8 @@
  *
  * Executed immediately after startup, drops capabilities we don't
  * need at any point during execution (or which we gain back when we
- * need by joining other namespaces).
+ * need by joining other namespaces), and closes any leaked file we
+ * might have inherited from the parent process.
  *
  * 2. isolate_user()
  * =================
@@ -105,7 +106,7 @@ static void drop_caps_ep_except(uint64_t keep)
 	int i;
 
 	if (syscall(SYS_capget, &hdr, data))
-		die("Couldn't get current capabilities: %s", strerror(errno));
+		die_perror("Couldn't get current capabilities");
 
 	for (i = 0; i < CAP_WORDS; i++) {
 		uint32_t mask = keep >> (32 * i);
@@ -115,7 +116,7 @@ static void drop_caps_ep_except(uint64_t keep)
 	}
 
 	if (syscall(SYS_capset, &hdr, data))
-		die("Couldn't drop capabilities: %s", strerror(errno));
+		die_perror("Couldn't drop capabilities");
 }
 
 /**
@@ -152,31 +153,34 @@ static void clamp_caps(void)
 		 */
 		if (prctl(PR_CAPBSET_DROP, i, 0, 0, 0) &&
 		    errno != EINVAL && errno != EPERM)
-			die("Couldn't drop cap %i from bounding set: %s",
-			    i, strerror(errno));
+			die_perror("Couldn't drop cap %i from bounding set", i);
 	}
 
 	if (syscall(SYS_capget, &hdr, data))
-		die("Couldn't get current capabilities: %s", strerror(errno));
+		die_perror("Couldn't get current capabilities");
 
 	for (i = 0; i < CAP_WORDS; i++)
 		data[i].inheritable = 0;
 
 	if (syscall(SYS_capset, &hdr, data))
-		die("Couldn't drop inheritable capabilities: %s",
-		    strerror(errno));
+		die_perror("Couldn't drop inheritable capabilities");
 }
 
 /**
- * isolate_initial() - Early, config independent self isolation
+ * isolate_initial() - Early, mostly config independent self isolation
+ * @argc:	Argument count
+ * @argv:	Command line options: only --fd (if present) is relevant here
  *
  * Should:
  *  - drop unneeded capabilities
+ *  - close all open files except for standard streams and the one from --fd
  * Musn't:
  *  - remove filesytem access (we need to access files during setup)
  */
-void isolate_initial(void)
+void isolate_initial(int argc, char **argv)
 {
+	uint64_t keep;
+
 	/* We want to keep CAP_NET_BIND_SERVICE in the initial
 	 * namespace if we have it, so that we can forward low ports
 	 * into the guest/namespace
@@ -193,9 +197,22 @@ void isolate_initial(void)
 	 * further capabilites in isolate_user() and
 	 * isolate_prefork().
 	 */
-	drop_caps_ep_except(BIT(CAP_NET_BIND_SERVICE) |
-			    BIT(CAP_SETUID) | BIT(CAP_SETGID) |
-			    BIT(CAP_SYS_ADMIN) | BIT(CAP_NET_ADMIN));
+	keep = BIT(CAP_NET_BIND_SERVICE) | BIT(CAP_SETUID) | BIT(CAP_SETGID) |
+	       BIT(CAP_SYS_ADMIN) | BIT(CAP_NET_ADMIN);
+
+	/* Since Linux 5.12, if we want to update /proc/self/uid_map to create
+	 * a mapping from UID 0, which only happens with pasta spawning a child
+	 * from a non-init user namespace (pasta can't run as root), we need to
+	 * retain CAP_SETFCAP too.
+	 * We also need to keep CAP_SYS_PTRACE in order to join an existing netns
+	 * path under /proc/$pid/ns/net which was created in the same userns.
+	 */
+	if (!ns_is_init() && !geteuid())
+		keep |= BIT(CAP_SETFCAP) | BIT(CAP_SYS_PTRACE);
+
+	drop_caps_ep_except(keep);
+
+	close_open_files(argc, argv);
 }
 
 /**
@@ -221,34 +238,30 @@ void isolate_user(uid_t uid, gid_t gid, bool use_userns, const char *userns,
 	if (setgroups(0, NULL)) {
 		/* If we don't have CAP_SETGID, this will EPERM */
 		if (errno != EPERM)
-			die("Can't drop supplementary groups: %s",
-			    strerror(errno));
+			die_perror("Can't drop supplementary groups");
 	}
 
 	if (setgid(gid) != 0)
-		die("Can't set GID to %u: %s", gid, strerror(errno));
+		die_perror("Can't set GID to %u", gid);
 
 	if (setuid(uid) != 0)
-		die("Can't set UID to %u: %s", uid, strerror(errno));
+		die_perror("Can't set UID to %u", uid);
 
 	if (*userns) { /* If given a userns, join it */
 		int ufd;
 
 		ufd = open(userns, O_RDONLY | O_CLOEXEC);
 		if (ufd < 0)
-			die("Couldn't open user namespace %s: %s",
-			    userns, strerror(errno));
+			die_perror("Couldn't open user namespace %s", userns);
 
 		if (setns(ufd, CLONE_NEWUSER) != 0)
-			die("Couldn't enter user namespace %s: %s",
-			    userns, strerror(errno));
+			die_perror("Couldn't enter user namespace %s", userns);
 
 		close(ufd);
 
 	} else if (use_userns) { /* Create and join a new userns */
 		if (unshare(CLONE_NEWUSER) != 0)
-			die("Couldn't create user namespace: %s",
-			    strerror(errno));
+			die_perror("Couldn't create user namespace");
 	}
 
 	/* Joining a new userns gives us full capabilities; drop the
@@ -290,7 +303,7 @@ void isolate_user(uid_t uid, gid_t gid, bool use_userns, const char *userns,
  * Mustn't:
  *  - Remove syscalls we need to daemonise
  */
-int isolate_prefork(struct ctx *c)
+int isolate_prefork(const struct ctx *c)
 {
 	int flags = CLONE_NEWIPC | CLONE_NEWNS | CLONE_NEWUTS;
 	uint64_t ns_caps = 0;
@@ -299,38 +312,38 @@ int isolate_prefork(struct ctx *c)
 	 * PID namespace. For passt, use CLONE_NEWPID anyway, in case somebody
 	 * ever gets around seccomp profiles -- there's no harm in passing it.
 	 */
-	if (!c->foreground || c->mode == MODE_PASST)
+	if (!c->foreground || c->mode != MODE_PASTA)
 		flags |= CLONE_NEWPID;
 
 	if (unshare(flags)) {
-		perror("unshare");
+		err_perror("Failed to detach isolating namespaces");
 		return -errno;
 	}
 
 	if (mount("", "/", "", MS_UNBINDABLE | MS_REC, NULL)) {
-		perror("mount /");
+		err_perror("Failed to remount /");
 		return -errno;
 	}
 
 	if (mount("", TMPDIR, "tmpfs",
 		  MS_NODEV | MS_NOEXEC | MS_NOSUID | MS_RDONLY,
 		  "nr_inodes=2,nr_blocks=0")) {
-		perror("mount tmpfs");
+		err_perror("Failed to mount empty tmpfs for pivot_root()");
 		return -errno;
 	}
 
 	if (chdir(TMPDIR)) {
-		perror("chdir");
+		err_perror("Failed to change directory into empty tmpfs");
 		return -errno;
 	}
 
 	if (syscall(SYS_pivot_root, ".", ".")) {
-		perror("pivot_root");
+		err_perror("Failed to pivot_root() into empty tmpfs");
 		return -errno;
 	}
 
 	if (umount2(".", MNT_DETACH | UMOUNT_NOFOLLOW)) {
-		perror("umount2");
+		err_perror("Failed to unmount original root filesystem");
 		return -errno;
 	}
 
@@ -366,17 +379,24 @@ void isolate_postfork(const struct ctx *c)
 
 	prctl(PR_SET_DUMPABLE, 0);
 
-	if (c->mode == MODE_PASST) {
+	switch (c->mode) {
+	case MODE_PASST:
 		prog.len = (unsigned short)ARRAY_SIZE(filter_passt);
 		prog.filter = filter_passt;
-	} else {
+		break;
+	case MODE_PASTA:
 		prog.len = (unsigned short)ARRAY_SIZE(filter_pasta);
 		prog.filter = filter_pasta;
+		break;
+	case MODE_VU:
+		prog.len = (unsigned short)ARRAY_SIZE(filter_vu);
+		prog.filter = filter_vu;
+		break;
+	default:
+		ASSERT(0);
 	}
 
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
-	    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)) {
-		perror("prctl");
-		exit(EXIT_FAILURE);
-	}
+	    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog))
+		die_perror("Failed to apply seccomp filter");
 }

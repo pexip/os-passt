@@ -1,17 +1,24 @@
 #!/usr/bin/make -f
 
+include /usr/share/dpkg/pkg-info.mk
+
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
 override_dh_auto_install:
-	dh_auto_install -- prefix=/usr
+	dh_auto_install -- prefix=/usr TARGET=$(DEB_HOST_GNU_CPU)
+	ln -f debian/passt/usr/bin/passt debian/passt/usr/bin/pasta
+ifneq (,$(findstring amd64,$(DEB_HOST_ARCH)))
+	ln -f debian/passt/usr/bin/passt.avx2 debian/passt/usr/bin/pasta.avx2
+endif
 	dh_apparmor --profile-name=usr.bin.passt -ppasst
+	dh_apparmor --profile-name=usr.bin.pasta -ppasst
+	dh_apparmor --profile-name=usr.bin.passt-repair -ppasst
 
-ifneq (,$(findstring amd64,$(DEB_BUILD_ARCH)))
+ifneq (,$(findstring amd64,$(DEB_HOST_ARCH)))
 override_dh_link:
 	dh_link usr/share/man/man1/passt.1 usr/share/man/man1/passt.avx2.1
 	dh_link usr/share/man/man1/pasta.1 usr/share/man/man1/pasta.avx2.1
 endif
 
 %:
-	export VERSION="$(DEB_UPSTREAM_VERSION)"
-	dh $@
+	VERSION=$(DEB_VERSION) dh $@

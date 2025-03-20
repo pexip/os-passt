@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -13,63 +13,95 @@
 # Copyright (c) 2021 Red Hat GmbH
 # Author: Stefano Brivio <sbrivio@redhat.com>
 
+# test_iperf3s() - Start iperf3 server
+# $1:	Destination/server context
+# $2:	Port number
+test_iperf3s() {
+	__sctx="${1}"
+	__port="${2}"
+
+	pane_or_context_run "${__sctx}" 'iperf3 -s -p'${__port}' -D -I s.pid'
+}
+
+# test_iperf3k() - Kill iperf3 server
+# $1:	Destination/server context
+test_iperf3k() {
+	__sctx="${1}"
+
+	pane_or_context_run "${__sctx}" 'kill -INT $(cat s.pid)'
+
+	sleep 1		# Wait for kernel to free up ports
+}
+
 # test_iperf3() - Ugly helper for iperf3 directive
 # $1:	Variable name: to put the measure bandwidth into
 # $2:	Source/client context
-# $3:	Destination/server context
-# $4:	Destination name or address for client
-# $5:	Port number, ${i} is translated to process index
-# $6:	Number of processes to run in parallel
-# $7:	Run time, in seconds
+# $3:	Destination name or address for client
+# $4:	Port number, ${i} is translated to process index
+# $5:	Run time, in seconds
 # $@:	Client options
 test_iperf3() {
 	__var="${1}"; shift
 	__cctx="${1}"; shift
-	__sctx="${1}"; shift
 	__dest="${1}"; shift
 	__port="${1}"; shift
-	__procs="$((${1} - 1))"; shift
 	__time="${1}"; shift
 
-	pane_or_context_run "${__sctx}" 'rm -f s*.json'
+	pane_or_context_run "${__cctx}" 'rm -f c.json'
 
-	pane_or_context_run_bg "${__sctx}" 				\
-		 'for i in $(seq 0 '${__procs}'); do'			\
-		 '	(iperf3 -s1J -p'${__port}' -i'${__time}		\
-		 '	 > s${i}.json) &'				\
-		 '	echo $! > s${i}.pid &'				\
-		 'done'							\
-
-	sleep 1		# Wait for server to be ready
-
-	pane_or_context_run_bg "${__cctx}" 				\
-		 '('							\
-		 '	for i in $(seq 0 '${__procs}'); do'		\
-		 '		iperf3 -c '${__dest}' -p '${__port}	\
-		 '		 -t'${__time}' -i0 -T s${i} '"${@}"' &' \
-		 '	done;'						\
-		 '	wait'						\
-		 ')'
-
-	sleep $((__time + 5))
-
-	# If client fails to deliver control message, tell server we're done
-	pane_or_context_run "${__sctx}" 'kill -INT $(cat s*.pid); rm s*.pid'
-
-	sleep 1		# ...and wait for output to be flushed
+        # A 1s wait for connection on what's basically a local link
+        # indicates something is pretty wrong
+        __timeout=1000
+	pane_or_context_run "${__cctx}" 				\
+		 'iperf3 -J -c '${__dest}' -p '${__port}		\
+		 '	 --connect-timeout '${__timeout}		\
+		 '	 -t'${__time}' -i0 '"${@}"' > c.json'		\
 
 	__jval=".end.sum_received.bits_per_second"
-	for __opt in ${@}; do
-		# UDP test
-		[ "${__opt}" = "-u" ] && __jval=".intervals[0].sum.bits_per_second"
-	done
 
-	__bw=$(pane_or_context_output "${__sctx}"			\
-		 'cat s*.json | jq -rMs "map('${__jval}') | add"')
+	__bw=$(pane_or_context_output "${__cctx}"			\
+		 'cat c.json | jq -rMs "map('${__jval}') | add"')
 
 	TEST_ONE_subs="$(list_add_pair "${TEST_ONE_subs}" "__${__var}__" "${__bw}" )"
+}
 
-	sleep 3		# Wait for kernel to free up ports
+# test_iperf3m() - Ugly helper for iperf3 directive, guest migration variant
+# $1:	Variable name: to put the measure bandwidth into
+# $2:	Initial source/client context
+# $3:	Second source/client context the guest is moving to
+# $4:	Destination name or address for client
+# $5:	Port number, ${i} is translated to process index
+# $6:	Run time, in seconds
+# $7:	Client options
+test_iperf3m() {
+	__var="${1}"; shift
+	__cctx="${1}"; shift
+	__cctx2="${1}"; shift
+	__dest="${1}"; shift
+	__port="${1}"; shift
+	__time="${1}"; shift
+
+	pane_or_context_run "${__cctx}" 'rm -f c.json'
+
+        # A 1s wait for connection on what's basically a local link
+        # indicates something is pretty wrong
+        __timeout=1000
+	pane_or_context_run_bg "${__cctx}" 				\
+		 'iperf3 -J -c '${__dest}' -p '${__port}		\
+		 '	 --connect-timeout '${__timeout}		\
+		 '	 -t'${__time}' -i0 '"${@}"' > c.json'		\
+
+	__jval=".end.sum_received.bits_per_second"
+
+	sleep $((${__time} + 3))
+
+	pane_or_context_output "${__cctx2}"				\
+		 'cat c.json'
+
+	__bw=$(pane_or_context_output "${__cctx2}"			\
+		 'cat c.json | jq -rMs "map('${__jval}') | add"')
+
+	TEST_ONE_subs="$(list_add_pair "${TEST_ONE_subs}" "__${__var}__" "${__bw}" )"
 }
 
 test_one_line() {
@@ -181,6 +213,12 @@ test_one_line() {
 	"guest2w")
 		pane_or_context_wait guest_2 || TEST_ONE_nok=1
 		;;
+	"mon")
+		pane_or_context_run mon "${__arg}" || TEST_ONE_nok=1
+		;;
+	"monb")
+		pane_or_context_run_bg mon "${__arg}"
+		;;
 	"ns")
 		pane_or_context_run ns "${__arg}" || TEST_ONE_nok=1
 		;;
@@ -287,8 +325,17 @@ test_one_line() {
 	"lat")
 		table_value_latency ${__arg} || TEST_ONE_perf_nok=1
 		;;
+	"iperf3s")
+		test_iperf3s ${__arg}
+                ;;
+	"iperf3k")
+		test_iperf3k ${__arg}
+                ;;
 	"iperf3")
 		test_iperf3 ${__arg}
+		;;
+	"iperf3m")
+		test_iperf3m ${__arg}
 		;;
 	"set")
 		TEST_ONE_subs="$(list_add_pair "${TEST_ONE_subs}" "__${__arg%% *}__" "${__arg#* }")"

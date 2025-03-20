@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -25,6 +25,7 @@
 #include <limits.h>
 
 #include "util.h"
+#include "ip.h"
 #include "checksum.h"
 #include "packet.h"
 #include "passt.h"
@@ -35,9 +36,9 @@
 /**
  * struct opt - DHCP option
  * @sent:	Convenience flag, set while filling replies
- * @slen:	Length of option defined for server
+ * @slen:	Length of option defined for server, -1 if not going to be sent
  * @s:		Option payload from server
- * @clen:	Length of option received from client
+ * @clen:	Length of option received from client, -1 if not received
  * @c:		Option payload from client
  */
 struct opt {
@@ -62,11 +63,21 @@ static struct opt opts[255];
 
 #define OPT_MIN		60 /* RFC 951 */
 
+/* Total option size (excluding end option) is 576 (RFC 2131), minus
+ * offset of options (268), minus end option (1).
+ */
+#define OPT_MAX		307
+
 /**
  * dhcp_init() - Initialise DHCP options
  */
 void dhcp_init(void)
 {
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(opts); i++)
+		opts[i].slen = -1;
+
 	opts[1]  = (struct opt) { 0, 4, {     0 }, 0, { 0 }, };	/* Mask */
 	opts[3]  = (struct opt) { 0, 4, {     0 }, 0, { 0 }, };	/* Router */
 	opts[51] = (struct opt) { 0, 4, {  0xff,
@@ -106,6 +117,8 @@ struct msg {
 	uint32_t xid;
 	uint16_t secs;
 	uint16_t flags;
+#define FLAG_BROADCAST	htons_constant(0x8000)
+
 	uint32_t ciaddr;
 	struct in_addr yiaddr;
 	uint32_t siaddr;
@@ -114,7 +127,7 @@ struct msg {
 	uint8_t sname[64];
 	uint8_t file[128];
 	uint32_t magic;
-	uint8_t o[308];
+	uint8_t o[OPT_MAX + 1 /* End option */ ];
 } __attribute__((__packed__));
 
 /**
@@ -122,15 +135,28 @@ struct msg {
  * @m:		Message to fill
  * @o:		Option number
  * @offset:	Current offset within options field, updated on insertion
+ *
+ * Return: false if m has space to write the option, true otherwise
  */
-static void fill_one(struct msg *m, int o, int *offset)
+static bool fill_one(struct msg *m, int o, int *offset)
 {
+	size_t slen = opts[o].slen;
+
+	/* If we don't have space to write the option, then just skip */
+	if (*offset + 2 /* code and length of option */ + slen > OPT_MAX)
+		return true;
+
 	m->o[*offset] = o;
-	m->o[*offset + 1] = opts[o].slen;
-	memcpy(&m->o[*offset + 2], opts[o].s, opts[o].slen);
+	m->o[*offset + 1] = slen;
+
+	/* Move to option */
+	*offset += 2;
+
+	memcpy(&m->o[*offset], opts[o].s, slen);
 
 	opts[o].sent = 1;
-	*offset += 2 + opts[o].slen;
+	*offset += slen;
+	return false;
 }
 
 /**
@@ -143,25 +169,31 @@ static int fill(struct msg *m)
 {
 	int i, o, offset = 0;
 
-	m->op = BOOTREPLY;
-	m->secs = 0;
-
 	for (o = 0; o < 255; o++)
 		opts[o].sent = 0;
 
+	/* Some clients (wattcp32, mTCP, maybe some others) expect
+	 * option 53 at the beginning of the list.
+	 * Put it there explicitly, unless requested via option 55.
+	 */
+	if (opts[55].clen > 0 && !memchr(opts[55].c, 53, opts[55].clen))
+		if (fill_one(m, 53, &offset))
+			 debug("DHCP: skipping option 53");
+
 	for (i = 0; i < opts[55].clen; i++) {
 		o = opts[55].c[i];
-		if (opts[o].slen)
-			fill_one(m, o, &offset);
+		if (opts[o].slen != -1)
+			if (fill_one(m, o, &offset))
+				debug("DHCP: skipping option %i", o);
 	}
 
 	for (o = 0; o < 255; o++) {
-		if (opts[o].slen && !opts[o].sent)
-			fill_one(m, o, &offset);
+		if (opts[o].slen != -1 && !opts[o].sent)
+			if (fill_one(m, o, &offset))
+				debug("DHCP: skipping option %i", o);
 	}
 
 	m->o[offset++] = 255;
-	m->o[offset++] = 0;
 
 	if (offset < OPT_MIN) {
 		memset(&m->o[offset], 0, OPT_MIN - offset);
@@ -256,6 +288,9 @@ static void opt_set_dns_search(const struct ctx *c, size_t max_len)
 						 ".\xc0");
 		}
 	}
+
+	if (!opts[119].slen)
+		opts[119].slen = -1;
 }
 
 /**
@@ -267,13 +302,15 @@ static void opt_set_dns_search(const struct ctx *c, size_t max_len)
  */
 int dhcp(const struct ctx *c, const struct pool *p)
 {
-	size_t mlen, len, offset = 0, opt_len, opt_off = 0;
-	struct in_addr mask;
-	struct ethhdr *eh;
-	struct iphdr *iph;
-	struct udphdr *uh;
+	size_t mlen, dlen, offset = 0, opt_len, opt_off = 0;
+	char macstr[ETH_ADDRSTRLEN];
+	struct in_addr mask, dst;
+	const struct ethhdr *eh;
+	const struct iphdr *iph;
+	const struct udphdr *uh;
+	struct msg const *m;
+	struct msg reply;
 	unsigned int i;
-	struct msg *m;
 
 	eh  = packet_get(p, 0, offset, sizeof(*eh),  NULL);
 	offset += sizeof(*eh);
@@ -302,10 +339,30 @@ int dhcp(const struct ctx *c, const struct pool *p)
 	    m->op != BOOTREQUEST)
 		return -1;
 
+	reply.op		= BOOTREPLY;
+	reply.htype		= m->htype;
+	reply.hlen		= m->hlen;
+	reply.hops		= 0;
+	reply.xid		= m->xid;
+	reply.secs		= 0;
+	reply.flags		= m->flags;
+	reply.ciaddr		= m->ciaddr;
+	reply.yiaddr		= c->ip4.addr;
+	reply.siaddr		= 0;
+	reply.giaddr		= m->giaddr;
+	memcpy(&reply.chaddr,	m->chaddr,	sizeof(reply.chaddr));
+	memset(&reply.sname,	0,		sizeof(reply.sname));
+	memset(&reply.file,	0,		sizeof(reply.file));
+	reply.magic		= m->magic;
+
 	offset += offsetof(struct msg, o);
 
+	for (i = 0; i < ARRAY_SIZE(opts); i++)
+		opts[i].clen = -1;
+
 	while (opt_off + 2 < opt_len) {
-		uint8_t *olen, *type, *val;
+		const uint8_t *olen, *val;
+		uint8_t *type;
 
 		type = packet_get(p, 0, offset + opt_off,	1,	NULL);
 		olen = packet_get(p, 0, offset + opt_off + 1,	1,	NULL);
@@ -317,42 +374,50 @@ int dhcp(const struct ctx *c, const struct pool *p)
 			return -1;
 
 		memcpy(&opts[*type].c, val, *olen);
+		opts[*type].clen = *olen;
 		opt_off += *olen + 2;
 	}
 
-	if (opts[53].c[0] == DHCPDISCOVER) {
-		info("DHCP: offer to discover");
-		opts[53].s[0] = DHCPOFFER;
-	} else if (opts[53].c[0] == DHCPREQUEST) {
-		info("DHCP: ack to request");
+	opts[80].slen = -1;
+	if (opts[53].clen > 0 && opts[53].c[0] == DHCPDISCOVER) {
+		if (opts[80].clen == -1) {
+			info("DHCP: offer to discover");
+			opts[53].s[0] = DHCPOFFER;
+		} else {
+			info("DHCP: ack to discover (Rapid Commit)");
+			opts[53].s[0] = DHCPACK;
+			opts[80].slen = 0;
+		}
+	} else if (opts[53].clen <= 0 || opts[53].c[0] == DHCPREQUEST) {
+		info("%s: ack to request", /* DHCP needs a valid message type */
+		     (opts[53].clen <= 0) ? "BOOTP" : "DHCP");
 		opts[53].s[0] = DHCPACK;
 	} else {
 		return -1;
 	}
 
-	info("    from %02x:%02x:%02x:%02x:%02x:%02x",
-	     m->chaddr[0], m->chaddr[1], m->chaddr[2],
-	     m->chaddr[3], m->chaddr[4], m->chaddr[5]);
+	info("    from %s", eth_ntop(m->chaddr, macstr, sizeof(macstr)));
 
-	m->yiaddr = c->ip4.addr;
 	mask.s_addr = htonl(0xffffffff << (32 - c->ip4.prefix_len));
-	memcpy(opts[1].s,  &mask,        sizeof(mask));
-	memcpy(opts[3].s,  &c->ip4.gw,   sizeof(c->ip4.gw));
-	memcpy(opts[54].s, &c->ip4.gw,   sizeof(c->ip4.gw));
+	memcpy(opts[1].s,  &mask,                sizeof(mask));
+	memcpy(opts[3].s,  &c->ip4.guest_gw,     sizeof(c->ip4.guest_gw));
+	memcpy(opts[54].s, &c->ip4.our_tap_addr, sizeof(c->ip4.our_tap_addr));
 
 	/* If the gateway is not on the assigned subnet, send an option 121
 	 * (Classless Static Routing) adding a dummy route to it.
 	 */
 	if ((c->ip4.addr.s_addr & mask.s_addr)
-	    != (c->ip4.gw.s_addr & mask.s_addr)) {
+	    != (c->ip4.guest_gw.s_addr & mask.s_addr)) {
 		/* a.b.c.d/32:0.0.0.0, 0:a.b.c.d */
 		opts[121].slen = 14;
 		opts[121].s[0] = 32;
-		memcpy(opts[121].s + 1,  &c->ip4.gw, sizeof(c->ip4.gw));
-		memcpy(opts[121].s + 10, &c->ip4.gw, sizeof(c->ip4.gw));
+		memcpy(opts[121].s + 1,
+		       &c->ip4.guest_gw, sizeof(c->ip4.guest_gw));
+		memcpy(opts[121].s + 10,
+		       &c->ip4.guest_gw, sizeof(c->ip4.guest_gw));
 	}
 
-	if (c->mtu != -1) {
+	if (c->mtu) {
 		opts[26].slen = 2;
 		opts[26].s[0] = c->mtu / 256;
 		opts[26].s[1] = c->mtu % 256;
@@ -363,12 +428,44 @@ int dhcp(const struct ctx *c, const struct pool *p)
 		((struct in_addr *)opts[6].s)[i] = c->ip4.dns[i];
 		opts[6].slen += sizeof(uint32_t);
 	}
+	if (!opts[6].slen)
+		opts[6].slen = -1;
+
+	opt_len = strlen(c->hostname);
+	if (opt_len > 0) {
+		opts[12].slen = opt_len;
+		memcpy(opts[12].s, &c->hostname, opt_len);
+	}
+
+	opt_len = strlen(c->fqdn);
+	if (opt_len > 0) {
+		opt_len += 3 /* flags */
+			+ 2; /* Length byte for first label, and terminator */
+
+		if (sizeof(opts[81].s) >= opt_len) {
+			opts[81].s[0] = 0x4; /* flags (E) */
+			opts[81].s[1] = 0xff; /* RCODE1 */
+			opts[81].s[2] = 0xff; /* RCODE2 */
+
+			encode_domain_name((char *)opts[81].s + 3, c->fqdn);
+
+			opts[81].slen = opt_len;
+		} else {
+			debug("DHCP: client FQDN option doesn't fit, skipping");
+		}
+	}
 
 	if (!c->no_dhcp_dns_search)
 		opt_set_dns_search(c, sizeof(m->o));
 
-	len = offsetof(struct msg, o) + fill(m);
-	tap_udp4_send(c, c->ip4.gw, 67, c->ip4.addr, 68, m, len);
+	dlen = offsetof(struct msg, o) + fill(&reply);
+
+	if (m->flags & FLAG_BROADCAST)
+		dst = in4addr_broadcast;
+	else
+		dst = c->ip4.addr;
+
+	tap_udp4_send(c, c->ip4.our_tap_addr, 67, dst, 68, &reply, dlen);
 
 	return 1;
 }

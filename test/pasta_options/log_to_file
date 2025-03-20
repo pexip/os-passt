@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -19,7 +19,7 @@ sleep	1
 endef
 
 def	flood_log_client
-host	tcp_crr --nolog -P 10001 -C 10002 -6 -c -H ::1
+host	tcp_crr --nolog -l1 -P 10001 -C 10002 -6 -c -H ::1
 endef
 
 def	check_log_size_mountns
@@ -33,19 +33,16 @@ test	Log creation
 set	PORTS -t 10001,10002 -u 10001,10002
 set	LOG_FILE __STATEDIR__/pasta.log
 
-passt	./pasta -l __LOG_FILE__
-passtb	exit
-sleep	1
+passt	./pasta -l __LOG_FILE__ -- /bin/true
 check	[ -s __LOG_FILE__ ]
 
 test	Log truncated on creation
-passt	./pasta -l __LOG_FILE__
-passtb	exit
-sleep	1
-check	[ $(cat __LOG_FILE__ | wc -l) -eq 1 ]
+passt	./pasta -l __LOG_FILE__ -- /bin/true & wait
+pout	PID2 echo $!
+check	head -1 __LOG_FILE__ | grep '^pasta .* [(]__PID2__[)]$'
 
 test	Maximum log size
-passtb	./pasta --config-net -d -f -l __LOG_FILE__ --log-size $((100 * 1024)) -- sh -c 'while true; do tcp_crr --nolog -P 10001 -C 10002 -6; done'
+passtb	./pasta --config-net -d -f -l __LOG_FILE__ --log-size $((100 * 1024)) -- sh -c 'while true; do tcp_crr --nolog -l1 -P 10001 -C 10002 -6; done'
 sleep	1
 
 flood_log_client

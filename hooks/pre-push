@@ -1,6 +1,6 @@
 #!/bin/sh -e
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -56,6 +56,7 @@ cd ..
 make pkgs
 scp passt passt.avx2 passt.1 qrap qrap.1	"${USER_HOST}:${BIN}"
 scp pasta pasta.avx2 pasta.1			"${USER_HOST}:${BIN}"
+scp passt-repair passt-repair.1			"${USER_HOST}:${BIN}"
 
 ssh "${USER_HOST}" 				"rm -f ${BIN}/*.deb"
 ssh "${USER_HOST}"				"rm -f ${BIN}/*.rpm"

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -15,13 +15,21 @@
 
   include <abstractions/passt>
 
+  mount		""	-> "/proc/",
+
   @{PROC}/net/tcp			r,	# procfs_scan_listen(), util.c
   @{PROC}/net/tcp6			r,
   @{PROC}/net/udp			r,
   @{PROC}/net/udp6			r,
 
-  @{run}/user/@{uid}/netns/*		r,	# pasta_open_ns(), pasta.c
+  @{PROC}/@{pid}/net/tcp		r,	# procfs_scan_listen(), util.c
+  @{PROC}/@{pid}/net/tcp6		r,
+  @{PROC}/@{pid}/net/udp		r,
+  @{PROC}/@{pid}/net/udp6		r,
 
+  @{run}/user/@{uid}/**			rw,	# pasta_open_ns()
+
+  @{PROC}/[0-9]*/ns/			r,	# pasta_netns_quit_init(),
   @{PROC}/[0-9]*/ns/net			r,	# pasta_wait_for_ns(),
   @{PROC}/[0-9]*/ns/user		r,	# conf_pasta_ns()
 
@@ -33,3 +41,7 @@
 
   owner @{PROC}/sys/net/ipv4/ping_group_range w, # pasta_spawn_cmd(), pasta.c
   /{usr/,}bin/**			Ux,
+
+  /usr/bin/pasta.avx2			ix,	# arch_avx2_exec(), arch.c
+
+  ptrace				r,	# pasta_open_ns()

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -15,8 +15,7 @@
 
   include <abstractions/base>
 
-  # Alternatively: include <abstractions/nameservice>
-  @{etc_ro}/resolv.conf			r,	# get_dns(), conf.c
+  include <abstractions/nameservice>		# get_dns(), conf.c
 
   capability net_bind_service,			# isolation.c, conf.c
   capability setuid,
@@ -27,10 +26,15 @@
   capability sys_ptrace,
 
   /					r,	# isolate_prefork(), isolation.c
+  mount options=(rw, runbindable) -> /,
   mount		""	-> "/",
   mount		""	-> "/tmp/",
   pivot_root	"/tmp/" -> "/tmp/",
   umount	"/",
+
+  owner @{PROC}/@{pid}/uid_map		r,	# conf_ugid()
+
+  @{PROC}/sys/net/ipv4/ip_local_port_range r,	# fwd_probe_ephemeral()
 
   network netlink raw,				# nl_sock_init_do(), netlink.c
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *
@@ -32,6 +32,7 @@
 #include <linux/icmpv6.h>
 
 #include "util.h"
+#include "ip.h"
 #include "passt.h"
 #include "arp.h"
 
@@ -251,8 +252,8 @@ int main(int argc, char **argv)
 		}
 
 		if (!strcmp(argv[i], "-device") && i + 1 < argc) {
-			char *template = NULL;
-			char *p;
+			const char *template = NULL;
+			const char *p;
 
 			has_dev = 1;
 

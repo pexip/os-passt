@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -15,91 +15,80 @@
 /**
  * DOC: Theory of Operation
  *
+ * UDP Flows
+ * =========
  *
- * For UDP, a reduced version of port-based connection tracking is implemented
- * with two purposes:
- * - binding ephemeral ports when they're used as source port by the guest, so
- *   that replies on those ports can be forwarded back to the guest, with a
- *   fixed timeout for this binding
- * - packets received from the local host get their source changed to a local
- *   address (gateway address) so that they can be forwarded to the guest, and
- *   packets sent as replies by the guest need their destination address to
- *   be changed back to the address of the local host. This is dynamic to allow
- *   connections from the gateway as well, and uses the same fixed 180s timeout
- * 
- * Sockets for bound ports are created at initialisation time, one set for IPv4
- * and one for IPv6.
+ * UDP doesn't have true connections, but many protocols use a connection-like
+ * format.  The flow is initiated by a client sending a datagram from a port of
+ * its choosing (usually ephemeral) to a specific port (usually well known) on a
+ * server.  Both client and server address must be unicast.  The server sends
+ * replies using the same addresses & ports with src/dest swapped.
  *
- * Packets are forwarded back and forth, by prepending and stripping UDP headers
- * in the obvious way, with no port translation.
+ * We track pseudo-connections of this type as flow table entries of type
+ * FLOW_UDP.  We store the time of the last traffic on the flow in uflow->ts,
+ * and let the flow expire if there is no traffic for UDP_CONN_TIMEOUT seconds.
  *
- * In PASTA mode, the L2-L4 translation is skipped for connections to ports
- * bound between namespaces using the loopback interface, messages are directly
+ * NOTE: This won't handle multicast protocols, or some protocols with different
+ * port usage.  We'll need specific logic if we want to handle those.
+ *
+ * "Listening" sockets
+ * ===================
+ *
+ * UDP doesn't use listen(), but we consider long term sockets which are allowed
+ * to create new flows "listening" by analogy with TCP. This listening socket
+ * could receive packets from multiple flows, so we use a hash table match to
+ * find the specific flow for a datagram.
+ *
+ * When a UDP flow is initiated from a listening socket we take a duplicate of
+ * the socket and store it in uflow->s[INISIDE].  This will last for the
+ * lifetime of the flow, even if the original listening socket is closed due to
+ * port auto-probing.  The duplicate is used to deliver replies back to the
+ * originating side.
+ *
+ * Reply sockets
+ * =============
+ *
+ * When a UDP flow targets a socket, we create a "reply" socket in
+ * uflow->s[TGTSIDE] both to deliver datagrams to the target side and receive
+ * replies on the target side.  This socket is both bound and connected and has
+ * EPOLL_TYPE_UDP_REPLY.  The connect() means it will only receive datagrams
+ * associated with this flow, so the epoll reference directly points to the flow
+ * and we don't need a hash lookup.
+ *
+ * NOTE: it's possible that the reply socket could have a bound address
+ * overlapping with an unrelated listening socket.  We assume datagrams for the
+ * flow will come to the reply socket in preference to a listening socket.  The
+ * sample program doc/platform-requirements/reuseaddr-priority.c documents and
+ * tests that assumption.
+ *
+ * "Spliced" flows
+ * ===============
+ *
+ * In PASTA mode, L2-L4 translation is skipped for connections to ports bound
+ * between namespaces using the loopback interface, messages are directly
  * transferred between L4 sockets instead. These are called spliced connections
- * for consistency with the TCP implementation, but the splice() syscall isn't
- * actually used as it wouldn't make sense for datagram-based connections: a
- * pair of recvmmsg() and sendmmsg() deals with this case.
+ * in analogy with the TCP implementation.  The the splice() syscall isn't
+ * actually used; it doesn't make sense for datagrams and instead a pair of
+ * recvmmsg() and sendmmsg() is used to forward the datagrams.
  *
- * The connection tracking for PASTA mode is slightly complicated by the absence
- * of actual connections, see struct udp_splice_port, and these examples:
- *
- * - from init to namespace:
- *
- *   - forward direction: 127.0.0.1:5000 -> 127.0.0.1:80 in init from socket s,
- *     with epoll reference: index = 80, splice = 1, orig = 1, ns = 0
- *     - if udp_splice_ns[V4][5000].sock:
- *       - send packet to udp_splice_ns[V4][5000].sock, with destination port
- *         80
- *     - otherwise:
- *       - create new socket udp_splice_ns[V4][5000].sock
- *       - bind in namespace to 127.0.0.1:5000
- *       - add to epoll with reference: index = 5000, splice = 1, orig = 0,
- *         ns = 1
- *     - update udp_splice_init[V4][80].ts and udp_splice_ns[V4][5000].ts with
- *       current time
- *
- *   - reverse direction: 127.0.0.1:80 -> 127.0.0.1:5000 in namespace socket s,
- *     having epoll reference: index = 5000, splice = 1, orig = 0, ns = 1
- *     - if udp_splice_init[V4][80].sock:
- *       - send to udp_splice_init[V4][80].sock, with destination port 5000
- *       - update udp_splice_init[V4][80].ts and udp_splice_ns[V4][5000].ts with
- *         current time
- *     - otherwise, discard
- *
- * - from namespace to init:
- *
- *   - forward direction: 127.0.0.1:2000 -> 127.0.0.1:22 in namespace from
- *     socket s, with epoll reference: index = 22, splice = 1, orig = 1, ns = 1
- *     - if udp4_splice_init[V4][2000].sock:
- *       - send packet to udp_splice_init[V4][2000].sock, with destination
- *         port 22
- *     - otherwise:
- *       - create new socket udp_splice_init[V4][2000].sock
- *       - bind in init to 127.0.0.1:2000
- *       - add to epoll with reference: index = 2000, splice = 1, orig = 0,
- *         ns = 0
- *     - update udp_splice_ns[V4][22].ts and udp_splice_init[V4][2000].ts with
- *       current time
- *
- *   - reverse direction: 127.0.0.1:22 -> 127.0.0.1:2000 in init from socket s,
- *     having epoll reference: index = 2000, splice = 1, orig = 0, ns = 0
- *   - if udp_splice_ns[V4][22].sock:
- *     - send to udp_splice_ns[V4][22].sock, with destination port 2000
- *     - update udp_splice_ns[V4][22].ts and udp_splice_init[V4][2000].ts with
- *       current time
- *   - otherwise, discard
+ * Note that a spliced flow will have *both* a duplicated listening socket and a
+ * reply socket (see above).
  */
 
 #include <sched.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <errno.h>
 #include <limits.h>
+#include <assert.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -107,632 +96,574 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
-#include <unistd.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <linux/errqueue.h>
 
 #include "checksum.h"
 #include "util.h"
+#include "iov.h"
+#include "ip.h"
+#include "siphash.h"
+#include "inany.h"
 #include "passt.h"
 #include "tap.h"
 #include "pcap.h"
 #include "log.h"
+#include "flow_table.h"
+#include "udp_internal.h"
+#include "udp_vu.h"
 
-#define UDP_CONN_TIMEOUT	180 /* s, timeout for ephemeral or local bind */
-#define UDP_MAX_FRAMES		32  /* max # of frames to receive at once */
-
-/**
- * struct udp_tap_port - Port tracking based on tap-facing source port
- * @sock:	Socket bound to source port used as index
- * @flags:	Flags for local bind, loopback address/unicast address as source
- * @ts:		Activity timestamp from tap, used for socket aging
- */
-struct udp_tap_port {
-	int sock;
-	uint8_t flags;
-#define PORT_LOCAL	BIT(0)
-#define PORT_LOOPBACK	BIT(1)
-#define PORT_GUA	BIT(2)
-
-	time_t ts;
-};
-
-/**
- * struct udp_splice_port - Bound socket for spliced communication
- * @sock:	Socket bound to index port
- * @ts:		Activity timestamp
- */
-struct udp_splice_port {
-	int sock;
-	time_t ts;
-};
-
-/* Port tracking, arrays indexed by packet source port (host order) */
-static struct udp_tap_port	udp_tap_map	[IP_VERSIONS][NUM_PORTS];
+/* Maximum UDP data to be returned in ICMP messages */
+#define ICMP4_MAX_DLEN 8
+#define ICMP6_MAX_DLEN (IPV6_MIN_MTU			\
+			- sizeof(struct udphdr)	\
+			- sizeof(struct ipv6hdr))
 
 /* "Spliced" sockets indexed by bound port (host order) */
-static struct udp_splice_port udp_splice_ns  [IP_VERSIONS][NUM_PORTS];
-static struct udp_splice_port udp_splice_init[IP_VERSIONS][NUM_PORTS];
-
-enum udp_act_type {
-	UDP_ACT_TAP,
-	UDP_ACT_SPLICE_NS,
-	UDP_ACT_SPLICE_INIT,
-	UDP_ACT_TYPE_MAX,
-};
-
-/* Activity-based aging for bindings */
-static uint8_t udp_act[IP_VERSIONS][UDP_ACT_TYPE_MAX][DIV_ROUND_UP(NUM_PORTS, 8)];
+static int udp_splice_ns  [IP_VERSIONS][NUM_PORTS];
+static int udp_splice_init[IP_VERSIONS][NUM_PORTS];
 
 /* Static buffers */
 
+/* UDP header and data for inbound messages */
+static struct udp_payload_t udp_payload[UDP_MAX_FRAMES];
+
+/* Ethernet header for IPv4 frames */
+static struct ethhdr udp4_eth_hdr;
+
+/* Ethernet header for IPv6 frames */
+static struct ethhdr udp6_eth_hdr;
+
 /**
- * udp4_l2_buf_t - Pre-cooked IPv4 packet buffers for tap connections
+ * struct udp_meta_t - Pre-cooked headers and metadata for UDP packets
+ * @ip6h:	Pre-filled IPv6 header (except for payload_len and addresses)
+ * @ip4h:	Pre-filled IPv4 header (except for tot_len and saddr)
+ * @taph:	Tap backend specific header
  * @s_in:	Source socket address, filled in by recvmmsg()
- * @psum:	Partial IP header checksum (excluding tot_len and saddr)
- * @taph:	Tap-level headers (partially pre-filled)
- * @iph:	Pre-filled IP header (except for tot_len and saddr)
- * @uh:		Headroom for UDP header
- * @data:	Storage for UDP payload
+ * @tosidx:	sidx for the destination side of this datagram's flow
  */
-static struct udp4_l2_buf_t {
-	struct sockaddr_in s_in;
-	uint32_t psum;
-
-	struct tap_hdr taph;
-	struct iphdr iph;
-	struct udphdr uh;
-	uint8_t data[USHRT_MAX -
-		     (sizeof(struct iphdr) + sizeof(struct udphdr))];
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))))
-udp4_l2_buf[UDP_MAX_FRAMES];
-
-/**
- * udp6_l2_buf_t - Pre-cooked IPv6 packet buffers for tap connections
- * @s_in6:	Source socket address, filled in by recvmmsg()
- * @taph:	Tap-level headers (partially pre-filled)
- * @ip6h:	Pre-filled IP header (except for payload_len and addresses)
- * @uh:		Headroom for UDP header
- * @data:	Storage for UDP payload
- */
-struct udp6_l2_buf_t {
-	struct sockaddr_in6 s_in6;
-#ifdef __AVX2__
-	/* Align ip6h to 32-byte boundary. */
-	uint8_t pad[64 - (sizeof(struct sockaddr_in6) + sizeof(struct ethhdr) +
-			  sizeof(uint32_t))];
-#endif
-
-	struct tap_hdr taph;
+static struct udp_meta_t {
 	struct ipv6hdr ip6h;
-	struct udphdr uh;
-	uint8_t data[USHRT_MAX -
-		     (sizeof(struct ipv6hdr) + sizeof(struct udphdr))];
-#ifdef __AVX2__
-} __attribute__ ((packed, aligned(32)))
-#else
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))))
-#endif
-udp6_l2_buf[UDP_MAX_FRAMES];
+	struct iphdr ip4h;
+	struct tap_hdr taph;
 
-/* recvmmsg()/sendmmsg() data for tap */
-static struct iovec	udp4_l2_iov_sock	[UDP_MAX_FRAMES];
-static struct iovec	udp6_l2_iov_sock	[UDP_MAX_FRAMES];
-
-static struct iovec	udp4_l2_iov_tap		[UDP_MAX_FRAMES];
-static struct iovec	udp6_l2_iov_tap		[UDP_MAX_FRAMES];
-
-static struct mmsghdr	udp4_l2_mh_sock		[UDP_MAX_FRAMES];
-static struct mmsghdr	udp6_l2_mh_sock		[UDP_MAX_FRAMES];
-
-/* recvmmsg()/sendmmsg() data for "spliced" connections */
-static struct iovec	udp4_iov_splice		[UDP_MAX_FRAMES];
-static struct iovec	udp6_iov_splice		[UDP_MAX_FRAMES];
-
-static struct sockaddr_in udp4_localname = {
-	.sin_family = AF_INET,
-	.sin_addr = IN4ADDR_LOOPBACK_INIT,
-};
-static struct sockaddr_in6 udp6_localname = {
-	.sin6_family = AF_INET6,
-	.sin6_addr = IN6ADDR_LOOPBACK_INIT,
-};
-
-static struct mmsghdr	udp4_mh_splice		[UDP_MAX_FRAMES];
-static struct mmsghdr	udp6_mh_splice		[UDP_MAX_FRAMES];
-
-/**
- * udp_invert_portmap() - Compute reverse port translations for return packets
- * @fwd:	Port forwarding configuration to compute reverse map for
- */
-static void udp_invert_portmap(struct udp_port_fwd *fwd)
-{
-	int i;
-
-	ASSERT(ARRAY_SIZE(fwd->f.delta) == ARRAY_SIZE(fwd->rdelta));
-	for (i = 0; i < ARRAY_SIZE(fwd->f.delta); i++) {
-		in_port_t delta = fwd->f.delta[i];
-
-		if (delta)
-			fwd->rdelta[(in_port_t)i + delta] = NUM_PORTS - delta;
-	}
+	union sockaddr_inany s_in;
+	flow_sidx_t tosidx;
 }
+#ifdef __AVX2__
+__attribute__ ((aligned(32)))
+#endif
+udp_meta[UDP_MAX_FRAMES];
 
 /**
- * udp_update_check4() - Update checksum with variable parts from stored one
- * @buf:	L2 packet buffer with final IPv4 header
+ * enum udp_iov_idx - Indices for the buffers making up a single UDP frame
+ * @UDP_IOV_TAP         tap specific header
+ * @UDP_IOV_ETH         Ethernet header
+ * @UDP_IOV_IP          IP (v4/v6) header
+ * @UDP_IOV_PAYLOAD     IP payload (UDP header + data)
+ * @UDP_NUM_IOVS        the number of entries in the iovec array
  */
-static void udp_update_check4(struct udp4_l2_buf_t *buf)
+enum udp_iov_idx {
+	UDP_IOV_TAP,
+	UDP_IOV_ETH,
+	UDP_IOV_IP,
+	UDP_IOV_PAYLOAD,
+	UDP_NUM_IOVS,
+};
+
+/* IOVs and msghdr arrays for receiving datagrams from sockets */
+static struct iovec	udp_iov_recv		[UDP_MAX_FRAMES];
+static struct mmsghdr	udp_mh_recv		[UDP_MAX_FRAMES];
+
+/* IOVs and msghdr arrays for sending "spliced" datagrams to sockets */
+static union sockaddr_inany udp_splice_to;
+
+static struct iovec	udp_iov_splice		[UDP_MAX_FRAMES];
+static struct mmsghdr	udp_mh_splice		[UDP_MAX_FRAMES];
+
+/* IOVs for L2 frames */
+static struct iovec	udp_l2_iov		[UDP_MAX_FRAMES][UDP_NUM_IOVS];
+
+/**
+ * udp_portmap_clear() - Clear UDP port map before configuration
+ */
+void udp_portmap_clear(void)
 {
-	uint32_t sum = buf->psum;
+	unsigned i;
 
-	sum += buf->iph.tot_len;
-	sum += (buf->iph.saddr >> 16) & 0xffff;
-	sum += buf->iph.saddr & 0xffff;
-
-	buf->iph.check = (uint16_t)~csum_fold(sum);
+	for (i = 0; i < NUM_PORTS; i++) {
+		udp_splice_ns[V4][i] = udp_splice_ns[V6][i] = -1;
+		udp_splice_init[V4][i] = udp_splice_init[V6][i] = -1;
+	}
 }
 
 /**
  * udp_update_l2_buf() - Update L2 buffers with Ethernet and IPv4 addresses
  * @eth_d:	Ethernet destination address, NULL if unchanged
  * @eth_s:	Ethernet source address, NULL if unchanged
- * @ip_da:	Pointer to IPv4 destination address, NULL if unchanged
  */
-void udp_update_l2_buf(const unsigned char *eth_d, const unsigned char *eth_s,
-		       const struct in_addr *ip_da)
+void udp_update_l2_buf(const unsigned char *eth_d, const unsigned char *eth_s)
 {
-	int i;
-
-	for (i = 0; i < UDP_MAX_FRAMES; i++) {
-		struct udp4_l2_buf_t *b4 = &udp4_l2_buf[i];
-		struct udp6_l2_buf_t *b6 = &udp6_l2_buf[i];
-
-		tap_update_mac(&b4->taph, eth_d, eth_s);
-		tap_update_mac(&b6->taph, eth_d, eth_s);
-
-		if (ip_da) {
-			b4->iph.daddr = ip_da->s_addr;
-			if (!i) {
-				b4->iph.saddr = 0;
-				b4->iph.tot_len = 0;
-				b4->iph.check = 0;
-				b4->psum = sum_16b(&b4->iph, 20);
-			} else {
-				b4->psum = udp4_l2_buf[0].psum;
-			}
-		}
-	}
+	eth_update_mac(&udp4_eth_hdr, eth_d, eth_s);
+	eth_update_mac(&udp6_eth_hdr, eth_d, eth_s);
 }
 
 /**
- * udp_sock4_iov_init() - Initialise scatter-gather L2 buffers for IPv4 sockets
+ * udp_iov_init_one() - Initialise scatter-gather lists for one buffer
+ * @c:		Execution context
+ * @i:		Index of buffer to initialize
+ */
+static void udp_iov_init_one(const struct ctx *c, size_t i)
+{
+	struct udp_payload_t *payload = &udp_payload[i];
+	struct msghdr *mh = &udp_mh_recv[i].msg_hdr;
+	struct udp_meta_t *meta = &udp_meta[i];
+	struct iovec *siov = &udp_iov_recv[i];
+	struct iovec *tiov = udp_l2_iov[i];
+
+	*meta = (struct udp_meta_t) {
+		.ip4h = L2_BUF_IP4_INIT(IPPROTO_UDP),
+		.ip6h = L2_BUF_IP6_INIT(IPPROTO_UDP),
+	};
+
+	*siov = IOV_OF_LVALUE(payload->data);
+
+	tiov[UDP_IOV_TAP] = tap_hdr_iov(c, &meta->taph);
+	tiov[UDP_IOV_PAYLOAD].iov_base = payload;
+
+	mh->msg_name	= &meta->s_in;
+	mh->msg_namelen	= sizeof(meta->s_in);
+	mh->msg_iov	= siov;
+	mh->msg_iovlen	= 1;
+}
+
+/**
+ * udp_iov_init() - Initialise scatter-gather L2 buffers
  * @c:		Execution context
  */
-static void udp_sock4_iov_init(const struct ctx *c)
+static void udp_iov_init(const struct ctx *c)
 {
-	struct mmsghdr *h;
-	int i;
+	size_t i;
 
-	for (i = 0; i < ARRAY_SIZE(udp4_l2_buf); i++) {
-		udp4_l2_buf[i] = (struct udp4_l2_buf_t) {
-			.taph = TAP_HDR_INIT(ETH_P_IP),
-			.iph = L2_BUF_IP4_INIT(IPPROTO_UDP)
-		};
-	}
+	udp4_eth_hdr.h_proto = htons_constant(ETH_P_IP);
+	udp6_eth_hdr.h_proto = htons_constant(ETH_P_IPV6);
 
-	for (i = 0, h = udp4_l2_mh_sock; i < UDP_MAX_FRAMES; i++, h++) {
-		struct msghdr *mh = &h->msg_hdr;
-
-		mh->msg_name			= &udp4_l2_buf[i].s_in;
-		mh->msg_namelen			= sizeof(udp4_l2_buf[i].s_in);
-
-		udp4_l2_iov_sock[i].iov_base	= udp4_l2_buf[i].data;
-		udp4_l2_iov_sock[i].iov_len	= sizeof(udp4_l2_buf[i].data);
-		mh->msg_iov			= &udp4_l2_iov_sock[i];
-		mh->msg_iovlen			= 1;
-	}
-
-	for (i = 0; i < UDP_MAX_FRAMES; i++) {
-		struct iovec *iov = &udp4_l2_iov_tap[i];
-
-		iov->iov_base = tap_iov_base(c, &udp4_l2_buf[i].taph);
-	}
+	for (i = 0; i < UDP_MAX_FRAMES; i++)
+		udp_iov_init_one(c, i);
 }
 
 /**
- * udp_sock6_iov_init() - Initialise scatter-gather L2 buffers for IPv6 sockets
+ * udp_splice_prepare() - Prepare one datagram for splicing
+ * @mmh:	Receiving mmsghdr array
+ * @idx:	Index of the datagram to prepare
+ */
+static void udp_splice_prepare(struct mmsghdr *mmh, unsigned idx)
+{
+	udp_mh_splice[idx].msg_hdr.msg_iov->iov_len = mmh[idx].msg_len;
+}
+
+/**
+ * udp_splice_send() - Send a batch of datagrams from socket to socket
  * @c:		Execution context
- */
-static void udp_sock6_iov_init(const struct ctx *c)
-{
-	struct mmsghdr *h;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(udp6_l2_buf); i++) {
-		udp6_l2_buf[i] = (struct udp6_l2_buf_t) {
-			.taph = TAP_HDR_INIT(ETH_P_IPV6),
-			.ip6h = L2_BUF_IP6_INIT(IPPROTO_UDP)
-		};
-	}
-
-	for (i = 0, h = udp6_l2_mh_sock; i < UDP_MAX_FRAMES; i++, h++) {
-		struct msghdr *mh = &h->msg_hdr;
-
-		mh->msg_name			= &udp6_l2_buf[i].s_in6;
-		mh->msg_namelen			= sizeof(struct sockaddr_in6);
-
-		udp6_l2_iov_sock[i].iov_base	= udp6_l2_buf[i].data;
-		udp6_l2_iov_sock[i].iov_len	= sizeof(udp6_l2_buf[i].data);
-		mh->msg_iov			= &udp6_l2_iov_sock[i];
-		mh->msg_iovlen			= 1;
-	}
-
-	for (i = 0; i < UDP_MAX_FRAMES; i++) {
-		struct iovec *iov = &udp6_l2_iov_tap[i];
-
-		iov->iov_base = tap_iov_base(c, &udp6_l2_buf[i].taph);
-	}
-}
-
-/**
- * udp_splice_new() - Create and prepare socket for "spliced" binding
- * @c:		Execution context
- * @v6:		Set for IPv6 sockets
- * @src:	Source port of original connection, host order
- * @splice:	UDP_BACK_TO_INIT from init, UDP_BACK_TO_NS from namespace
- *
- * Return: prepared socket, negative error code on failure
- *
- * #syscalls:pasta getsockname
- */
-int udp_splice_new(const struct ctx *c, int v6, in_port_t src, bool ns)
-{
-	struct epoll_event ev = { .events = EPOLLIN | EPOLLRDHUP | EPOLLHUP };
-	union epoll_ref ref = { .r.proto = IPPROTO_UDP,
-				.r.p.udp.udp = { .splice = true, .ns = ns,
-						 .v6 = v6, .port = src }
-			      };
-	struct udp_splice_port *sp;
-	int act, s;
-
-	if (ns) {
-		sp = &udp_splice_ns[v6 ? V6 : V4][src];
-		act = UDP_ACT_SPLICE_NS;
-	} else {
-		sp = &udp_splice_init[v6 ? V6 : V4][src];
-		act = UDP_ACT_SPLICE_INIT;
-	}
-
-	s = socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM | SOCK_NONBLOCK,
-		   IPPROTO_UDP);
-
-	if (s > SOCKET_MAX) {
-		close(s);
-		return -EIO;
-	}
-
-	if (s < 0)
-		return s;
-
-	ref.r.s = s;
-
-	if (v6) {
-		struct sockaddr_in6 addr6 = {
-			.sin6_family = AF_INET6,
-			.sin6_port = htons(src),
-			.sin6_addr = IN6ADDR_LOOPBACK_INIT,
-		};
-		if (bind(s, (struct sockaddr *)&addr6, sizeof(addr6)))
-			goto fail;
-	} else {
-		struct sockaddr_in addr4 = {
-			.sin_family = AF_INET,
-			.sin_port = htons(src),
-			.sin_addr = { .s_addr = htonl(INADDR_LOOPBACK) },
-		};
-		if (bind(s, (struct sockaddr *)&addr4, sizeof(addr4)))
-			goto fail;
-	}
-
-	sp->sock = s;
-	bitmap_set(udp_act[v6 ? V6 : V4][act], src);
-
-	ev.data.u64 = ref.u64;
-	epoll_ctl(c->epollfd, EPOLL_CTL_ADD, s, &ev);
-	return s;
-
-fail:
-	close(s);
-	return -1;
-}
-
-/**
- * struct udp_splice_new_ns_arg - Arguments for udp_splice_new_ns()
- * @c:		Execution context
- * @v6:		Set for IPv6
- * @src:	Source port of originating datagram, host order
- * @dst:	Destination port of originating datagram, host order
- * @s:		Newly created socket or negative error code
- */
-struct udp_splice_new_ns_arg {
-	const struct ctx *c;
-	int v6;
-	in_port_t src;
-	int s;
-};
-
-/**
- * udp_splice_new_ns() - Enter namespace and call udp_splice_new()
- * @arg:	See struct udp_splice_new_ns_arg
- *
- * Return: 0
- */
-static int udp_splice_new_ns(void *arg)
-{
-	struct udp_splice_new_ns_arg *a;
-
-	a = (struct udp_splice_new_ns_arg *)arg;
-
-	if (ns_enter(a->c))
-		return 0;
-
-	a->s = udp_splice_new(a->c, a->v6, a->src, true);
-
-	return 0;
-}
-
-/**
- * udp_mmh_splice_port() - Is source address of message suitable for splicing?
- * @v6:		Is @sa a sockaddr_in6 (otherwise sockaddr_in)?
- * @mmh:	mmsghdr of incoming message
- *
- * Return: if @sa refers to localhost (127.0.0.1 or ::1) the port from
- *         @sa in host order, otherwise -1.
- */
-static int udp_mmh_splice_port(bool v6, const struct mmsghdr *mmh)
-{
-	const struct sockaddr_in6 *sa6 = mmh->msg_hdr.msg_name;
-	const struct sockaddr_in *sa4 = mmh->msg_hdr.msg_name;
-
-	if (v6 && IN6_IS_ADDR_LOOPBACK(&sa6->sin6_addr))
-		return ntohs(sa6->sin6_port);
-
-	if (!v6 && IN4_IS_ADDR_LOOPBACK(&sa4->sin_addr))
-		return ntohs(sa4->sin_port);
-
-	return -1;
-}
-
-/**
- * udp_splice_sendfrom() - Send datagrams from given port to given port
- * @c:		Execution context
- * @start:	Index of first datagram in udp[46]_l2_buf
- * @n:		Number of datagrams to send
- * @src:	Datagrams will be sent from this port (on origin side)
- * @dst:	Datagrams will be send to this port (on destination side)
- * @v6:		Send as IPv6?
- * @from_ns:	If true send from pasta ns to init, otherwise reverse
- * @allow_new:	If true create sending socket if needed, if false discard
- *              if no sending socket is available
+ * @start:	Index of batch's first datagram in udp[46]_l2_buf
+ * @n:		Number of datagrams in batch
+ * @src:	Source port for datagram (target side)
+ * @dst:	Destination port for datagrams (target side)
+ * @ref:	epoll reference for origin socket
  * @now:	Timestamp
  */
-static void udp_splice_sendfrom(const struct ctx *c, unsigned start, unsigned n,
-				in_port_t src, in_port_t dst,
-				bool v6, bool from_ns, bool allow_new,
-				const struct timespec *now)
+static void udp_splice_send(const struct ctx *c, size_t start, size_t n,
+			    flow_sidx_t tosidx)
 {
-	struct mmsghdr *mmh_recv, *mmh_send;
-	unsigned int i;
-	int s;
+	const struct flowside *toside = flowside_at_sidx(tosidx);
+	const struct udp_flow *uflow = udp_at_sidx(tosidx);
+	uint8_t topif = pif_at_sidx(tosidx);
+	int s = uflow->s[tosidx.sidei];
+	socklen_t sl;
 
-	if (v6) {
-		mmh_recv = udp6_l2_mh_sock;
-		mmh_send = udp6_mh_splice;
-	} else {
-		mmh_recv = udp4_l2_mh_sock;
-		mmh_send = udp4_mh_splice;
-	}
+	pif_sockaddr(c, &udp_splice_to, &sl, topif,
+		     &toside->eaddr, toside->eport);
 
-	if (from_ns) {
-		src += c->udp.fwd_in.rdelta[src];
-		s = udp_splice_init[v6][src].sock;
-		if (!s && allow_new)
-			s = udp_splice_new(c, v6, src, false);
-
-		if (s < 0)
-			return;
-
-		udp_splice_ns[v6][dst].ts = now->tv_sec;
-		udp_splice_init[v6][src].ts = now->tv_sec;
-	} else {
-		src += c->udp.fwd_out.rdelta[src];
-		s = udp_splice_ns[v6][src].sock;
-		if (!s && allow_new) {
-			struct udp_splice_new_ns_arg arg = {
-				c, v6, src, -1,
-			};
-
-			NS_CALL(udp_splice_new_ns, &arg);
-			s = arg.s;
-		}
-		if (s < 0)
-			return;
-
-		udp_splice_init[v6][dst].ts = now->tv_sec;
-		udp_splice_ns[v6][src].ts = now->tv_sec;
-	}
-
-	for (i = start; i < start + n; i++)
-		mmh_send[i].msg_hdr.msg_iov->iov_len = mmh_recv[i].msg_len;
-
-	sendmmsg(s, mmh_send + start, n, MSG_NOSIGNAL);
+	sendmmsg(s, udp_mh_splice + start, n, MSG_NOSIGNAL);
 }
 
 /**
  * udp_update_hdr4() - Update headers for one IPv4 datagram
- * @c:		Execution context
- * @n:		Index of buffer in udp4_l2_buf pool
- * @dstport:	Destination port number
- * @now:	Current timestamp
+ * @ip4h:		Pre-filled IPv4 header (except for tot_len and saddr)
+ * @bp:			Pointer to udp_payload_t to update
+ * @toside:		Flowside for destination side
+ * @dlen:		Length of UDP payload
+ * @no_udp_csum:	Do not set UDP checksum
  *
- * Return: size of tap frame with headers
+ * Return: size of IPv4 payload (UDP header + data)
  */
-static size_t udp_update_hdr4(const struct ctx *c, int n, in_port_t dstport,
-			      const struct timespec *now)
+size_t udp_update_hdr4(struct iphdr *ip4h, struct udp_payload_t *bp,
+		       const struct flowside *toside, size_t dlen,
+		       bool no_udp_csum)
 {
-	struct udp4_l2_buf_t *b = &udp4_l2_buf[n];
-	in_port_t src_port;
-	size_t ip_len;
+	const struct in_addr *src = inany_v4(&toside->oaddr);
+	const struct in_addr *dst = inany_v4(&toside->eaddr);
+	size_t l4len = dlen + sizeof(bp->uh);
+	size_t l3len = l4len + sizeof(*ip4h);
 
-	ip_len = udp4_l2_mh_sock[n].msg_len + sizeof(b->iph) + sizeof(b->uh);
+	ASSERT(src && dst);
 
-	b->iph.tot_len = htons(ip_len);
+	ip4h->tot_len = htons(l3len);
+	ip4h->daddr = dst->s_addr;
+	ip4h->saddr = src->s_addr;
+	ip4h->check = csum_ip4_header(l3len, IPPROTO_UDP, *src, *dst);
 
-	src_port = ntohs(b->s_in.sin_port);
-
-	if (!IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_match) &&
-	    IN4_ARE_ADDR_EQUAL(&b->s_in.sin_addr, &c->ip4.dns_host) &&
-	    src_port == 53) {
-		b->iph.saddr = c->ip4.dns_match.s_addr;
-	} else if (IN4_IS_ADDR_LOOPBACK(&b->s_in.sin_addr) ||
-		   IN4_IS_ADDR_UNSPECIFIED(&b->s_in.sin_addr)||
-		   IN4_ARE_ADDR_EQUAL(&b->s_in.sin_addr, &c->ip4.addr_seen)) {
-		b->iph.saddr = c->ip4.gw.s_addr;
-		udp_tap_map[V4][src_port].ts = now->tv_sec;
-		udp_tap_map[V4][src_port].flags |= PORT_LOCAL;
-
-		if (IN4_ARE_ADDR_EQUAL(&b->s_in.sin_addr.s_addr, &c->ip4.addr_seen))
-			udp_tap_map[V4][src_port].flags &= ~PORT_LOOPBACK;
-		else
-			udp_tap_map[V4][src_port].flags |= PORT_LOOPBACK;
-
-		bitmap_set(udp_act[V4][UDP_ACT_TAP], src_port);
+	bp->uh.source = htons(toside->oport);
+	bp->uh.dest = htons(toside->eport);
+	bp->uh.len = htons(l4len);
+	if (no_udp_csum) {
+		bp->uh.check = 0;
 	} else {
-		b->iph.saddr = b->s_in.sin_addr.s_addr;
+		const struct iovec iov = {
+			.iov_base = bp->data,
+			.iov_len = dlen
+		};
+		struct iov_tail data = IOV_TAIL(&iov, 1, 0);
+		csum_udp4(&bp->uh, *src, *dst, &data);
 	}
 
-	udp_update_check4(b);
-	b->uh.source = b->s_in.sin_port;
-	b->uh.dest = htons(dstport);
-	b->uh.len = htons(udp4_l2_mh_sock[n].msg_len + sizeof(b->uh));
-
-	return tap_iov_len(c, &b->taph, ip_len);
+	return l4len;
 }
 
 /**
  * udp_update_hdr6() - Update headers for one IPv6 datagram
- * @c:		Execution context
- * @n:		Index of buffer in udp6_l2_buf pool
- * @dstport:	Destination port number
- * @now:	Current timestamp
+ * @ip6h:		Pre-filled IPv6 header (except for payload_len and
+ * 			addresses)
+ * @bp:			Pointer to udp_payload_t to update
+ * @toside:		Flowside for destination side
+ * @dlen:		Length of UDP payload
+ * @no_udp_csum:	Do not set UDP checksum
  *
- * Return: size of tap frame with headers
+ * Return: size of IPv6 payload (UDP header + data)
  */
-static size_t udp_update_hdr6(const struct ctx *c, int n, in_port_t dstport,
-			      const struct timespec *now)
+size_t udp_update_hdr6(struct ipv6hdr *ip6h, struct udp_payload_t *bp,
+		       const struct flowside *toside, size_t dlen,
+		       bool no_udp_csum)
 {
-	struct udp6_l2_buf_t *b = &udp6_l2_buf[n];
-	struct in6_addr *src;
-	in_port_t src_port;
-	size_t ip_len;
+	uint16_t l4len = dlen + sizeof(bp->uh);
 
-	src = &b->s_in6.sin6_addr;
-	src_port = ntohs(b->s_in6.sin6_port);
+	ip6h->payload_len = htons(l4len);
+	ip6h->daddr = toside->eaddr.a6;
+	ip6h->saddr = toside->oaddr.a6;
+	ip6h->version = 6;
+	ip6h->nexthdr = IPPROTO_UDP;
+	ip6h->hop_limit = 255;
 
-	ip_len = udp6_l2_mh_sock[n].msg_len + sizeof(b->ip6h) + sizeof(b->uh);
-
-	b->ip6h.payload_len = htons(udp6_l2_mh_sock[n].msg_len + sizeof(b->uh));
-
-	if (IN6_IS_ADDR_LINKLOCAL(src)) {
-		b->ip6h.daddr = c->ip6.addr_ll_seen;
-		b->ip6h.saddr = b->s_in6.sin6_addr;
-	} else if (!IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_match) &&
-		   IN6_ARE_ADDR_EQUAL(src, &c->ip6.dns_host) &&
-		   src_port == 53) {
-		b->ip6h.daddr = c->ip6.addr_seen;
-		b->ip6h.saddr = c->ip6.dns_match;
-	} else if (IN6_IS_ADDR_LOOPBACK(src)			||
-		   IN6_ARE_ADDR_EQUAL(src, &c->ip6.addr_seen)	||
-		   IN6_ARE_ADDR_EQUAL(src, &c->ip6.addr)) {
-		b->ip6h.daddr = c->ip6.addr_ll_seen;
-
-		if (IN6_IS_ADDR_LINKLOCAL(&c->ip6.gw))
-			b->ip6h.saddr = c->ip6.gw;
-		else
-			b->ip6h.saddr = c->ip6.addr_ll;
-
-		udp_tap_map[V6][src_port].ts = now->tv_sec;
-		udp_tap_map[V6][src_port].flags |= PORT_LOCAL;
-
-		if (IN6_IS_ADDR_LOOPBACK(src))
-			udp_tap_map[V6][src_port].flags |= PORT_LOOPBACK;
-		else
-			udp_tap_map[V6][src_port].flags &= ~PORT_LOOPBACK;
-
-		if (IN6_ARE_ADDR_EQUAL(src, &c->ip6.addr))
-			udp_tap_map[V6][src_port].flags |= PORT_GUA;
-		else
-			udp_tap_map[V6][src_port].flags &= ~PORT_GUA;
-
-		bitmap_set(udp_act[V6][UDP_ACT_TAP], src_port);
+	bp->uh.source = htons(toside->oport);
+	bp->uh.dest = htons(toside->eport);
+	bp->uh.len = ip6h->payload_len;
+	if (no_udp_csum) {
+		/* 0 is an invalid checksum for UDP IPv6 and dropped by
+		 * the kernel stack, even if the checksum is disabled by virtio
+		 * flags. We need to put any non-zero value here.
+		 */
+		bp->uh.check = 0xffff;
 	} else {
-		b->ip6h.daddr = c->ip6.addr_seen;
-		b->ip6h.saddr = b->s_in6.sin6_addr;
+		const struct iovec iov = {
+			.iov_base = bp->data,
+			.iov_len = dlen
+		};
+		struct iov_tail data = IOV_TAIL(&iov, 1, 0);
+		csum_udp6(&bp->uh, &toside->oaddr.a6, &toside->eaddr.a6, &data);
 	}
 
-	b->uh.source = b->s_in6.sin6_port;
-	b->uh.dest = htons(dstport);
-	b->uh.len = b->ip6h.payload_len;
-
-	b->ip6h.hop_limit = IPPROTO_UDP;
-	b->ip6h.version = b->ip6h.nexthdr = b->uh.check = 0;
-	b->uh.check = csum(&b->ip6h, ip_len, 0);
-	b->ip6h.version = 6;
-	b->ip6h.nexthdr = IPPROTO_UDP;
-	b->ip6h.hop_limit = 255;
-
-	return tap_iov_len(c, &b->taph, ip_len);
+	return l4len;
 }
 
 /**
- * udp_tap_send() - Prepare UDP datagrams and send to tap interface
- * @c:		Execution context
- * @start:	Index of first datagram in udp[46]_l2_buf pool
- * @n:		Number of datagrams to send
- * @dstport:	Destination port number
- * @v6:		True if using IPv6
- * @now:	Current timestamp
- *
- * Return: size of tap frame with headers
+ * udp_tap_prepare() - Convert one datagram into a tap frame
+ * @mmh:	Receiving mmsghdr array
+ * @idx:	Index of the datagram to prepare
+ * @toside:	Flowside for destination side
+ * @no_udp_csum: Do not set UDP checksum
  */
-static void udp_tap_send(struct ctx *c,
-			 unsigned int start, unsigned int n,
-			 in_port_t dstport, bool v6, const struct timespec *now)
+static void udp_tap_prepare(const struct mmsghdr *mmh,
+			    unsigned idx, const struct flowside *toside,
+			    bool no_udp_csum)
 {
-	struct iovec *tap_iov;
-	unsigned int i;
+	struct iovec (*tap_iov)[UDP_NUM_IOVS] = &udp_l2_iov[idx];
+	struct udp_payload_t *bp = &udp_payload[idx];
+	struct udp_meta_t *bm = &udp_meta[idx];
+	size_t l4len;
 
-	if (v6)
-		tap_iov = udp6_l2_iov_tap;
-	else
-		tap_iov = udp4_l2_iov_tap;
-
-	for (i = start; i < start + n; i++) {
-		size_t buf_len;
-
-		if (v6)
-			buf_len = udp_update_hdr6(c, i, dstport, now);
-		else
-			buf_len = udp_update_hdr4(c, i, dstport, now);
-
-		tap_iov[i].iov_len = buf_len;
+	if (!inany_v4(&toside->eaddr) || !inany_v4(&toside->oaddr)) {
+		l4len = udp_update_hdr6(&bm->ip6h, bp, toside,
+					mmh[idx].msg_len, no_udp_csum);
+		tap_hdr_update(&bm->taph, l4len + sizeof(bm->ip6h) +
+			       sizeof(udp6_eth_hdr));
+		(*tap_iov)[UDP_IOV_ETH] = IOV_OF_LVALUE(udp6_eth_hdr);
+		(*tap_iov)[UDP_IOV_IP] = IOV_OF_LVALUE(bm->ip6h);
+	} else {
+		l4len = udp_update_hdr4(&bm->ip4h, bp, toside,
+					mmh[idx].msg_len, no_udp_csum);
+		tap_hdr_update(&bm->taph, l4len + sizeof(bm->ip4h) +
+			       sizeof(udp4_eth_hdr));
+		(*tap_iov)[UDP_IOV_ETH] = IOV_OF_LVALUE(udp4_eth_hdr);
+		(*tap_iov)[UDP_IOV_IP] = IOV_OF_LVALUE(bm->ip4h);
 	}
-
-	tap_send_frames(c, tap_iov + start, n);
+	(*tap_iov)[UDP_IOV_PAYLOAD].iov_len = l4len;
 }
 
 /**
- * udp_sock_handler() - Handle new data from socket
+ * udp_send_conn_fail_icmp4() - Construct and send ICMPv4 to local peer
+ * @c:		Execution context
+ * @ee:	Extended error descriptor
+ * @toside:	Destination side of flow
+ * @saddr:	Address of ICMP generating node
+ * @in:	First bytes (max 8) of original UDP message body
+ * @dlen:	Length of the read part of original UDP message body
+ */
+static void udp_send_conn_fail_icmp4(const struct ctx *c,
+				     const struct sock_extended_err *ee,
+				     const struct flowside *toside,
+				     struct in_addr saddr,
+				     const void *in, size_t dlen)
+{
+	struct in_addr oaddr = toside->oaddr.v4mapped.a4;
+	struct in_addr eaddr = toside->eaddr.v4mapped.a4;
+	in_port_t eport = toside->eport;
+	in_port_t oport = toside->oport;
+	struct {
+		struct icmphdr icmp4h;
+		struct iphdr ip4h;
+		struct udphdr uh;
+		char data[ICMP4_MAX_DLEN];
+	} __attribute__((packed, aligned(__alignof__(max_align_t)))) msg;
+	size_t msglen = sizeof(msg) - sizeof(msg.data) + dlen;
+	size_t l4len = dlen + sizeof(struct udphdr);
+
+	ASSERT(dlen <= ICMP4_MAX_DLEN);
+	memset(&msg, 0, sizeof(msg));
+	msg.icmp4h.type = ee->ee_type;
+	msg.icmp4h.code = ee->ee_code;
+	if (ee->ee_type == ICMP_DEST_UNREACH && ee->ee_code == ICMP_FRAG_NEEDED)
+		msg.icmp4h.un.frag.mtu = htons((uint16_t) ee->ee_info);
+
+	/* Reconstruct the original headers as returned in the ICMP message */
+	tap_push_ip4h(&msg.ip4h, eaddr, oaddr, l4len, IPPROTO_UDP);
+	tap_push_uh4(&msg.uh, eaddr, eport, oaddr, oport, in, dlen);
+	memcpy(&msg.data, in, dlen);
+
+	tap_icmp4_send(c, saddr, eaddr, &msg, msglen);
+}
+
+
+/**
+ * udp_send_conn_fail_icmp6() - Construct and send ICMPv6 to local peer
+ * @c:		Execution context
+ * @ee:	Extended error descriptor
+ * @toside:	Destination side of flow
+ * @saddr:	Address of ICMP generating node
+ * @in:	First bytes (max 1232) of original UDP message body
+ * @dlen:	Length of the read part of original UDP message body
+ * @flow:	IPv6 flow identifier
+ */
+static void udp_send_conn_fail_icmp6(const struct ctx *c,
+				     const struct sock_extended_err *ee,
+				     const struct flowside *toside,
+				     const struct in6_addr *saddr,
+				     void *in, size_t dlen, uint32_t flow)
+{
+	const struct in6_addr *oaddr = &toside->oaddr.a6;
+	const struct in6_addr *eaddr = &toside->eaddr.a6;
+	in_port_t eport = toside->eport;
+	in_port_t oport = toside->oport;
+	struct {
+		struct icmp6_hdr icmp6h;
+		struct ipv6hdr ip6h;
+		struct udphdr uh;
+		char data[ICMP6_MAX_DLEN];
+	} __attribute__((packed, aligned(__alignof__(max_align_t)))) msg;
+	size_t msglen = sizeof(msg) - sizeof(msg.data) + dlen;
+	size_t l4len = dlen + sizeof(struct udphdr);
+
+	ASSERT(dlen <= ICMP6_MAX_DLEN);
+	memset(&msg, 0, sizeof(msg));
+	msg.icmp6h.icmp6_type = ee->ee_type;
+	msg.icmp6h.icmp6_code = ee->ee_code;
+	if (ee->ee_type == ICMP6_PACKET_TOO_BIG)
+		msg.icmp6h.icmp6_dataun.icmp6_un_data32[0] = htonl(ee->ee_info);
+
+	/* Reconstruct the original headers as returned in the ICMP message */
+	tap_push_ip6h(&msg.ip6h, eaddr, oaddr, l4len, IPPROTO_UDP, flow);
+	tap_push_uh6(&msg.uh, eaddr, eport, oaddr, oport, in, dlen);
+	memcpy(&msg.data, in, dlen);
+
+	tap_icmp6_send(c, saddr, eaddr, &msg, msglen);
+}
+
+/**
+ * udp_sock_recverr() - Receive and clear an error from a socket
+ * @c:		Execution context
+ * @ref:	epoll reference
+ *
+ * Return: 1 if error received and processed, 0 if no more errors in queue, < 0
+ *         if there was an error reading the queue
+ *
+ * #syscalls recvmsg
+ */
+static int udp_sock_recverr(const struct ctx *c, union epoll_ref ref)
+{
+	const struct sock_extended_err *ee;
+	const struct cmsghdr *hdr;
+	union sockaddr_inany saddr;
+	char buf[CMSG_SPACE(sizeof(*ee))];
+	char data[ICMP6_MAX_DLEN];
+	int s = ref.fd;
+	struct iovec iov = {
+		.iov_base = data,
+		.iov_len = sizeof(data)
+	};
+	struct msghdr mh = {
+		.msg_name = &saddr,
+		.msg_namelen = sizeof(saddr),
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = buf,
+		.msg_controllen = sizeof(buf),
+	};
+	ssize_t rc;
+
+	rc = recvmsg(s, &mh, MSG_ERRQUEUE);
+	if (rc < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0;
+
+		err_perror("UDP: Failed to read error queue");
+		return -1;
+	}
+
+	if (!(mh.msg_flags & MSG_ERRQUEUE)) {
+		err("Missing MSG_ERRQUEUE flag reading error queue");
+		return -1;
+	}
+
+	hdr = CMSG_FIRSTHDR(&mh);
+	if (!((hdr->cmsg_level == IPPROTO_IP &&
+	       hdr->cmsg_type == IP_RECVERR) ||
+	      (hdr->cmsg_level == IPPROTO_IPV6 &&
+	       hdr->cmsg_type == IPV6_RECVERR))) {
+		err("Unexpected cmsg reading error queue");
+		return -1;
+	}
+
+	ee = (const struct sock_extended_err *)CMSG_DATA(hdr);
+	if (ref.type == EPOLL_TYPE_UDP_REPLY) {
+		flow_sidx_t sidx = flow_sidx_opposite(ref.flowside);
+		const struct flowside *toside = flowside_at_sidx(sidx);
+		size_t dlen = rc;
+
+		if (hdr->cmsg_level == IPPROTO_IP) {
+			dlen = MIN(dlen, ICMP4_MAX_DLEN);
+			udp_send_conn_fail_icmp4(c, ee, toside, saddr.sa4.sin_addr,
+						 data, dlen);
+		} else if (hdr->cmsg_level == IPPROTO_IPV6) {
+			udp_send_conn_fail_icmp6(c, ee, toside,
+						 &saddr.sa6.sin6_addr,
+						 data, dlen, sidx.flowi);
+		}
+	} else {
+		trace("Ignoring received IP_RECVERR cmsg on listener socket");
+	}
+	debug("%s error on UDP socket %i: %s",
+	      str_ee_origin(ee), s, strerror_(ee->ee_errno));
+
+	return 1;
+}
+
+/**
+ * udp_sock_errs() - Process errors on a socket
+ * @c:		Execution context
+ * @ref:	epoll reference
+ * @events:	epoll events bitmap
+ *
+ * Return: Number of errors handled, or < 0 if we have an unrecoverable error
+ */
+int udp_sock_errs(const struct ctx *c, union epoll_ref ref, uint32_t events)
+{
+	unsigned n_err = 0;
+	socklen_t errlen;
+	int s = ref.fd;
+	int rc, err;
+
+	ASSERT(!c->no_udp);
+
+	if (!(events & EPOLLERR))
+		return 0; /* Nothing to do */
+
+	/* Empty the error queue */
+	while ((rc = udp_sock_recverr(c, ref)) > 0)
+		n_err += rc;
+
+	if (rc < 0)
+		return -1; /* error reading error, unrecoverable */
+
+	errlen = sizeof(err);
+	if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 ||
+	    errlen != sizeof(err)) {
+		err_perror("Error reading SO_ERROR");
+		return -1;  /* error reading error, unrecoverable */
+	}
+
+	if (err) {
+		debug("Unqueued error on UDP socket %i: %s", s, strerror_(err));
+		n_err++;
+	}
+
+	if (!n_err) {
+		/* EPOLLERR, but no errors to clear !? */
+		err("EPOLLERR event without reported errors on socket %i", s);
+		return -1; /* no way to clear, unrecoverable */
+	}
+
+	return n_err;
+}
+
+/**
+ * udp_sock_recv() - Receive datagrams from a socket
+ * @c:		Execution context
+ * @s:		Socket to receive from
+ * @events:	epoll events bitmap
+ * @mmh		mmsghdr array to receive into
+ *
+ * Return: Number of datagrams received
+ *
+ * #syscalls recvmmsg arm:recvmmsg_time64 i686:recvmmsg_time64
+ */
+static int udp_sock_recv(const struct ctx *c, int s, uint32_t events,
+			 struct mmsghdr *mmh)
+{
+	/* For not entirely clear reasons (data locality?) pasta gets better
+	 * throughput if we receive tap datagrams one at a atime.  For small
+	 * splice datagrams throughput is slightly better if we do batch, but
+	 * it's slightly worse for large splice datagrams.  Since we don't know
+	 * before we receive whether we'll use tap or splice, always go one at a
+	 * time for pasta mode.
+	 */
+	int n = (c->mode == MODE_PASTA ? 1 : UDP_MAX_FRAMES);
+
+	ASSERT(!c->no_udp);
+
+	if (!(events & EPOLLIN))
+		return 0;
+
+	n = recvmmsg(s, mmh, n, 0, NULL);
+	if (n < 0) {
+		err_perror("Error receiving datagrams");
+		return 0;
+	}
+
+	return n;
+}
+
+/**
+ * udp_buf_listen_sock_handler() - Handle new data from socket
  * @c:		Execution context
  * @ref:	epoll reference
  * @events:	epoll events bitmap
@@ -740,91 +671,202 @@ static void udp_tap_send(struct ctx *c,
  *
  * #syscalls recvmmsg
  */
-void udp_sock_handler(struct ctx *c, union epoll_ref ref, uint32_t events,
-		      const struct timespec *now)
+static void udp_buf_listen_sock_handler(const struct ctx *c,
+					union epoll_ref ref, uint32_t events,
+					const struct timespec *now)
 {
-	/* For not entirely clear reasons (data locality?) pasta gets
-	 * better throughput if we receive tap datagrams one at a
-	 * atime.  For small splice datagrams throughput is slightly
-	 * better if we do batch, but it's slightly worse for large
-	 * splice datagrams.  Since we don't know before we receive
-	 * whether we'll use tap or splice, always go one at a time
-	 * for pasta mode.
+	const socklen_t sasize = sizeof(udp_meta[0].s_in);
+	int n, i;
+
+	if (udp_sock_errs(c, ref, events) < 0) {
+		err("UDP: Unrecoverable error on listening socket:"
+		    " (%s port %hu)", pif_name(ref.udp.pif), ref.udp.port);
+		/* FIXME: what now?  close/re-open socket? */
+		return;
+	}
+
+	if ((n = udp_sock_recv(c, ref.fd, events, udp_mh_recv)) <= 0)
+		return;
+
+	/* We divide datagrams into batches based on how we need to send them,
+	 * determined by udp_meta[i].tosidx.  To avoid either two passes through
+	 * the array, or recalculating tosidx for a single entry, we have to
+	 * populate it one entry *ahead* of the loop counter.
 	 */
-	ssize_t n = (c->mode == MODE_PASST ? UDP_MAX_FRAMES : 1);
-	in_port_t dstport = ref.r.p.udp.udp.port;
-	bool v6 = ref.r.p.udp.udp.v6;
-	struct mmsghdr *mmh_recv;
-	int i, m;
+	udp_meta[0].tosidx = udp_flow_from_sock(c, ref, &udp_meta[0].s_in, now);
+	udp_mh_recv[0].msg_hdr.msg_namelen = sasize;
+	for (i = 0; i < n; ) {
+		flow_sidx_t batchsidx = udp_meta[i].tosidx;
+		uint8_t batchpif = pif_at_sidx(batchsidx);
+		int batchstart = i;
 
-	if (!(events & EPOLLIN))
-		return;
-
-	if (v6) {
-		mmh_recv = udp6_l2_mh_sock;
-		udp6_localname.sin6_port = htons(dstport);
-	} else {
-		mmh_recv = udp4_l2_mh_sock;
-		udp4_localname.sin_port = htons(dstport);
-	}
-
-	n = recvmmsg(ref.r.s, mmh_recv, n, 0, NULL);
-	if (n <= 0)
-		return;
-
-	for (i = 0; i < n; i += m) {
-		int splicefrom = -1;
-		m = n;
-
-		if (ref.r.p.udp.udp.splice) {
-			splicefrom = udp_mmh_splice_port(v6, mmh_recv + i);
-
-			for (m = 1; i + m < n; m++) {
-				int p;
-
-				p = udp_mmh_splice_port(v6, mmh_recv + i + m);
-				if (p != splicefrom)
-					break;
+		do {
+			if (pif_is_socket(batchpif)) {
+				udp_splice_prepare(udp_mh_recv, i);
+			} else if (batchpif == PIF_TAP) {
+				udp_tap_prepare(udp_mh_recv, i,
+						flowside_at_sidx(batchsidx),
+						false);
 			}
-		}
 
-		if (splicefrom >= 0)
-			udp_splice_sendfrom(c, i, m, splicefrom, dstport,
-					    v6, ref.r.p.udp.udp.ns,
-					    ref.r.p.udp.udp.orig, now);
-		else
-			udp_tap_send(c, i, m, dstport, v6, now);
+			if (++i >= n)
+				break;
+
+			udp_meta[i].tosidx = udp_flow_from_sock(c, ref,
+								&udp_meta[i].s_in,
+								now);
+			udp_mh_recv[i].msg_hdr.msg_namelen = sasize;
+		} while (flow_sidx_eq(udp_meta[i].tosidx, batchsidx));
+
+		if (pif_is_socket(batchpif)) {
+			udp_splice_send(c, batchstart, i - batchstart,
+					batchsidx);
+		} else if (batchpif == PIF_TAP) {
+			tap_send_frames(c, &udp_l2_iov[batchstart][0],
+					UDP_NUM_IOVS, i - batchstart);
+		} else if (flow_sidx_valid(batchsidx)) {
+			flow_sidx_t fromsidx = flow_sidx_opposite(batchsidx);
+			struct udp_flow *uflow = udp_at_sidx(batchsidx);
+
+			flow_err(uflow,
+				 "No support for forwarding UDP from %s to %s",
+				 pif_name(pif_at_sidx(fromsidx)),
+				 pif_name(batchpif));
+		} else {
+			debug("Discarding %d datagrams without flow",
+			      i - batchstart);
+		}
 	}
+}
+
+/**
+ * udp_listen_sock_handler() - Handle new data from socket
+ * @c:		Execution context
+ * @ref:	epoll reference
+ * @events:	epoll events bitmap
+ * @now:	Current timestamp
+ */
+void udp_listen_sock_handler(const struct ctx *c,
+			     union epoll_ref ref, uint32_t events,
+			     const struct timespec *now)
+{
+	if (c->mode == MODE_VU) {
+		udp_vu_listen_sock_handler(c, ref, events, now);
+		return;
+	}
+
+	udp_buf_listen_sock_handler(c, ref, events, now);
+}
+
+/**
+ * udp_buf_reply_sock_handler() - Handle new data from flow specific socket
+ * @c:		Execution context
+ * @ref:	epoll reference
+ * @events:	epoll events bitmap
+ * @now:	Current timestamp
+ *
+ * #syscalls recvmmsg
+ */
+static void udp_buf_reply_sock_handler(const struct ctx *c, union epoll_ref ref,
+				       uint32_t events,
+				       const struct timespec *now)
+{
+	flow_sidx_t tosidx = flow_sidx_opposite(ref.flowside);
+	const struct flowside *toside = flowside_at_sidx(tosidx);
+	struct udp_flow *uflow = udp_at_sidx(ref.flowside);
+	uint8_t topif = pif_at_sidx(tosidx);
+	int n, i, from_s;
+
+	ASSERT(!c->no_udp && uflow);
+
+	from_s = uflow->s[ref.flowside.sidei];
+
+	if (udp_sock_errs(c, ref, events) < 0) {
+		flow_err(uflow, "Unrecoverable error on reply socket");
+		flow_err_details(uflow);
+		udp_flow_close(c, uflow);
+		return;
+	}
+
+	if ((n = udp_sock_recv(c, from_s, events, udp_mh_recv)) <= 0)
+		return;
+
+	flow_trace(uflow, "Received %d datagrams on reply socket", n);
+	uflow->ts = now->tv_sec;
+
+	for (i = 0; i < n; i++) {
+		if (pif_is_socket(topif))
+			udp_splice_prepare(udp_mh_recv, i);
+		else if (topif == PIF_TAP)
+			udp_tap_prepare(udp_mh_recv, i, toside, false);
+		/* Restore sockaddr length clobbered by recvmsg() */
+		udp_mh_recv[i].msg_hdr.msg_namelen = sizeof(udp_meta[i].s_in);
+	}
+
+	if (pif_is_socket(topif)) {
+		udp_splice_send(c, 0, n, tosidx);
+	} else if (topif == PIF_TAP) {
+		tap_send_frames(c, &udp_l2_iov[0][0], UDP_NUM_IOVS, n);
+	} else {
+		uint8_t frompif = pif_at_sidx(ref.flowside);
+
+		flow_err(uflow, "No support for forwarding UDP from %s to %s",
+			 pif_name(frompif), pif_name(topif));
+	}
+}
+
+/**
+ * udp_reply_sock_handler() - Handle new data from flow specific socket
+ * @c:		Execution context
+ * @ref:	epoll reference
+ * @events:	epoll events bitmap
+ * @now:	Current timestamp
+ */
+void udp_reply_sock_handler(const struct ctx *c, union epoll_ref ref,
+			    uint32_t events, const struct timespec *now)
+{
+	if (c->mode == MODE_VU) {
+		udp_vu_reply_sock_handler(c, ref, events, now);
+		return;
+	}
+
+	udp_buf_reply_sock_handler(c, ref, events, now);
 }
 
 /**
  * udp_tap_handler() - Handle packets from tap
  * @c:		Execution context
+ * @pif:	pif on which the packet is arriving
  * @af:		Address family, AF_INET or AF_INET6
- * @addr:	Destination address
+ * @saddr:	Source address
+ * @daddr:	Destination address
  * @p:		Pool of UDP packets, with UDP headers
+ * @idx:	Index of first packet to process
  * @now:	Current timestamp
  *
  * Return: count of consumed packets
  *
  * #syscalls sendmmsg
  */
-int udp_tap_handler(struct ctx *c, int af, const void *addr,
-		    const struct pool *p, const struct timespec *now)
+int udp_tap_handler(const struct ctx *c, uint8_t pif,
+		    sa_family_t af, const void *saddr, const void *daddr,
+		    const struct pool *p, int idx, const struct timespec *now)
 {
+	const struct flowside *toside;
 	struct mmsghdr mm[UIO_MAXIOV];
+	union sockaddr_inany to_sa;
 	struct iovec m[UIO_MAXIOV];
-	struct sockaddr_in6 s_in6;
-	struct sockaddr_in s_in;
-	struct sockaddr *sa;
+	const struct udphdr *uh;
+	struct udp_flow *uflow;
 	int i, s, count = 0;
+	flow_sidx_t tosidx;
 	in_port_t src, dst;
-	struct udphdr *uh;
+	uint8_t topif;
 	socklen_t sl;
 
-	(void)c;
+	ASSERT(!c->no_udp);
 
-	uh = packet_get(p, 0, 0, sizeof(*uh), NULL);
+	uh = packet_get(p, idx, 0, sizeof(*uh), NULL);
 	if (!uh)
 		return 1;
 
@@ -834,113 +876,42 @@ int udp_tap_handler(struct ctx *c, int af, const void *addr,
 	src = ntohs(uh->source);
 	dst = ntohs(uh->dest);
 
-	if (af == AF_INET) {
-		s_in = (struct sockaddr_in) {
-			.sin_family = AF_INET,
-			.sin_port = uh->dest,
-			.sin_addr = *(struct in_addr *)addr,
-		};
+	tosidx = udp_flow_from_tap(c, pif, af, saddr, daddr, src, dst, now);
+	if (!(uflow = udp_at_sidx(tosidx))) {
+		char sstr[INET6_ADDRSTRLEN], dstr[INET6_ADDRSTRLEN];
 
-		sa = (struct sockaddr *)&s_in;
-		sl = sizeof(s_in);
-
-		if (IN4_ARE_ADDR_EQUAL(&s_in.sin_addr, &c->ip4.dns_match) &&
-		    ntohs(s_in.sin_port) == 53) {
-			s_in.sin_addr = c->ip4.dns_host;
-		} else if (IN4_ARE_ADDR_EQUAL(&s_in.sin_addr, &c->ip4.gw) &&
-			   !c->no_map_gw) {
-			if (!(udp_tap_map[V4][dst].flags & PORT_LOCAL) ||
-			    (udp_tap_map[V4][dst].flags & PORT_LOOPBACK))
-				s_in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-			else
-				s_in.sin_addr = c->ip4.addr_seen;
-		}
-
-		if (!(s = udp_tap_map[V4][src].sock)) {
-			union udp_epoll_ref uref = { .udp.port = src };
-			in_addr_t bind_addr = { 0 };
-			const char *bind_if = NULL;
-
-			if (!IN6_IS_ADDR_LOOPBACK(&s_in.sin_addr) &&
-			    *c->ip6.ifname_out)
-				bind_if = c->ip6.ifname_out;
-
-			if (!IN4_IS_ADDR_UNSPECIFIED(&c->ip4.addr_out) &&
-			    !IN4_IS_ADDR_LOOPBACK(&s_in.sin_addr))
-				bind_addr = c->ip4.addr_out.s_addr;
-
-			s = sock_l4(c, AF_INET, IPPROTO_UDP, &bind_addr,
-				    bind_if, src, uref.u32);
-			if (s < 0)
-				return p->count;
-
-			udp_tap_map[V4][src].sock = s;
-			bitmap_set(udp_act[V4][UDP_ACT_TAP], src);
-		}
-
-		udp_tap_map[V4][src].ts = now->tv_sec;
-	} else {
-		s_in6 = (struct sockaddr_in6) {
-			.sin6_family = AF_INET6,
-			.sin6_port = uh->dest,
-			.sin6_addr = *(struct in6_addr *)addr,
-		};
-		const struct in6_addr *bind_addr = &in6addr_any;
-
-		sa = (struct sockaddr *)&s_in6;
-		sl = sizeof(s_in6);
-
-		if (IN6_ARE_ADDR_EQUAL(addr, &c->ip6.dns_match) &&
-		    ntohs(s_in6.sin6_port) == 53) {
-			s_in6.sin6_addr = c->ip6.dns_host;
-		} else if (IN6_ARE_ADDR_EQUAL(addr, &c->ip6.gw) &&
-			   !c->no_map_gw) {
-			if (!(udp_tap_map[V6][dst].flags & PORT_LOCAL) ||
-			    (udp_tap_map[V6][dst].flags & PORT_LOOPBACK))
-				s_in6.sin6_addr = in6addr_loopback;
-			else if (udp_tap_map[V6][dst].flags & PORT_GUA)
-				s_in6.sin6_addr = c->ip6.addr;
-			else
-				s_in6.sin6_addr = c->ip6.addr_seen;
-		} else if (IN6_IS_ADDR_LINKLOCAL(&s_in6.sin6_addr)) {
-			bind_addr = &c->ip6.addr_ll;
-		}
-
-		if (!(s = udp_tap_map[V6][src].sock)) {
-			union udp_epoll_ref uref = { .udp.v6 = 1,
-						     .udp.port = src };
-			const char *bind_if = NULL;
-
-			if (!IN6_IS_ADDR_LOOPBACK(&s_in6.sin6_addr) &&
-			    *c->ip6.ifname_out)
-				bind_if = c->ip6.ifname_out;
-
-			if (!IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_out) &&
-			    !IN6_IS_ADDR_LOOPBACK(&s_in6.sin6_addr) &&
-			    !IN6_IS_ADDR_LINKLOCAL(&s_in6.sin6_addr))
-				bind_addr = &c->ip6.addr_out;
-
-			s = sock_l4(c, AF_INET6, IPPROTO_UDP, bind_addr,
-				    bind_if, src, uref.u32);
-			if (s < 0)
-				return p->count;
-
-			udp_tap_map[V6][src].sock = s;
-			bitmap_set(udp_act[V6][UDP_ACT_TAP], src);
-		}
-
-		udp_tap_map[V6][src].ts = now->tv_sec;
+		debug("Dropping datagram with no flow %s %s:%hu -> %s:%hu",
+		      pif_name(pif),
+		      inet_ntop(af, saddr, sstr, sizeof(sstr)), src,
+		      inet_ntop(af, daddr, dstr, sizeof(dstr)), dst);
+		return 1;
 	}
 
-	for (i = 0; i < (int)p->count; i++) {
+	topif = pif_at_sidx(tosidx);
+	if (topif != PIF_HOST) {
+		flow_sidx_t fromsidx = flow_sidx_opposite(tosidx);
+		uint8_t frompif = pif_at_sidx(fromsidx);
+
+		flow_err(uflow, "No support for forwarding UDP from %s to %s",
+			 pif_name(frompif), pif_name(topif));
+		return 1;
+	}
+	toside = flowside_at_sidx(tosidx);
+
+	s = udp_at_sidx(tosidx)->s[tosidx.sidei];
+	ASSERT(s >= 0);
+
+	pif_sockaddr(c, &to_sa, &sl, topif, &toside->eaddr, toside->eport);
+
+	for (i = 0; i < (int)p->count - idx; i++) {
 		struct udphdr *uh_send;
 		size_t len;
 
-		uh_send = packet_get(p, i, 0, sizeof(*uh), &len);
+		uh_send = packet_get(p, idx + i, 0, sizeof(*uh), &len);
 		if (!uh_send)
-			return p->count;
+			return p->count - idx;
 
-		mm[i].msg_hdr.msg_name = sa;
+		mm[i].msg_hdr.msg_name = &to_sa;
 		mm[i].msg_hdr.msg_namelen = sl;
 
 		if (len) {
@@ -972,97 +943,69 @@ int udp_tap_handler(struct ctx *c, int af, const void *addr,
  * udp_sock_init() - Initialise listening sockets for a given port
  * @c:		Execution context
  * @ns:		In pasta mode, if set, bind with loopback address in namespace
- * @af:		Address family to select a specific IP version, or AF_UNSPEC
  * @addr:	Pointer to address for binding, NULL if not configured
  * @ifname:	Name of interface to bind to, NULL if not configured
  * @port:	Port, host order
  *
  * Return: 0 on (partial) success, negative error code on (complete) failure
  */
-int udp_sock_init(const struct ctx *c, int ns, sa_family_t af,
-		  const void *addr, const char *ifname, in_port_t port)
+int udp_sock_init(const struct ctx *c, int ns, const union inany_addr *addr,
+		  const char *ifname, in_port_t port)
 {
-	union udp_epoll_ref uref = { .u32 = 0 };
-	int s, r4 = SOCKET_MAX + 1, r6 = SOCKET_MAX + 1;
+	union udp_listen_epoll_ref uref = {
+		.pif = ns ? PIF_SPLICE : PIF_HOST,
+		.port = port,
+	};
+	int r4 = FD_REF_MAX + 1, r6 = FD_REF_MAX + 1;
 
-	if (ns) {
-		uref.udp.port = (in_port_t)(port +
-					    c->udp.fwd_out.f.delta[port]);
-	} else {
-		uref.udp.port = (in_port_t)(port +
-					    c->udp.fwd_in.f.delta[port]);
+	ASSERT(!c->no_udp);
+
+	if (!addr && c->ifi4 && c->ifi6 && !ns) {
+		int s;
+
+		/* Attempt to get a dual stack socket */
+		s = pif_sock_l4(c, EPOLL_TYPE_UDP_LISTEN, PIF_HOST,
+				NULL, ifname, port, uref.u32);
+		udp_splice_init[V4][port] = s < 0 ? -1 : s;
+		udp_splice_init[V6][port] = s < 0 ? -1 : s;
+		if (IN_INTERVAL(0, FD_REF_MAX, s))
+			return 0;
 	}
 
-	if ((af == AF_INET || af == AF_UNSPEC) && c->ifi4) {
-		uref.udp.v6 = 0;
-		uref.udp.splice = (c->mode == MODE_PASTA);
-		uref.udp.orig = true;
-
+	if ((!addr || inany_v4(addr)) && c->ifi4) {
 		if (!ns) {
-			r4 = s = sock_l4(c, AF_INET, IPPROTO_UDP, addr,
-					 ifname, port, uref.u32);
+			r4 = pif_sock_l4(c, EPOLL_TYPE_UDP_LISTEN, PIF_HOST,
+					 addr ? addr : &inany_any4, ifname,
+					 port, uref.u32);
 
-			udp_tap_map[V4][uref.udp.port].sock = s < 0 ? -1 : s;
-			udp_splice_init[V4][port].sock = s < 0 ? -1 : s;
+			udp_splice_init[V4][port] = r4 < 0 ? -1 : r4;
 		} else {
-			struct in_addr loopback = { htonl(INADDR_LOOPBACK) };
-			uref.udp.ns = true;
-
-			r4 = s = sock_l4(c, AF_INET, IPPROTO_UDP, &loopback,
-					 ifname, port, uref.u32);
-			udp_splice_ns[V4][port].sock = s < 0 ? -1 : s;
+			r4  = pif_sock_l4(c, EPOLL_TYPE_UDP_LISTEN, PIF_SPLICE,
+					  &inany_loopback4, ifname,
+					  port, uref.u32);
+			udp_splice_ns[V4][port] = r4 < 0 ? -1 : r4;
 		}
 	}
 
-	if ((af == AF_INET6 || af == AF_UNSPEC) && c->ifi6) {
-		uref.udp.v6 = 1;
-		uref.udp.splice = (c->mode == MODE_PASTA);
-		uref.udp.orig = true;
-
+	if ((!addr || !inany_v4(addr)) && c->ifi6) {
 		if (!ns) {
-			r6 = s = sock_l4(c, AF_INET6, IPPROTO_UDP, addr,
-					 ifname, port, uref.u32);
+			r6 = pif_sock_l4(c, EPOLL_TYPE_UDP_LISTEN, PIF_HOST,
+					 addr ? addr : &inany_any6, ifname,
+					 port, uref.u32);
 
-			udp_tap_map[V6][uref.udp.port].sock = s < 0 ? -1 : s;
-			udp_splice_init[V6][port].sock = s < 0 ? -1 : s;
+			udp_splice_init[V6][port] = r6 < 0 ? -1 : r6;
 		} else {
-			uref.udp.ns = true;
-
-			r6 = s = sock_l4(c, AF_INET6, IPPROTO_UDP,
-					 &in6addr_loopback,
-					 ifname, port, uref.u32);
-			udp_splice_ns[V6][port].sock = s < 0 ? -1 : s;
+			r6 = pif_sock_l4(c, EPOLL_TYPE_UDP_LISTEN, PIF_SPLICE,
+					 &inany_loopback6, ifname,
+					 port, uref.u32);
+			udp_splice_ns[V6][port] = r6 < 0 ? -1 : r6;
 		}
 	}
 
-	if (IN_INTERVAL(0, SOCKET_MAX, r4) || IN_INTERVAL(0, SOCKET_MAX, r6))
+	if (IN_INTERVAL(0, FD_REF_MAX, r4) || IN_INTERVAL(0, FD_REF_MAX, r6))
 		return 0;
 
 	return r4 < 0 ? r4 : r6;
-}
-
-/**
- * udp_sock_init_ns() - Bind sockets in namespace for inbound connections
- * @arg:	Execution context
- *
- * Return: 0
- */
-int udp_sock_init_ns(void *arg)
-{
-	struct ctx *c = (struct ctx *)arg;
-	unsigned dst;
-
-	if (ns_enter(c))
-		return 0;
-
-	for (dst = 0; dst < NUM_PORTS; dst++) {
-		if (!bitmap_isset(c->udp.fwd_out.f.map, dst))
-			continue;
-
-		udp_sock_init(c, 1, AF_UNSPEC, NULL, NULL, dst);
-	}
-
-	return 0;
 }
 
 /**
@@ -1073,21 +1016,100 @@ static void udp_splice_iov_init(void)
 	int i;
 
 	for (i = 0; i < UDP_MAX_FRAMES; i++) {
-		struct msghdr *mh4 = &udp4_mh_splice[i].msg_hdr;
-		struct msghdr *mh6 = &udp6_mh_splice[i].msg_hdr;
+		struct msghdr *mh = &udp_mh_splice[i].msg_hdr;
 
-		mh4->msg_name = &udp4_localname;
-		mh4->msg_namelen = sizeof(udp4_localname);
+		mh->msg_name = &udp_splice_to;
+		mh->msg_namelen = sizeof(udp_splice_to);
 
-		mh6->msg_name = &udp6_localname;
-		mh6->msg_namelen = sizeof(udp6_localname);
+		udp_iov_splice[i].iov_base = udp_payload[i].data;
 
-		udp4_iov_splice[i].iov_base = udp4_l2_buf[i].data;
-		udp6_iov_splice[i].iov_base = udp6_l2_buf[i].data;
+		mh->msg_iov = &udp_iov_splice[i];
+		mh->msg_iovlen = 1;
+	}
+}
 
-		mh4->msg_iov = &udp4_iov_splice[i];
-		mh6->msg_iov = &udp6_iov_splice[i];
-		mh4->msg_iovlen = mh6->msg_iovlen = 1;
+/**
+ * udp_port_rebind() - Rebind ports to match forward maps
+ * @c:		Execution context
+ * @outbound:	True to remap outbound forwards, otherwise inbound
+ *
+ * Must be called in namespace context if @outbound is true.
+ */
+static void udp_port_rebind(struct ctx *c, bool outbound)
+{
+	int (*socks)[NUM_PORTS] = outbound ? udp_splice_ns : udp_splice_init;
+	const uint8_t *fmap
+		= outbound ? c->udp.fwd_out.map : c->udp.fwd_in.map;
+	const uint8_t *rmap
+		= outbound ? c->udp.fwd_in.map : c->udp.fwd_out.map;
+	unsigned port;
+
+	for (port = 0; port < NUM_PORTS; port++) {
+		if (!bitmap_isset(fmap, port)) {
+			if (socks[V4][port] >= 0) {
+				close(socks[V4][port]);
+				socks[V4][port] = -1;
+			}
+
+			if (socks[V6][port] >= 0) {
+				close(socks[V6][port]);
+				socks[V6][port] = -1;
+			}
+
+			continue;
+		}
+
+		/* Don't loop back our own ports */
+		if (bitmap_isset(rmap, port))
+			continue;
+
+		if ((c->ifi4 && socks[V4][port] == -1) ||
+		    (c->ifi6 && socks[V6][port] == -1))
+			udp_sock_init(c, outbound, NULL, NULL, port);
+	}
+}
+
+/**
+ * udp_port_rebind_outbound() - Rebind ports in namespace
+ * @arg:	Execution context
+ *
+ * Called with NS_CALL()
+ *
+ * Return: 0
+ */
+static int udp_port_rebind_outbound(void *arg)
+{
+	struct ctx *c = (struct ctx *)arg;
+
+	ns_enter(c);
+	udp_port_rebind(c, true);
+
+	return 0;
+}
+
+/**
+ * udp_timer() - Scan activity bitmaps for ports with associated timed events
+ * @c:		Execution context
+ * @now:	Current timestamp
+ */
+void udp_timer(struct ctx *c, const struct timespec *now)
+{
+	(void)now;
+
+	ASSERT(!c->no_udp);
+
+	if (c->mode == MODE_PASTA) {
+		if (c->udp.fwd_out.mode == FWD_AUTO) {
+			fwd_scan_ports_udp(&c->udp.fwd_out, &c->udp.fwd_in,
+					   &c->tcp.fwd_out, &c->tcp.fwd_in);
+			NS_CALL(udp_port_rebind_outbound, c);
+		}
+
+		if (c->udp.fwd_in.mode == FWD_AUTO) {
+			fwd_scan_ports_udp(&c->udp.fwd_in, &c->udp.fwd_out,
+					   &c->tcp.fwd_in, &c->tcp.fwd_out);
+			udp_port_rebind(c, false);
+		}
 	}
 }
 
@@ -1099,101 +1121,14 @@ static void udp_splice_iov_init(void)
  */
 int udp_init(struct ctx *c)
 {
-	if (c->ifi4)
-		udp_sock4_iov_init(c);
+	ASSERT(!c->no_udp);
 
-	if (c->ifi6)
-		udp_sock6_iov_init(c);
-
-	udp_invert_portmap(&c->udp.fwd_in);
-	udp_invert_portmap(&c->udp.fwd_out);
+	udp_iov_init(c);
 
 	if (c->mode == MODE_PASTA) {
 		udp_splice_iov_init();
-		NS_CALL(udp_sock_init_ns, c);
+		NS_CALL(udp_port_rebind_outbound, c);
 	}
 
 	return 0;
-}
-
-/**
- * udp_timer_one() - Handler for timed events on one port
- * @c:		Execution context
- * @v6:		Set for IPv6 connections
- * @type:	Socket type
- * @port:	Port number, host order
- * @ts:		Timestamp from caller
- */
-static void udp_timer_one(struct ctx *c, int v6, enum udp_act_type type,
-			  in_port_t port, const struct timespec *ts)
-{
-	struct udp_splice_port *sp;
-	struct udp_tap_port *tp;
-	int s = -1;
-
-	switch (type) {
-	case UDP_ACT_TAP:
-		tp = &udp_tap_map[v6 ? V6 : V4][port];
-
-		if (ts->tv_sec - tp->ts > UDP_CONN_TIMEOUT) {
-			s = tp->sock;
-			tp->flags = 0;
-		}
-
-		break;
-	case UDP_ACT_SPLICE_INIT:
-		sp = &udp_splice_init[v6 ? V6 : V4][port];
-
-		if (ts->tv_sec - sp->ts > UDP_CONN_TIMEOUT)
-			s = sp->sock;
-
-		break;
-	case UDP_ACT_SPLICE_NS:
-		sp = &udp_splice_ns[v6 ? V6 : V4][port];
-
-		if (ts->tv_sec - sp->ts > UDP_CONN_TIMEOUT)
-			s = sp->sock;
-
-		break;
-	default:
-		return;
-	}
-
-	if (s > 0) {
-		epoll_ctl(c->epollfd, EPOLL_CTL_DEL, s, NULL);
-		close(s);
-		bitmap_clear(udp_act[v6 ? V6 : V4][type], port);
-	}
-}
-
-/**
- * udp_timer() - Scan activity bitmaps for ports with associated timed events
- * @c:		Execution context
- * @ts:		Timestamp from caller
- */
-void udp_timer(struct ctx *c, const struct timespec *ts)
-{
-	int n, t, v6 = 0;
-	unsigned int i;
-	long *word, tmp;
-
-	if (!c->ifi4)
-		v6 = 1;
-v6:
-	for (t = 0; t < UDP_ACT_TYPE_MAX; t++) {
-		word = (long *)udp_act[v6 ? V6 : V4][t];
-		for (i = 0; i < ARRAY_SIZE(udp_act[0][0]);
-		     i += sizeof(long), word++) {
-			tmp = *word;
-			while ((n = ffsl(tmp))) {
-				tmp &= ~(1UL << (n - 1));
-				udp_timer_one(c, v6, t, i * 8 + n - 1, ts);
-			}
-		}
-	}
-
-	if (!v6 && c->ifi6) {
-		v6 = 1;
-		goto v6;
-	}
 }

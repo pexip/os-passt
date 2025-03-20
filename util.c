@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 
 /* PASST - Plug A Simple Socket Transport
  *  for qemu/UNIX domain socket mode
@@ -19,167 +19,104 @@
 #include <arpa/inet.h>
 #include <net/ethernet.h>
 #include <sys/epoll.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <string.h>
 #include <time.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <linux/errqueue.h>
+#include <getopt.h>
 
+#include "linux_dep.h"
 #include "util.h"
+#include "iov.h"
 #include "passt.h"
 #include "packet.h"
-#include "lineread.h"
 #include "log.h"
-
-#define IPV6_NH_OPT(nh)							\
-	((nh) == 0   || (nh) == 43  || (nh) == 44  || (nh) == 50  ||	\
-	 (nh) == 51  || (nh) == 60  || (nh) == 135 || (nh) == 139 ||	\
-	 (nh) == 140 || (nh) == 253 || (nh) == 254)
+#ifdef HAS_GETRANDOM
+#include <sys/random.h>
+#endif
 
 /**
- * ipv6_l4hdr() - Find pointer to L4 header in IPv6 packet and extract protocol
- * @p:		Packet pool, packet number @index has IPv6 header at @offset
- * @index:	Index of packet in pool
- * @offset:	Pre-calculated IPv6 header offset
- * @proto:	Filled with L4 protocol number
- * @dlen:	Data length (payload excluding header extensions), set on return
- *
- * Return: pointer to L4 header, NULL if not found
- */
-char *ipv6_l4hdr(const struct pool *p, int index, size_t offset, uint8_t *proto,
-		 size_t *dlen)
-{
-	struct ipv6_opt_hdr *o;
-	struct ipv6hdr *ip6h;
-	char *base;
-	int hdrlen;
-	uint8_t nh;
-
-	base = packet_get(p, index, 0, 0, NULL);
-	ip6h = packet_get(p, index, offset, sizeof(*ip6h), dlen);
-	if (!ip6h)
-		return NULL;
-
-	offset += sizeof(*ip6h);
-
-	nh = ip6h->nexthdr;
-	if (!IPV6_NH_OPT(nh))
-		goto found;
-
-	while ((o = packet_get_try(p, index, offset, sizeof(*o), dlen))) {
-		nh = o->nexthdr;
-		hdrlen = (o->hdrlen + 1) * 8;
-
-		if (IPV6_NH_OPT(nh))
-			offset += hdrlen;
-		else
-			goto found;
-	}
-
-	return NULL;
-
-found:
-	if (nh == 59)
-		return NULL;
-
-	*proto = nh;
-	return base + offset;
-}
-
-/**
- * sock_l4() - Create and bind socket for given L4, add to epoll list
+ * sock_l4_sa() - Create and bind socket to socket address, add to epoll list
  * @c:		Execution context
- * @af:		Address family, AF_INET or AF_INET6
- * @proto:	Protocol number
- * @bind_addr:	Address for binding, NULL for any
+ * @type:	epoll type
+ * @sa:		Socket address to bind to
+ * @sl:		Length of @sa
  * @ifname:	Interface for binding, NULL for any
- * @port:	Port, host order
+ * @v6only:	Set IPV6_V6ONLY socket option
  * @data:	epoll reference portion for protocol handlers
  *
  * Return: newly created socket, negative error code on failure
  */
-int sock_l4(const struct ctx *c, int af, uint8_t proto,
-	    const void *bind_addr, const char *ifname, uint16_t port,
-	    uint32_t data)
+int sock_l4_sa(const struct ctx *c, enum epoll_type type,
+	       const void *sa, socklen_t sl,
+	       const char *ifname, bool v6only, uint32_t data)
 {
-	union epoll_ref ref = { .r.proto = proto, .r.p.data = data };
-	struct sockaddr_in addr4 = {
-		.sin_family = AF_INET,
-		.sin_port = htons(port),
-		{ 0 }, { 0 },
-	};
-	struct sockaddr_in6 addr6 = {
-		.sin6_family = AF_INET6,
-		.sin6_port = htons(port),
-		0, IN6ADDR_ANY_INIT, 0,
-	};
-	const struct sockaddr *sa;
-	bool dual_stack = false;
-	int fd, sl, y = 1, ret;
+	sa_family_t af = ((const struct sockaddr *)sa)->sa_family;
+	union epoll_ref ref = { .type = type, .data = data };
+	bool freebind = false;
 	struct epoll_event ev;
+	int fd, y = 1, ret;
+	uint8_t proto;
+	int socktype;
 
-	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP &&
-	    proto != IPPROTO_ICMP && proto != IPPROTO_ICMPV6)
-		return -EPFNOSUPPORT;	/* Not implemented. */
-
-	if (af == AF_UNSPEC) {
-		if (!DUAL_STACK_SOCKETS || bind_addr)
-			return -EINVAL;
-		dual_stack = true;
-		af = AF_INET6;
+	switch (type) {
+	case EPOLL_TYPE_TCP_LISTEN:
+		proto = IPPROTO_TCP;
+		socktype = SOCK_STREAM | SOCK_NONBLOCK;
+		freebind = c->freebind;
+		break;
+	case EPOLL_TYPE_UDP_LISTEN:
+		freebind = c->freebind;
+		/* fallthrough */
+	case EPOLL_TYPE_UDP_REPLY:
+		proto = IPPROTO_UDP;
+		socktype = SOCK_DGRAM | SOCK_NONBLOCK;
+		break;
+	case EPOLL_TYPE_PING:
+		if (af == AF_INET)
+			proto = IPPROTO_ICMP;
+		else
+			proto = IPPROTO_ICMPV6;
+		socktype = SOCK_DGRAM | SOCK_NONBLOCK;
+		break;
+	default:
+		ASSERT(0);
 	}
 
-	if (proto == IPPROTO_TCP)
-		fd = socket(af, SOCK_STREAM | SOCK_NONBLOCK, proto);
-	else
-		fd = socket(af, SOCK_DGRAM | SOCK_NONBLOCK, proto);
+	fd = socket(af, socktype, proto);
 
 	ret = -errno;
 	if (fd < 0) {
-		warn("L4 socket: %s", strerror(-ret));
+		warn("L4 socket: %s", strerror_(-ret));
 		return ret;
 	}
 
-	if (fd > SOCKET_MAX) {
+	if (fd > FD_REF_MAX) {
 		close(fd);
 		return -EBADF;
 	}
 
-	ref.r.s = fd;
+	ref.fd = fd;
 
-	if (af == AF_INET) {
-		if (bind_addr)
-			addr4.sin_addr.s_addr = *(in_addr_t *)bind_addr;
-		else
-			addr4.sin_addr.s_addr = htonl(INADDR_ANY);
-
-		sa = (const struct sockaddr *)&addr4;
-		sl = sizeof(addr4);
-	} else {
-		if (bind_addr) {
-			addr6.sin6_addr = *(struct in6_addr *)bind_addr;
-
-			if (!memcmp(bind_addr, &c->ip6.addr_ll,
-			    sizeof(c->ip6.addr_ll)))
-				addr6.sin6_scope_id = c->ifi6;
-		} else {
-			addr6.sin6_addr = in6addr_any;
-		}
-
-		sa = (const struct sockaddr *)&addr6;
-		sl = sizeof(addr6);
-
-		if (!dual_stack)
-			if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
-				       &y, sizeof(y)))
-				debug("Failed to set IPV6_V6ONLY on socket %i",
-				      fd);
-	}
+	if (v6only)
+		if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &y, sizeof(y)))
+			debug("Failed to set IPV6_V6ONLY on socket %i", fd);
 
 	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &y, sizeof(y)))
 		debug("Failed to set SO_REUSEADDR on socket %i", fd);
 
-	if (ifname) {
+	if (proto == IPPROTO_UDP) {
+		int level = af == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+		int opt = af == AF_INET ? IP_RECVERR : IPV6_RECVERR;
+
+		if (setsockopt(fd, level, opt, &y, sizeof(y)))
+			die_perror("Failed to set RECVERR on socket %i", fd);
+	}
+
+	if (ifname && *ifname) {
 		/* Supported since kernel version 5.7, commit c427bfec18f2
 		 * ("net: core: enable SO_BINDTODEVICE for non-root users"). If
 		 * it's unsupported, don't bind the socket at all, because the
@@ -187,11 +124,26 @@ int sock_l4(const struct ctx *c, int af, uint8_t proto,
 		 */
 		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
 			       ifname, strlen(ifname))) {
+			char str[SOCKADDR_STRLEN];
+
 			ret = -errno;
-			warn("Can't bind socket for %s port %u to %s, closing",
-			     ip_proto_str[proto], port, ifname);
+			warn("Can't bind %s socket for %s to %s, closing",
+			     EPOLL_TYPE_STR(proto),
+			     sockaddr_ntop(sa, str, sizeof(str)), ifname);
 			close(fd);
 			return ret;
+		}
+	}
+
+	if (freebind) {
+		int level = af == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+		int opt = af == AF_INET ? IP_FREEBIND : IPV6_FREEBIND;
+
+		if (setsockopt(fd, level, opt, &y, sizeof(y))) {
+			err_perror("Failed to set %s on socket %i",
+				   af == AF_INET ? "IP_FREEBIND"
+				                 : "IPV6_FREEBIND",
+				   fd);
 		}
 	}
 
@@ -201,16 +153,16 @@ int sock_l4(const struct ctx *c, int af, uint8_t proto,
 		 * this is fine. This might also fail for ICMP because of a
 		 * broken SELinux policy, see icmp_tap_handler().
 		 */
-		if (proto != IPPROTO_ICMP && proto != IPPROTO_ICMPV6) {
+		if (type != EPOLL_TYPE_PING) {
 			ret = -errno;
 			close(fd);
 			return ret;
 		}
 	}
 
-	if (proto == IPPROTO_TCP && listen(fd, 128) < 0) {
+	if (type == EPOLL_TYPE_TCP_LISTEN && listen(fd, 128) < 0) {
 		ret = -errno;
-		warn("TCP socket listen: %s", strerror(-ret));
+		warn("TCP socket listen: %s", strerror_(-ret));
 		close(fd);
 		return ret;
 	}
@@ -219,9 +171,71 @@ int sock_l4(const struct ctx *c, int af, uint8_t proto,
 	ev.data.u64 = ref.u64;
 	if (epoll_ctl(c->epollfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
 		ret = -errno;
-		warn("L4 epoll_ctl: %s", strerror(-ret));
+		warn("L4 epoll_ctl: %s", strerror_(-ret));
 		return ret;
 	}
+
+	return fd;
+}
+
+/**
+ * sock_unix() - Create and bind AF_UNIX socket
+ * @sock_path:	Socket path. If empty, set on return (UNIX_SOCK_PATH as prefix)
+ *
+ * Return: socket descriptor on success, won't return on failure
+ */
+int sock_unix(char *sock_path)
+{
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_un addr = {
+		.sun_family = AF_UNIX,
+	};
+	int i;
+
+	if (fd < 0)
+		die_perror("Failed to open UNIX domain socket");
+
+	for (i = 1; i < UNIX_SOCK_MAX; i++) {
+		char *path = addr.sun_path;
+		int ex, ret;
+
+		if (*sock_path)
+			memcpy(path, sock_path, UNIX_PATH_MAX);
+		else if (snprintf_check(path, UNIX_PATH_MAX - 1,
+					UNIX_SOCK_PATH, i))
+			die_perror("Can't build UNIX domain socket path");
+
+		ex = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+			    0);
+		if (ex < 0)
+			die_perror("Failed to check for UNIX domain conflicts");
+
+		ret = connect(ex, (const struct sockaddr *)&addr, sizeof(addr));
+		if (!ret || (errno != ENOENT && errno != ECONNREFUSED &&
+			     errno != EACCES)) {
+			if (*sock_path)
+				die("Socket path %s already in use", path);
+
+			close(ex);
+			continue;
+		}
+		close(ex);
+
+		unlink(path);
+		ret = bind(fd, (const struct sockaddr *)&addr, sizeof(addr));
+		if (*sock_path && ret)
+			die_perror("Failed to bind UNIX domain socket");
+
+		if (!ret)
+			break;
+	}
+
+	if (i == UNIX_SOCK_MAX)
+		die_perror("Failed to bind UNIX domain socket");
+
+	info("UNIX domain socket bound at %s", addr.sun_path);
+	if (!*sock_path)
+		memcpy(sock_path, addr.sun_path, UNIX_PATH_MAX);
 
 	return fd;
 }
@@ -235,7 +249,8 @@ void sock_probe_mem(struct ctx *c)
 	int v = INT_MAX / 2, s;
 	socklen_t sl;
 
-	if ((s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+	s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+	if (s < 0) {
 		c->low_wmem = c->low_rmem = 1;
 		return;
 	}
@@ -255,6 +270,23 @@ void sock_probe_mem(struct ctx *c)
 	close(s);
 }
 
+/**
+ * timespec_diff_us() - Report difference in microseconds between two timestamps
+ * @a:		Minuend timestamp
+ * @b:		Subtrahend timestamp
+ *
+ * Return: difference in microseconds (wraps after 2^63 / 10^6s ~= 292k years)
+ */
+int64_t timespec_diff_us(const struct timespec *a, const struct timespec *b)
+{
+	if (a->tv_nsec < b->tv_nsec) {
+		return (a->tv_nsec + 1000000000 - b->tv_nsec) / 1000 +
+		       (a->tv_sec - b->tv_sec - 1) * 1000000;
+	}
+
+	return (a->tv_nsec - b->tv_nsec) / 1000 +
+	       (a->tv_sec - b->tv_sec) * 1000000;
+}
 
 /**
  * timespec_diff_ms() - Report difference in milliseconds between two timestamps
@@ -263,15 +295,9 @@ void sock_probe_mem(struct ctx *c)
  *
  * Return: difference in milliseconds
  */
-int timespec_diff_ms(const struct timespec *a, const struct timespec *b)
+long timespec_diff_ms(const struct timespec *a, const struct timespec *b)
 {
-	if (a->tv_nsec < b->tv_nsec) {
-		return (b->tv_nsec - a->tv_nsec) / 1000000 +
-		       (a->tv_sec - b->tv_sec - 1) * 1000;
-	}
-
-	return (a->tv_nsec - b->tv_nsec) / 1000000 +
-	       (a->tv_sec - b->tv_sec) * 1000;
+	return timespec_diff_us(a, b) / 1000;
 }
 
 /**
@@ -279,7 +305,7 @@ int timespec_diff_ms(const struct timespec *a, const struct timespec *b)
  * @map:	Pointer to bitmap
  * @bit:	Bit number to set
  */
-void bitmap_set(uint8_t *map, int bit)
+void bitmap_set(uint8_t *map, unsigned bit)
 {
 	unsigned long *word = (unsigned long *)map + BITMAP_WORD(bit);
 
@@ -291,7 +317,7 @@ void bitmap_set(uint8_t *map, int bit)
  * @map:	Pointer to bitmap
  * @bit:	Bit number to clear
  */
-void bitmap_clear(uint8_t *map, int bit)
+void bitmap_clear(uint8_t *map, unsigned bit)
 {
 	unsigned long *word = (unsigned long *)map + BITMAP_WORD(bit);
 
@@ -303,99 +329,133 @@ void bitmap_clear(uint8_t *map, int bit)
  * @map:	Pointer to bitmap
  * @bit:	Bit number to check
  *
- * Return: one if given bit is set, zero if it's not
+ * Return: true if given bit is set, false if it's not
  */
-int bitmap_isset(const uint8_t *map, int bit)
+bool bitmap_isset(const uint8_t *map, unsigned bit)
 {
-	unsigned long *word = (unsigned long *)map + BITMAP_WORD(bit);
+	const unsigned long *word
+		= (const unsigned long *)map + BITMAP_WORD(bit);
 
 	return !!(*word & BITMAP_BIT(bit));
 }
 
 /**
- * procfs_scan_listen() - Set bits for listening TCP or UDP sockets from procfs
- * @proto:	IPPROTO_TCP or IPPROTO_UDP
- * @ip_version:	IP version, V4 or V6
- * @ns:		Use saved file descriptors for namespace if set
- * @map:	Bitmap where numbers of ports in listening state will be set
- * @exclude:	Bitmap of ports to exclude from setting (and clear)
- *
- * #syscalls:pasta lseek
- * #syscalls:pasta ppc64le:_llseek ppc64:_llseek armv6l:_llseek armv7l:_llseek
+ * bitmap_or() - Logical disjunction (OR) of two bitmaps
+ * @dst:	Pointer to result bitmap
+ * @size:	Size of bitmaps, in bytes
+ * @a:		First operand
+ * @b:		Second operand
  */
-void procfs_scan_listen(struct ctx *c, uint8_t proto, int ip_version, int ns,
-			uint8_t *map, uint8_t *exclude)
+void bitmap_or(uint8_t *dst, size_t size, const uint8_t *a, const uint8_t *b)
 {
-	char *path, *line;
-	struct lineread lr;
-	unsigned long port;
-	unsigned int state;
-	int *fd;
+	unsigned long *dw = (unsigned long *)dst;
+	unsigned long *aw = (unsigned long *)a;
+	unsigned long *bw = (unsigned long *)b;
+	size_t i;
 
-	if (proto == IPPROTO_TCP) {
-		fd = &c->proc_net_tcp[ip_version][ns];
-		if (ip_version == V4)
-			path = "/proc/net/tcp";
-		else
-			path = "/proc/net/tcp6";
-	} else {
-		fd = &c->proc_net_udp[ip_version][ns];
-		if (ip_version == V4)
-			path = "/proc/net/udp";
-		else
-			path = "/proc/net/udp6";
-	}
+	for (i = 0; i < size / sizeof(long); i++, dw++, aw++, bw++)
+		*dw = *aw | *bw;
 
-	if (*fd != -1) {
-		if (lseek(*fd, 0, SEEK_SET)) {
-			warn("lseek() failed on %s: %s", path, strerror(errno));
-			return;
-		}
-	} else if ((*fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) {
-		return;
-	}
-
-	lineread_init(&lr, *fd);
-	lineread_get(&lr, &line); /* throw away header */
-	while (lineread_get(&lr, &line) > 0) {
-		/* NOLINTNEXTLINE(cert-err34-c): != 2 if conversion fails */
-		if (sscanf(line, "%*u: %*x:%lx %*x:%*x %x", &port, &state) != 2)
-			continue;
-
-		/* See enum in kernel's include/net/tcp_states.h */
-		if ((proto == IPPROTO_TCP && state != 0x0a) ||
-		    (proto == IPPROTO_UDP && state != 0x07))
-			continue;
-
-		if (bitmap_isset(exclude, port))
-			bitmap_clear(map, port);
-		else
-			bitmap_set(map, port);
-	}
+	for (i = size / sizeof(long) * sizeof(long); i < size; i++)
+		dst[i] = a[i] | b[i];
 }
 
-/**
+/*
  * ns_enter() - Enter configured user (unless already joined) and network ns
  * @c:		Execution context
  *
- * Return: 0, won't return on failure
+ * Won't return on failure
  *
  * #syscalls:pasta setns
  */
-int ns_enter(const struct ctx *c)
+void ns_enter(const struct ctx *c)
 {
 	if (setns(c->pasta_netns_fd, CLONE_NEWNET))
-		exit(EXIT_FAILURE);
+		die_perror("setns() failed entering netns");
+}
+
+/**
+ * ns_is_init() - Is the caller running in the "init" user namespace?
+ *
+ * Return: true if caller is in init, false otherwise, won't return on failure
+ */
+bool ns_is_init(void)
+{
+	const char root_uid_map[] = "         0          0 4294967295\n";
+	char buf[sizeof(root_uid_map)] = { 0 };
+	bool ret = true;
+	int fd;
+
+	if ((fd = open("/proc/self/uid_map", O_RDONLY | O_CLOEXEC)) < 0)
+		die_perror("Can't determine if we're in init namespace");
+
+	if (read(fd, buf, sizeof(root_uid_map)) != sizeof(root_uid_map) - 1 ||
+	    strncmp(buf, root_uid_map, sizeof(root_uid_map)))
+		ret = false;
+
+	close(fd);
+	return ret;
+}
+
+/**
+ * struct open_in_ns_args - Parameters for do_open_in_ns()
+ * @c:		Execution context
+ * @fd:		Filled in with return value from open()
+ * @err:	Filled in with errno if open() failed
+ * @path:	Path to open
+ * @flags:	open() flags
+ */
+struct open_in_ns_args {
+	const struct ctx *c;
+	int fd;
+	int err;
+	const char *path;
+	int flags;
+};
+
+/**
+ * do_open_in_ns() - Enter namespace and open a file
+ * @arg:	See struct open_in_ns_args
+ *
+ * Must be called via NS_CALL()
+ */
+static int do_open_in_ns(void *arg)
+{
+	struct open_in_ns_args *a = (struct open_in_ns_args *)arg;
+
+	ns_enter(a->c);
+
+	a->fd = open(a->path, a->flags);
+	a->err = errno;
 
 	return 0;
 }
 
 /**
- * pid_file() - Write PID to file, if requested to do so, and close it
+ * open_in_ns() - open() within the pasta namespace
+ * @c:		Execution context
+ * @path:	Path to open
+ * @flags:	open() flags
+ *
+ * Return: fd of open()ed file or -1 on error, errno is set to indicate error
+ */
+int open_in_ns(const struct ctx *c, const char *path, int flags)
+{
+	struct open_in_ns_args arg = {
+		.c = c, .path = path, .flags = flags,
+	};
+
+	NS_CALL(do_open_in_ns, &arg);
+	errno = arg.err;
+	return arg.fd;
+}
+
+/**
+ * pidfile_write() - Write PID to file, if requested to do so, and close it
  * @fd:		Open PID file descriptor, closed on exit, -1 to skip writing it
  * @pid:	PID value to write
  */
-void write_pidfile(int fd, pid_t pid)
+void pidfile_write(int fd, pid_t pid)
 {
 	char pid_buf[12];
 	int n;
@@ -407,10 +467,27 @@ void write_pidfile(int fd, pid_t pid)
 
 	if (write(fd, pid_buf, n) < 0) {
 		perror("PID file write");
-		exit(EXIT_FAILURE);
+		_exit(EXIT_FAILURE);
 	}
 
 	close(fd);
+}
+
+/**
+ * output_file_open() - Open file for output, if needed
+ * @path:	Path for output file
+ * @flags:	Flags for open() other than O_CREAT, O_TRUNC, O_CLOEXEC
+ *
+ * Return: file descriptor on success, -1 on failure with errno set by open()
+ */
+int output_file_open(const char *path, int flags)
+{
+	/* We use O_CLOEXEC here, but clang-tidy as of LLVM 16 to 19 looks for
+	 * it in the 'mode' argument if we have one
+	 */
+	return open(path, O_CREAT | O_TRUNC | O_CLOEXEC | flags,
+		    /* NOLINTNEXTLINE(android-cloexec-open) */
+		    S_IRUSR | S_IWUSR);
 }
 
 /**
@@ -426,25 +503,20 @@ int __daemon(int pidfile_fd, int devnull_fd)
 
 	if (pid == -1) {
 		perror("fork");
-		exit(EXIT_FAILURE);
+		_exit(EXIT_FAILURE);
 	}
 
 	if (pid) {
-		write_pidfile(pidfile_fd, pid);
-		exit(EXIT_SUCCESS);
+		pidfile_write(pidfile_fd, pid);
+		_exit(EXIT_SUCCESS);
 	}
 
-	errno = 0;
-
-	setsid();
-
-	dup2(devnull_fd, STDIN_FILENO);
-	dup2(devnull_fd, STDOUT_FILENO);
-	dup2(devnull_fd, STDERR_FILENO);
-	close(devnull_fd);
-
-	if (errno)
-		exit(EXIT_FAILURE);
+	if (setsid()				< 0 ||
+	    dup2(devnull_fd, STDIN_FILENO)	< 0 ||
+	    dup2(devnull_fd, STDOUT_FILENO)	< 0 ||
+	    dup2(devnull_fd, STDERR_FILENO)	< 0 ||
+	    close(devnull_fd))
+		_exit(EXIT_FAILURE);
 
 	return 0;
 }
@@ -481,7 +553,7 @@ int write_file(const char *path, const char *buf)
 	size_t len = strlen(buf);
 
 	if (fd < 0) {
-		warn("Could not open %s: %s", path, strerror(errno));
+		warn_perror("Could not open %s", path);
 		return -1;
 	}
 
@@ -489,7 +561,7 @@ int write_file(const char *path, const char *buf)
 		ssize_t rc = write(fd, buf, len);
 
 		if (rc <= 0) {
-			warn("Couldn't write to %s: %s", path, strerror(errno));
+			warn_perror("Couldn't write to %s", path);
 			break;
 		}
 
@@ -529,4 +601,419 @@ int do_clone(int (*fn)(void *), char *stack_area, size_t stack_size, int flags,
 #else
 	return clone(fn, stack_area + stack_size / 2, flags, arg);
 #endif
+}
+
+/* write_all_buf() - write all of a buffer to an fd
+ * @fd:		File descriptor
+ * @buf:	Pointer to base of buffer
+ * @len:	Length of buffer
+ *
+ * Return: 0 on success, -1 on error (with errno set)
+ *
+ * #syscalls write
+ */
+int write_all_buf(int fd, const void *buf, size_t len)
+{
+	const char *p = buf;
+	size_t left = len;
+
+	while (left) {
+		ssize_t rc;
+
+		do
+			rc = write(fd, p, left);
+		while ((rc < 0) && errno == EINTR);
+
+		if (rc < 0)
+			return -1;
+
+		p += rc;
+		left -= rc;
+	}
+	return 0;
+}
+
+/* write_remainder() - write the tail of an IO vector to an fd
+ * @fd:		File descriptor
+ * @iov:	IO vector
+ * @iovcnt:	Number of entries in @iov
+ * @skip:	Number of bytes of the vector to skip writing
+ *
+ * Return: 0 on success, -1 on error (with errno set)
+ *
+ * #syscalls writev
+ */
+int write_remainder(int fd, const struct iovec *iov, size_t iovcnt, size_t skip)
+{
+	size_t i = 0, offset;
+
+	while ((i += iov_skip_bytes(iov + i, iovcnt - i, skip, &offset)) < iovcnt) {
+		ssize_t rc;
+
+		if (offset) {
+			/* Write the remainder of the partially written buffer */
+			if (write_all_buf(fd, (char *)iov[i].iov_base + offset,
+					  iov[i].iov_len - offset) < 0)
+				return -1;
+			i++;
+		}
+
+		/* Write as much of the remaining whole buffers as we can */
+		rc = writev(fd, &iov[i], iovcnt - i);
+		if (rc < 0)
+			return -1;
+
+		skip = rc;
+	}
+	return 0;
+}
+
+/**
+ * read_all_buf() - Fill a whole buffer from a file descriptor
+ * @fd:		File descriptor
+ * @buf:	Pointer to base of buffer
+ * @len:	Length of buffer
+ *
+ * Return: 0 on success, -1 on error (with errno set)
+ *
+ * #syscalls read
+ */
+int read_all_buf(int fd, void *buf, size_t len)
+{
+	size_t left = len;
+	char *p = buf;
+
+	while (left) {
+		ssize_t rc;
+
+		ASSERT(left <= len);
+
+		do
+			rc = read(fd, p, left);
+		while ((rc < 0) && errno == EINTR);
+
+		if (rc < 0)
+			return -1;
+
+		if (rc == 0) {
+			errno = ENODATA;
+			return -1;
+		}
+
+		p += rc;
+		left -= rc;
+	}
+	return 0;
+}
+
+/**
+ * read_remainder() - Read the tail of an IO vector from a file descriptor
+ * @fd:		File descriptor
+ * @iov:	IO vector
+ * @cnt:	Number of entries in @iov
+ * @skip:	Number of bytes of the vector to skip reading
+ *
+ * Return: 0 on success, -1 on error (with errno set)
+ *
+ * Note: mode-specific seccomp profiles need to enable readv() to use this.
+ */
+/* cppcheck-suppress unusedFunction */
+int read_remainder(int fd, const struct iovec *iov, size_t cnt, size_t skip)
+{
+	size_t i = 0, offset;
+
+	while ((i += iov_skip_bytes(iov + i, cnt - i, skip, &offset)) < cnt) {
+		ssize_t rc;
+
+		if (offset) {
+			ASSERT(offset < iov[i].iov_len);
+			/* Read the remainder of the partially read buffer */
+			if (read_all_buf(fd, (char *)iov[i].iov_base + offset,
+					 iov[i].iov_len - offset) < 0)
+				return -1;
+			i++;
+		}
+
+		if (cnt == i)
+			break;
+
+		/* Fill as many of the remaining buffers as we can */
+		rc = readv(fd, &iov[i], cnt - i);
+		if (rc < 0)
+			return -1;
+
+		if (rc == 0) {
+			errno = ENODATA;
+			return -1;
+		}
+
+		skip = rc;
+	}
+	return 0;
+}
+
+/** sockaddr_ntop() - Convert a socket address to text format
+ * @sa:		Socket address
+ * @dst:	output buffer, minimum SOCKADDR_STRLEN bytes
+ * @size:	size of buffer at @dst
+ *
+ * Return: On success, a non-null pointer to @dst, NULL on failure
+ */
+const char *sockaddr_ntop(const void *sa, char *dst, socklen_t size)
+{
+	sa_family_t family = ((const struct sockaddr *)sa)->sa_family;
+	socklen_t off = 0;
+
+#define IPRINTF(...)							\
+	do {								\
+		off += snprintf(dst + off, size - off, __VA_ARGS__);	\
+		if (off >= size)					\
+			return NULL;					\
+	} while (0)
+
+#define INTOP(af, addr)							\
+	do {								\
+		if (!inet_ntop((af), (addr), dst + off, size - off))	\
+			return NULL;					\
+		off += strlen(dst + off);				\
+	} while (0)
+
+	switch (family) {
+	case AF_UNSPEC:
+		IPRINTF("<unspecified>");
+		break;
+
+	case AF_INET: {
+		const struct sockaddr_in *sa4 = sa;
+
+		INTOP(AF_INET, &sa4->sin_addr);
+		IPRINTF(":%hu", ntohs(sa4->sin_port));
+		break;
+	}
+
+	case AF_INET6: {
+		const struct sockaddr_in6 *sa6 = sa;
+
+		IPRINTF("[");
+		INTOP(AF_INET6, &sa6->sin6_addr);
+		IPRINTF("]:%hu", ntohs(sa6->sin6_port));
+		break;
+	}
+
+		/* FIXME: Implement AF_UNIX */
+	default:
+		errno = EAFNOSUPPORT;
+		return NULL;
+	}
+
+#undef IPRINTF
+#undef INTOP
+
+	return dst;
+}
+
+/** eth_ntop() - Convert an Ethernet MAC address to text format
+ * @mac:	MAC address
+ * @dst:	Output buffer, minimum ETH_ADDRSTRLEN bytes
+ * @size:	Size of buffer at @dst
+ *
+ * Return: On success, a non-null pointer to @dst, NULL on failure
+ */
+const char *eth_ntop(const unsigned char *mac, char *dst, size_t size)
+{
+	int len;
+
+	len = snprintf(dst, size, "%02x:%02x:%02x:%02x:%02x:%02x",
+		       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	if (len < 0 || (size_t)len >= size)
+		return NULL;
+
+	return dst;
+}
+
+/** str_ee_origin() - Convert socket extended error origin to a string
+ * @ee:		Socket extended error structure
+ *
+ * Return: Static string describing error origin
+ */
+const char *str_ee_origin(const struct sock_extended_err *ee)
+{
+	const char *const desc[] = {
+		[SO_EE_ORIGIN_NONE]  = "<no origin>",
+		[SO_EE_ORIGIN_LOCAL] = "Local",
+		[SO_EE_ORIGIN_ICMP]  = "ICMP",
+		[SO_EE_ORIGIN_ICMP6] = "ICMPv6",
+	};
+
+	if (ee->ee_origin < ARRAY_SIZE(desc))
+		return desc[ee->ee_origin];
+
+	return "<invalid>";
+}
+
+/**
+ * close_open_files() - Close leaked files, but not --fd, stdin, stdout, stderr
+ * @argc:	Argument count
+ * @argv:	Command line options, as we need to skip any file given via --fd
+ */
+void close_open_files(int argc, char **argv)
+{
+	const struct option optfd[] = { { "fd", required_argument, NULL, 'F' },
+					{ 0 },
+				      };
+	long fd = -1;
+	int name, rc;
+
+	do {
+		name = getopt_long(argc, argv, "-:F:", optfd, NULL);
+
+		if (name == 'F') {
+			errno = 0;
+			fd = strtol(optarg, NULL, 0);
+
+			if (errno || fd <= STDERR_FILENO || fd > INT_MAX)
+				die("Invalid --fd: %s", optarg);
+		}
+	} while (name != -1);
+
+	if (fd == -1) {
+		rc = close_range(STDERR_FILENO + 1, ~0U, CLOSE_RANGE_UNSHARE);
+	} else if (fd == STDERR_FILENO + 1) { /* Still a single range */
+		rc = close_range(STDERR_FILENO + 2, ~0U, CLOSE_RANGE_UNSHARE);
+	} else {
+		rc = close_range(STDERR_FILENO + 1, fd - 1,
+				 CLOSE_RANGE_UNSHARE);
+		if (!rc)
+			rc = close_range(fd + 1, ~0U, CLOSE_RANGE_UNSHARE);
+	}
+
+	if (rc) {
+		if (errno == ENOSYS || errno == EINVAL) {
+			/* This probably means close_range() or the
+			 * CLOSE_RANGE_UNSHARE flag is not supported by the
+			 * kernel.  Not much we can do here except carry on and
+			 * hope for the best.
+			 */
+			warn(
+"Can't use close_range() to ensure no files leaked by parent");
+		} else {
+			die_perror("Failed to close files leaked by parent");
+		}
+	}
+
+}
+
+/**
+ * snprintf_check() - snprintf() wrapper, checking for truncation and errors
+ * @str:	Output buffer
+ * @size:	Maximum size to write to @str
+ * @format:	Message
+ *
+ * Return: false on success, true on truncation or error, sets errno on failure
+ */
+bool snprintf_check(char *str, size_t size, const char *format, ...)
+{
+	va_list ap;
+	int rc;
+
+	va_start(ap, format);
+	rc = vsnprintf(str, size, format, ap);
+	va_end(ap);
+
+	if (rc < 0) {
+		errno = EIO;
+		return true;
+	}
+
+	if ((size_t)rc >= size) {
+		errno = ENOBUFS;
+		return true;
+	}
+
+	return false;
+}
+
+#define DEV_RANDOM	"/dev/random"
+
+/**
+ * raw_random() - Get high quality random bytes
+ * @buf:	Buffer to fill with random bytes
+ * @buflen:	Number of bytes of random data to put in @buf
+ *
+ * Assumes that the random data is essential, and will die() if unable to obtain
+ * it.
+ */
+void raw_random(void *buf, size_t buflen)
+{
+	size_t random_read = 0;
+#ifndef HAS_GETRANDOM
+	int fd = open(DEV_RANDOM, O_RDONLY);
+
+	if (fd < 0)
+		die_perror("Couldn't open %s", DEV_RANDOM);
+#endif
+
+	while (random_read < buflen) {
+		ssize_t ret;
+
+#ifdef HAS_GETRANDOM
+		ret = getrandom((char *)buf + random_read,
+				buflen - random_read, GRND_RANDOM);
+#else
+		ret = read(dev_random, (char *)buf + random_read,
+			   buflen - random_read);
+#endif
+
+		if (ret == -1 && errno == EINTR)
+			continue;
+
+		if (ret < 0)
+			die_perror("Error on random data source");
+
+		if (ret == 0)
+			break;
+
+		random_read += ret;
+	}
+
+#ifndef HAS_GETRANDOM
+	close(dev_random);
+#endif
+
+	if (random_read < buflen)
+		die("Unexpected EOF on random data source");
+}
+
+/**
+ * epoll_del() - Remove a file descriptor from our passt epoll
+ * @c:		Execution context
+ * @fd:		File descriptor to remove
+ */
+void epoll_del(const struct ctx *c, int fd)
+{
+	epoll_ctl(c->epollfd, EPOLL_CTL_DEL, fd, NULL);
+
+}
+
+/**
+ * encode_domain_name() - Encode domain name according to RFC 1035, section 3.1
+ * @buf:		Buffer to fill in with encoded domain name
+ * @domain_name:	Input domain name string with terminator
+ *
+ * The buffer's 'buf' size has to be >= strlen(domain_name) + 2
+ */
+void encode_domain_name(char *buf, const char *domain_name)
+{
+	size_t i;
+	char *p;
+
+	buf[0] = strcspn(domain_name, ".");
+	p = buf + 1;
+	for (i = 0; domain_name[i]; i++) {
+		if (domain_name[i] == '.')
+			p[i] = strcspn(domain_name + i + 1, ".");
+		else
+			p[i] = domain_name[i];
+	}
+	p[i] = 0L;
 }

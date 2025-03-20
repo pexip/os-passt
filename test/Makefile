@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Tests makefile
 #
@@ -8,7 +8,6 @@
 WGET = wget -c
 
 DEBIAN_IMGS = debian-8.11.0-openstack-amd64.qcow2 \
-	debian-9-nocloud-amd64-daily-20200210-166.qcow2 \
 	debian-10-nocloud-amd64.qcow2 \
 	debian-10-generic-arm64.qcow2 \
 	debian-10-generic-ppc64el-20220911-1135.qcow2 \
@@ -42,8 +41,7 @@ OPENSUSE_IMGS = openSUSE-Leap-15.1-JeOS.x86_64-kvm-and-xen.qcow2 \
 	openSUSE-Leap-15.2-JeOS.x86_64-kvm-and-xen.qcow2 \
 	openSUSE-Leap-15.3-JeOS.x86_64-kvm-and-xen.qcow2 \
 	openSUSE-Tumbleweed-ARM-JeOS-efi.aarch64.raw.xz \
-	openSUSE-Tumbleweed-ARM-JeOS-efi.armv7l.raw.xz \
-	openSUSE-Tumbleweed-JeOS.x86_64-kvm-and-xen.qcow2
+	openSUSE-Tumbleweed-ARM-JeOS-efi.armv7l.raw.xz
 
 UBUNTU_OLD_IMGS = trusty-server-cloudimg-amd64-disk1.img \
 	trusty-server-cloudimg-i386-disk1.img \
@@ -52,13 +50,14 @@ UBUNTU_NEW_IMGS = xenial-server-cloudimg-powerpc-disk1.img \
 	jammy-server-cloudimg-s390x.img
 UBUNTU_IMGS = $(UBUNTU_OLD_IMGS) $(UBUNTU_NEW_IMGS)
 
-DOWNLOAD_ASSETS = mbuto \
+DOWNLOAD_ASSETS = mbuto podman \
 	$(DEBIAN_IMGS) $(FEDORA_IMGS) $(OPENSUSE_IMGS) $(UBUNTU_IMGS)
-TESTDATA_ASSETS = small.bin big.bin medium.bin
-LOCAL_ASSETS = mbuto.img mbuto.mem.img QEMU_EFI.fd \
+TESTDATA_ASSETS = small.bin big.bin medium.bin \
+	rampstream
+LOCAL_ASSETS = mbuto.img mbuto.mem.img podman/bin/podman QEMU_EFI.fd \
 	$(DEBIAN_IMGS:%=prepared-%) $(FEDORA_IMGS:%=prepared-%) \
 	$(UBUNTU_NEW_IMGS:%=prepared-%) \
-	nsholder guest-key guest-key.pub \
+	nstool guest-key guest-key.pub \
 	$(TESTDATA_ASSETS)
 
 ASSETS = $(DOWNLOAD_ASSETS) $(LOCAL_ASSETS)
@@ -67,19 +66,33 @@ CFLAGS = -Wall -Werror -Wextra -pedantic -std=c99
 
 assets: $(ASSETS)
 
+.PHONY: pull-%
+pull-%: %
+	git -C $* pull
+
 mbuto:
 	git clone git://mbuto.sh/mbuto
+
+mbuto/mbuto: pull-mbuto
+
+podman:
+	git clone https://github.com/containers/podman.git
+
+# To succesfully build podman, you will need gpgme and systemd
+# development packages
+podman/bin/podman: pull-podman
+	$(MAKE) -C podman
 
 guest-key guest-key.pub:
 	ssh-keygen -f guest-key -N ''
 
-mbuto.img: passt.mbuto mbuto guest-key.pub $(TESTDATA_ASSETS)
+mbuto.img: passt.mbuto mbuto/mbuto guest-key.pub rampstream-check.sh $(TESTDATA_ASSETS)
 	./mbuto/mbuto -p ./$< -c lz4 -f $@
 
 mbuto.mem.img: passt.mem.mbuto mbuto ../passt.avx2
 	./mbuto/mbuto -p ./$< -c lz4 -f $@
 
-nsholder: nsholder.c
+nstool: nstool.c
 	$(CC) $(CFLAGS) -o $@ $^
 
 QEMU_EFI.fd:
@@ -120,9 +133,6 @@ realclean: clean
 # Debian downloads
 debian-8.11.0-openstack-%.qcow2:
 	$(WGET) -O $@ https://cloud.debian.org/images/cloud/OpenStack/archive/8.11.0/debian-8.11.0-openstack-$*.qcow2
-
-debian-9-nocloud-%-daily-20200210-166.qcow2:
-	$(WGET) -O $@ https://cloud.debian.org/images/cloud/stretch/daily/20200210-166/debian-9-nocloud-$*-daily-20200210-166.qcow2
 
 debian-10-nocloud-%.qcow2:
 	$(WGET) -O $@ https://cloud.debian.org/images/cloud/buster/latest/debian-10-nocloud-$*.qcow2
@@ -188,9 +198,6 @@ openSUSE-Tumbleweed-ARM-JeOS-efi.aarch64.raw.xz:
 
 openSUSE-Tumbleweed-ARM-JeOS-efi.armv7l.raw.xz:
 	$(WGET) -O $@ http://download.opensuse.org/ports/armv7hl/tumbleweed/appliances/openSUSE-Tumbleweed-ARM-JeOS-efi.armv7l.raw.xz
-
-openSUSE-Tumbleweed-JeOS.x86_64-kvm-and-xen.qcow2:
-	$(WGET) -O $@ https://download.opensuse.org/tumbleweed/appliances/openSUSE-Tumbleweed-JeOS.x86_64-kvm-and-xen.qcow2
 
 # Ubuntu downloads
 trusty-server-cloudimg-%-disk1.img:

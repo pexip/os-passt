@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -31,8 +31,8 @@ PR_DELAY_INIT=100 # ms
 # $@:	Message to print
 info() {
 	tmux select-pane -t ${PANE_INFO}
-	echo "${@}" >> $STATEBASE/log_pipe
-	echo "${@}" >> "${LOGFILE}"
+	printf "${@}\n" >> $STATEBASE/log_pipe
+	printf "${@}\n" >> "${LOGFILE}"
 }
 
 # info_n() - Highlight, print message to pane and to log file without newline
@@ -47,13 +47,13 @@ info_n() {
 # $@:	Message to print
 info_nolog() {
 	tmux select-pane -t ${PANE_INFO}
-	echo "${@}" >> $STATEBASE/log_pipe
+	printf "${@}\n" >> $STATEBASE/log_pipe
 }
 
 # info_nolog() - Print message to log file
 # $@:	Message to print
 log() {
-	echo "${@}" >> "${LOGFILE}"
+	printf "${@}\n" >> "${LOGFILE}"
 }
 
 # info_nolog_n() - Send message to pane without highlighting it, without newline
@@ -97,7 +97,6 @@ display_delay() {
 switch_pane() {
 	tmux select-pane -t ${1}
 	PR_DELAY=${PR_DELAY_INIT}
-	display_delay "0.2"
 }
 
 # cmd_write() - Write a command to a pane, letter by letter, and execute it
@@ -199,17 +198,15 @@ pane_run() {
 # $1:	Pane name
 pane_wait() {
 	__lc="$(echo "${1}" | tr [A-Z] [a-z])"
-	sleep 0.1 || sleep 1
+	sleep 0.01 || sleep 1
 
 	__done=0
 	while
-		__l="$(tail -1 ${LOGDIR}/pane_${__lc}.log | tr -d [:cntrl:])"
+		__l="$(tail -1 ${LOGDIR}/pane_${__lc}.log | sed 's/[[][^a-zA-Z]*[a-zA-Z]//g')"
 		case ${__l} in
-		'$ ' | '# ' | '# # ' | *"$ " | *"# ") return ;;
-		*" #[m " | *" #[m [K" | *"]# ["*) return ;;
-		*' $ [6n' | *' # [6n' ) return ;;
+		*"$ " | *"# ") return ;;
 		esac
-	do sleep 0.1 || sleep 1; done
+	do sleep 0.01 || sleep 1; done
 }
 
 # pane_parse() - Print last line, @EMPTY@ if command had no output
@@ -233,7 +230,7 @@ pane_status() {
 
 	__status="$(pane_parse "${1}")"
 	while ! [ "${__status}" -eq "${__status}" ] 2>/dev/null; do
-		sleep 1
+		sleep 0.01 || sleep 1
 		pane_run "${1}" 'echo $?'
 		pane_wait "${1}"
 		__status="$(pane_parse "${1}")"
@@ -385,6 +382,16 @@ info_check_failed() {
 	printf " < failed.\n" >> "${LOGFILE}"
 }
 
+# status_bar_blink() - Make status bar blink
+status_bar_blink() {
+	for i in `seq 1 3`; do
+		tmux set status-right-style 'bg=colour1 fg=colour196 bold'
+		sleep 0.1 || sleep 1
+		tmux set status-right-style 'bg=colour1 fg=colour233 bold'
+		sleep 0.1 || sleep 1
+	done
+}
+
 # info_passed() - Display, log, and make status bar blink when a test passes
 info_passed() {
 	switch_pane ${PANE_INFO}
@@ -393,12 +400,7 @@ info_passed() {
 	log "...passed."
 	log
 
-	for i in `seq 1 3`; do
-		tmux set status-right-style 'bg=colour1 fg=colour2 bold'
-		sleep "0.1"
-		tmux set status-right-style 'bg=colour1 fg=colour233 bold'
-		sleep "0.1"
-	done
+	[ ${FAST} -eq 1 ] || status_bar_blink
 }
 
 # info_failed() - Display, log, and make status bar blink when a test passes
@@ -409,12 +411,7 @@ info_failed() {
 	log "...failed."
 	log
 
-	for i in `seq 1 3`; do
-		tmux set status-right-style 'bg=colour1 fg=colour196 bold'
-		sleep "0.1"
-		tmux set status-right-style 'bg=colour1 fg=colour233 bold'
-		sleep "0.1"
-	done
+	[ ${FAST} -eq 1 ] || status_bar_blink
 
 	pause_continue \
 		"Press any key to pause test session"		\
@@ -667,7 +664,7 @@ pause_continue() {
 
 # run_term() - Start tmux session, running entry point, with recording if needed
 run_term() {
-	TMUX="tmux new-session -s passt_test -eSTATEBASE=$STATEBASE -ePCAP=$PCAP -eDEBUG=$DEBUG"
+	TMUX="tmux new-session -s passt_test -eSTATEBASE=$STATEBASE -ePCAP=$PCAP -eDEBUG=$DEBUG -eTRACE=$TRACE -eKERNEL=$KERNEL"
 
 	if [ ${CI} -eq 1 ]; then
 		printf '\e[8;50;240t'

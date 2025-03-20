@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -15,62 +15,45 @@ VERSION ?= $(shell git describe --tags HEAD 2>/dev/null || echo "unknown\ versio
 # the IPv6 socket API? (Linux does)
 DUAL_STACK_SOCKETS := 1
 
-RLIMIT_STACK_VAL := $(shell /bin/sh -c 'ulimit -s')
-ifeq ($(RLIMIT_STACK_VAL),unlimited)
-RLIMIT_STACK_VAL := 1024
+TARGET ?= $(shell $(CC) -dumpmachine)
+$(if $(TARGET),,$(error Failed to get target architecture))
+# Get 'uname -m'-like architecture description for target
+TARGET_ARCH := $(firstword $(subst -, ,$(TARGET)))
+TARGET_ARCH := $(patsubst [:upper:],[:lower:],$(TARGET_ARCH))
+TARGET_ARCH := $(subst powerpc,ppc,$(TARGET_ARCH))
+
+# On some systems enabling optimization also enables source fortification,
+# automagically. Do not override it.
+FORTIFY_FLAG :=
+ifeq ($(shell $(CC) -O2 -dM -E - < /dev/null 2>&1 | grep ' _FORTIFY_SOURCE ' > /dev/null; echo $$?),1)
+FORTIFY_FLAG := -D_FORTIFY_SOURCE=2
 endif
 
-TARGET := $(shell $(CC) -dumpmachine)
-# Get 'uname -m'-like architecture description for target
-TARGET_ARCH := $(shell echo $(TARGET) | cut -f1 -d- | tr [A-Z] [a-z])
-TARGET_ARCH := $(shell echo $(TARGET_ARCH) | sed 's/powerpc/ppc/')
-
-AUDIT_ARCH := $(shell echo $(TARGET_ARCH) | tr [a-z] [A-Z] | sed 's/^ARM.*/ARM/')
-AUDIT_ARCH := $(shell echo $(AUDIT_ARCH) | sed 's/I[456]86/I386/')
-AUDIT_ARCH := $(shell echo $(AUDIT_ARCH) | sed 's/PPC64/PPC/')
-AUDIT_ARCH := $(shell echo $(AUDIT_ARCH) | sed 's/PPCLE/PPC64LE/')
-AUDIT_ARCH := $(shell echo $(AUDIT_ARCH) | sed 's/MIPS64EL/MIPSEL64/')
-AUDIT_ARCH := $(shell echo $(AUDIT_ARCH) | sed 's/HPPA/PARISC/')
-AUDIT_ARCH := $(shell echo $(AUDIT_ARCH) | sed 's/SH4/SH/')
-
-FLAGS := -Wall -Wextra -pedantic -std=c99 -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
-FLAGS += -D_FORTIFY_SOURCE=2 -O2 -pie -fPIE
+FLAGS := -Wall -Wextra -Wno-format-zero-length -Wformat-security
+FLAGS += -pedantic -std=c11 -D_XOPEN_SOURCE=700 -D_GNU_SOURCE
+FLAGS +=  $(FORTIFY_FLAG) -O2 -pie -fPIE
 FLAGS += -DPAGE_SIZE=$(shell getconf PAGE_SIZE)
-FLAGS += -DNETNS_RUN_DIR=\"/run/netns\"
-FLAGS += -DPASST_AUDIT_ARCH=AUDIT_ARCH_$(AUDIT_ARCH)
-FLAGS += -DRLIMIT_STACK_VAL=$(RLIMIT_STACK_VAL)
-FLAGS += -DARCH=\"$(TARGET_ARCH)\"
 FLAGS += -DVERSION=\"$(VERSION)\"
 FLAGS += -DDUAL_STACK_SOCKETS=$(DUAL_STACK_SOCKETS)
 
-PASST_SRCS = arch.c arp.c checksum.c conf.c dhcp.c dhcpv6.c icmp.c igmp.c \
-	isolation.c lineread.c log.c mld.c ndp.c netlink.c packet.c passt.c \
-	pasta.c pcap.c siphash.c tap.c tcp.c tcp_splice.c udp.c util.c
+PASST_SRCS = arch.c arp.c checksum.c conf.c dhcp.c dhcpv6.c flow.c fwd.c \
+	icmp.c igmp.c inany.c iov.c ip.c isolation.c lineread.c log.c mld.c \
+	ndp.c netlink.c migrate.c packet.c passt.c pasta.c pcap.c pif.c \
+	repair.c tap.c tcp.c tcp_buf.c tcp_splice.c tcp_vu.c udp.c udp_flow.c \
+	udp_vu.c util.c vhost_user.c virtio.c vu_common.c
 QRAP_SRCS = qrap.c
-SRCS = $(PASST_SRCS) $(QRAP_SRCS)
+PASST_REPAIR_SRCS = passt-repair.c
+SRCS = $(PASST_SRCS) $(QRAP_SRCS) $(PASST_REPAIR_SRCS)
 
-MANPAGES = passt.1 pasta.1 qrap.1
+MANPAGES = passt.1 pasta.1 qrap.1 passt-repair.1
 
-PASST_HEADERS = arch.h arp.h checksum.h conf.h dhcp.h dhcpv6.h icmp.h \
-	inany.h isolation.h lineread.h log.h ndp.h netlink.h packet.h passt.h \
-	pasta.h pcap.h port_fwd.h siphash.h tap.h tcp.h tcp_conn.h \
-	tcp_splice.h udp.h util.h
+PASST_HEADERS = arch.h arp.h checksum.h conf.h dhcp.h dhcpv6.h flow.h fwd.h \
+	flow_table.h icmp.h icmp_flow.h inany.h iov.h ip.h isolation.h \
+	lineread.h log.h migrate.h ndp.h netlink.h packet.h passt.h pasta.h \
+	pcap.h pif.h repair.h siphash.h tap.h tcp.h tcp_buf.h tcp_conn.h \
+	tcp_internal.h tcp_splice.h tcp_vu.h udp.h udp_flow.h udp_internal.h \
+	udp_vu.h util.h vhost_user.h virtio.h vu_common.h
 HEADERS = $(PASST_HEADERS) seccomp.h
-
-C := \#include <linux/tcp.h>\nstruct tcp_info x = { .tcpi_snd_wnd = 0 };
-ifeq ($(shell printf "$(C)" | $(CC) -S -xc - -o - >/dev/null 2>&1; echo $$?),0)
-	FLAGS += -DHAS_SND_WND
-endif
-
-C := \#include <linux/tcp.h>\nstruct tcp_info x = { .tcpi_bytes_acked = 0 };
-ifeq ($(shell printf "$(C)" | $(CC) -S -xc - -o - >/dev/null 2>&1; echo $$?),0)
-	FLAGS += -DHAS_BYTES_ACKED
-endif
-
-C := \#include <linux/tcp.h>\nstruct tcp_info x = { .tcpi_min_rtt = 0 };
-ifeq ($(shell printf "$(C)" | $(CC) -S -xc - -o - >/dev/null 2>&1; echo $$?),0)
-	FLAGS += -DHAS_MIN_RTT
-endif
 
 C := \#include <sys/random.h>\nint main(){int a=getrandom(0, 0, 0);}
 ifeq ($(shell printf "$(C)" | $(CC) -S -xc - -o - >/dev/null 2>&1; echo $$?),0)
@@ -79,11 +62,6 @@ endif
 
 ifeq ($(shell :|$(CC) -fstack-protector-strong -S -xc - -o - >/dev/null 2>&1; echo $$?),0)
 	FLAGS += -fstack-protector-strong
-endif
-
-C := \#define _GNU_SOURCE\n\#include <fcntl.h>\nint x = FALLOC_FL_COLLAPSE_RANGE;
-ifeq ($(shell printf "$(C)" | $(CC) -S -xc - -o - >/dev/null 2>&1; echo $$?),0)
-	EXTRA_SYSCALLS += fallocate
 endif
 
 prefix		?= /usr/local
@@ -95,9 +73,9 @@ mandir		?= $(datarootdir)/man
 man1dir		?= $(mandir)/man1
 
 ifeq ($(TARGET_ARCH),x86_64)
-BIN := passt passt.avx2 pasta pasta.avx2 qrap
+BIN := passt passt.avx2 pasta pasta.avx2 qrap passt-repair
 else
-BIN := passt pasta qrap
+BIN := passt pasta qrap passt-repair
 endif
 
 all: $(BIN) $(MANPAGES) docs
@@ -106,7 +84,10 @@ static: FLAGS += -static -DGLIBC_NO_STATIC_NSS
 static: clean all
 
 seccomp.h: seccomp.sh $(PASST_SRCS) $(PASST_HEADERS)
-	@ EXTRA_SYSCALLS="$(EXTRA_SYSCALLS)" ARCH="$(TARGET_ARCH)" CC="$(CC)" ./seccomp.sh $(PASST_SRCS) $(PASST_HEADERS)
+	@ EXTRA_SYSCALLS="$(EXTRA_SYSCALLS)" ARCH="$(TARGET_ARCH)" CC="$(CC)" ./seccomp.sh seccomp.h $(PASST_SRCS) $(PASST_HEADERS)
+
+seccomp_repair.h: seccomp.sh $(PASST_REPAIR_SRCS)
+	@ ARCH="$(TARGET_ARCH)" CC="$(CC)" ./seccomp.sh seccomp_repair.h $(PASST_REPAIR_SRCS)
 
 passt: $(PASST_SRCS) $(HEADERS)
 	$(CC) $(FLAGS) $(CFLAGS) $(CPPFLAGS) $(PASST_SRCS) -o passt $(LDFLAGS)
@@ -122,17 +103,21 @@ pasta.avx2 pasta.1 pasta: pasta%: passt%
 	ln -sf $< $@
 
 qrap: $(QRAP_SRCS) passt.h
-	$(CC) $(FLAGS) $(CFLAGS) $(CPPFLAGS) $(QRAP_SRCS) -o qrap $(LDFLAGS)
+	$(CC) $(FLAGS) $(CFLAGS) $(CPPFLAGS) -DARCH=\"$(TARGET_ARCH)\" $(QRAP_SRCS) -o qrap $(LDFLAGS)
+
+passt-repair: $(PASST_REPAIR_SRCS) seccomp_repair.h
+	$(CC) $(FLAGS) $(CFLAGS) $(CPPFLAGS) $(PASST_REPAIR_SRCS) -o passt-repair $(LDFLAGS)
 
 valgrind: EXTRA_SYSCALLS += rt_sigprocmask rt_sigtimedwait rt_sigaction	\
-			    getpid gettid kill clock_gettime mmap	\
-			    munmap open unlink gettimeofday futex
-valgrind: FLAGS:=-g -O0 $(filter-out -O%,$(FLAGS))
+			    rt_sigreturn getpid gettid kill clock_gettime \
+			    mmap|mmap2 munmap open unlink gettimeofday futex \
+			    statx readlink
+valgrind: FLAGS += -g -DVALGRIND
 valgrind: all
 
 .PHONY: clean
 clean:
-	$(RM) $(BIN) *~ *.o seccomp.h pasta.1 \
+	$(RM) $(BIN) *~ *.o seccomp.h seccomp_repair.h pasta.1 \
 		passt.tar passt.tar.gz *.deb *.rpm \
 		passt.pid README.plain.md
 
@@ -186,111 +171,21 @@ docs: README.md
 		done < README.md;					\
 	) > README.plain.md
 
-# Checkers currently disabled for clang-tidy:
-# - llvmlibc-restrict-system-libc-headers
-#	TODO: this is Linux-only for the moment, nice to fix eventually
-#
-# - bugprone-macro-parentheses
-# - google-readability-braces-around-statements
-# - hicpp-braces-around-statements
-# - readability-braces-around-statements
-#	Debatable whether that improves readability, right now it would look
-#	like a mess
-#
-# - readability-magic-numbers
-# - cppcoreguidelines-avoid-magic-numbers
-#	TODO: in most cases they are justified, but probably not everywhere
-#
-# - clang-analyzer-valist.Uninitialized
-#	TODO: enable once https://bugs.llvm.org/show_bug.cgi?id=41311 is fixed
-#
-# - clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
-#	Probably not doable to impement this without plain memcpy(), memset()
-#
-# - cppcoreguidelines-init-variables
-#	Dubious value, would kill readability
-#
-# - hicpp-signed-bitwise
-#	Those are needed for syscalls, epoll_wait flags, etc.
-#
-# - llvm-include-order
-#	TODO: not really important, but nice to fix eventually
-#
-# - readability-isolate-declaration
-#	Dubious value, would kill readability
-#
-# - bugprone-narrowing-conversions
-# - cppcoreguidelines-narrowing-conversions
-#	TODO: nice to fix eventually
-#
-# - cppcoreguidelines-avoid-non-const-global-variables
-#	TODO: check, fix, and more in general constify wherever possible
-#
-# - altera-unroll-loops
-# - altera-id-dependent-backward-branch
-#	TODO: check paths where it might make sense to improve performance
-#
-# - bugprone-easily-swappable-parameters
-#	Not much can be done about them other than being careful
-#
-# - readability-function-cognitive-complexity
-#	TODO: split reported functions
-#
-# - altera-struct-pack-align
-#	"Poor" alignment needed for structs reflecting message formats/headers
-#
-# - concurrency-mt-unsafe
-#	TODO: check again if multithreading is implemented
-#
-# - readability-identifier-length
-#	Complains about any identifier <3 characters, reasonable for
-#	globals, pointlessly verbose for locals and parameters.
-#
-# - bugprone-assignment-in-if-condition
-#	Dubious value over the compiler's built-in warning.  Would
-#	increase verbosity.
+clang-tidy: $(PASST_SRCS) $(HEADERS)
+	clang-tidy $(PASST_SRCS) -- $(filter-out -pie,$(FLAGS) $(CFLAGS) $(CPPFLAGS)) \
+	           -DCLANG_TIDY_58992
 
-clang-tidy: $(SRCS) $(HEADERS)
-	clang-tidy -checks=*,-modernize-*,\
-	-clang-analyzer-valist.Uninitialized,\
-	-cppcoreguidelines-init-variables,\
-	-bugprone-assignment-in-if-condition,\
-	-bugprone-macro-parentheses,\
-	-google-readability-braces-around-statements,\
-	-hicpp-braces-around-statements,\
-	-readability-braces-around-statements,\
-	-readability-magic-numbers,\
-	-llvmlibc-restrict-system-libc-headers,\
-	-hicpp-signed-bitwise,\
-	-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,\
-	-llvm-include-order,\
-	-cppcoreguidelines-avoid-magic-numbers,\
-	-readability-isolate-declaration,\
-	-bugprone-narrowing-conversions,\
-	-cppcoreguidelines-narrowing-conversions,\
-	-cppcoreguidelines-avoid-non-const-global-variables,\
-	-altera-unroll-loops,-altera-id-dependent-backward-branch,\
-	-bugprone-easily-swappable-parameters,\
-	-readability-function-cognitive-complexity,\
-	-altera-struct-pack-align,\
-	-concurrency-mt-unsafe,\
-	-readability-identifier-length \
-	-config='{CheckOptions: [{key: bugprone-suspicious-string-compare.WarnOnImplicitComparison, value: "false"}]}' \
-	--warnings-as-errors=* $(SRCS) -- $(filter-out -pie,$(FLAGS) $(CFLAGS) $(CPPFLAGS))
-
-SYSTEM_INCLUDES := /usr/include $(wildcard /usr/include/$(TARGET))
-ifeq ($(shell $(CC) -v 2>&1 | grep -c "gcc version"),1)
-VER := $(shell $(CC) -dumpversion)
-SYSTEM_INCLUDES += /usr/lib/gcc/$(TARGET)/$(VER)/include
-endif
-cppcheck: $(SRCS) $(HEADERS)
-	cppcheck --std=c99 --error-exitcode=1 --enable=all --force	\
+cppcheck: $(PASST_SRCS) $(HEADERS)
+	if cppcheck --check-level=exhaustive /dev/null > /dev/null 2>&1; then \
+		CPPCHECK_EXHAUSTIVE="--check-level=exhaustive";		\
+	else								\
+		CPPCHECK_EXHAUSTIVE=;					\
+	fi;								\
+	cppcheck --std=c11 --error-exitcode=1 --enable=all --force	\
 	--inconclusive --library=posix --quiet				\
-	$(SYSTEM_INCLUDES:%=-I%)					\
-	$(SYSTEM_INCLUDES:%=--config-exclude=%)				\
-	$(SYSTEM_INCLUDES:%=--suppress=*:%/*)				\
-	$(SYSTEM_INCLUDES:%=--suppress=unmatchedSuppression:%/*)	\
+	$${CPPCHECK_EXHAUSTIVE}						\
 	--inline-suppr							\
+	--suppress=missingIncludeSystem \
 	--suppress=unusedStructMember					\
-	$(filter -D%,$(FLAGS) $(CFLAGS) $(CPPFLAGS))			\
-	.
+	$(filter -D%,$(FLAGS) $(CFLAGS) $(CPPFLAGS)) -D CPPCHECK_6936  \
+	$(PASST_SRCS) $(HEADERS)

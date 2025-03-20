@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: AGPL-3.0-or-later
+/* SPDX-License-Identifier: GPL-2.0-or-later
  * Copyright (c) 2022 Red Hat GmbH
  * Author: Stefano Brivio <sbrivio@redhat.com>
  */
@@ -7,12 +7,11 @@
 #define TCP_SPLICE_H
 
 struct tcp_splice_conn;
+union sockaddr_inany;
 
-void tcp_splice_sock_handler(struct ctx *c, struct tcp_splice_conn *conn,
-			     int s, uint32_t events);
-bool tcp_splice_conn_from_sock(struct ctx *c, union epoll_ref ref,
-			       struct tcp_splice_conn *conn, int s,
-			       const struct sockaddr *sa);
+void tcp_splice_sock_handler(struct ctx *c, union epoll_ref ref,
+			     uint32_t events);
+void tcp_splice_conn_from_sock(const struct ctx *c, union flow *flow, int s0);
 void tcp_splice_init(struct ctx *c);
 
 #endif /* TCP_SPLICE_H */

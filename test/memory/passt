@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -44,7 +44,7 @@ endef
 def	start_stop_diff
 guest	sed /proc/slabinfo -ne 's/^\([^ ]* *[^ ]* *[^ ]* *[^ ]*\).*/\\\1/p' > /tmp/slabinfo.before
 guest	cat /proc/meminfo > /tmp/meminfo.before
-guest	/bin/passt.avx2 -l /tmp/log -s /tmp/sock -P /tmp/pid __OPTS__ --netns-only
+guest	/bin/passt.avx2 -l /tmp/log -s /tmp/sock -P /tmp/pid __OPTS__
 sleep	2
 guest	cat /proc/meminfo > /tmp/meminfo.after
 guest	sed /proc/slabinfo -ne 's/^\([^ ]* *[^ ]* *[^ ]* *[^ ]*\).*/\\\1/p' > /tmp/slabinfo.after
@@ -78,9 +78,16 @@ guest	mount -o bind /proc /test/proc
 guest	mount -o bind /dev /test/dev
 guest	cp -Lr /bin /lib /lib64 /usr /sbin /test/
 
+guest	exec switch_root /test /bin/sh
+
 guest	ulimit -Hn 300000
-guest	unshare -rUm -R /test
-guest	chroot .
+guest	unshare -rUn
+guest	ip link add eth0 type dummy
+guest	ip link set eth0 up
+guest	ip address add 192.0.2.2/24 dev eth0
+guest	ip address add 2001:db8::2/64 dev eth0
+guest	ip route add default via 192.0.2.1
+guest	ip -6 route add default via 2001:db8::1 dev eth0
 
 guest	meminfo_size() { grep "^$2:" $1 | tr -s ' ' | cut -f2 -d ' '; }
 guest	meminfo_diff() { echo $(( $(meminfo_size $2 $3) - $(meminfo_size $1 $3) )); }
@@ -103,27 +110,17 @@ info
 th	symbol MiB
 set	WHAT tcp_buf_discard
 nm_row
-set	WHAT tcp6_l2_buf
+set	WHAT flowtab
 nm_row
-set	WHAT tcp4_l2_buf
+set	WHAT tcp6_payload
 nm_row
-set	WHAT tc
+set	WHAT tcp4_payload
 nm_row
 set	WHAT pkt_buf
 nm_row
-set	WHAT udp_splice_map
+set	WHAT udp_payload
 nm_row
-set	WHAT udp6_l2_buf
-nm_row
-set	WHAT udp4_l2_buf
-nm_row
-set	WHAT udp_tap_map
-nm_row
-set	WHAT icmp_id_map
-nm_row
-set	WHAT udp_splice_buf
-nm_row
-set	WHAT tc_hash
+set	WHAT flow_hashtab
 nm_row
 set	WHAT pool_tap6_storage
 nm_row
@@ -141,8 +138,6 @@ th	objects count size MiB
 set	WHAT pid
 slab_row
 set	WHAT dentry
-slab_row
-set	WHAT Acpi-Parse
 slab_row
 set	WHAT kmalloc-64
 slab_row

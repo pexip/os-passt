@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 #
 # PASST - Plug A Simple Socket Transport
 #  for qemu/UNIX domain socket mode
@@ -36,45 +36,49 @@ check	[ "__ADDR2__" = "__HOST_ADDR__" ]
 
 test	DHCPv6: addresses
 # Link is up now, wait for DAD to complete
-sleep	2
+guest1	while ip -j -6 addr show tentative | jq -e '.[].addr_info'; do sleep 0.1; done
+guest2	while ip -j -6 addr show tentative | jq -e '.[].addr_info'; do sleep 0.1; done
 guest1	/sbin/dhclient -6 __IFNAME1__
 guest2	/sbin/dhclient -6 __IFNAME2__
-g1out	ADDR1_6 ip -j -6 addr show|jq -rM '.[] | select(.ifname == "__IFNAME1__").addr_info[] | select(.prefixlen == 128).local'
-g2out	ADDR2_6 ip -j -6 addr show|jq -rM '.[] | select(.ifname == "__IFNAME2__").addr_info[] | select(.prefixlen == 128).local'
-hout	HOST_ADDR6 ip -j -6 addr show|jq -rM '.[] | select(.ifname == "__HOST_IFNAME6__").addr_info[] | select(.scope == "global").local'
+# Wait for DAD to complete on the DHCP address
+guest1	while ip -j -6 addr show tentative | jq -e '.[].addr_info'; do sleep 0.1; done
+guest2	while ip -j -6 addr show tentative | jq -e '.[].addr_info'; do sleep 0.1; done
+g1out	ADDR1_6 ip -j -6 addr show|jq -rM '[.[] | select(.ifname == "__IFNAME1__").addr_info[] | select(.prefixlen == 128).local] | .[0]'
+g2out	ADDR2_6 ip -j -6 addr show|jq -rM '[.[] | select(.ifname == "__IFNAME2__").addr_info[] | select(.prefixlen == 128).local] | .[0]'
+hout	HOST_ADDR6 ip -j -6 addr show|jq -rM '[.[] | select(.ifname == "__HOST_IFNAME6__").addr_info[] | select(.scope == "global" and .deprecated != true).local] | .[0]'
 check	[ "__ADDR1_6__" = "__HOST_ADDR6__" ]
 check	[ "__ADDR2_6__" = "__HOST_ADDR6__" ]
 
 test	TCP/IPv4: guest 1 > guest 2
 g1out	GW1 ip -j -4 route show|jq -rM '.[] | select(.dst == "default").gateway'
 guest2b	socat -u TCP4-LISTEN:10004 OPEN:msg,create,trunc
+sleep	1
 guest1	echo "Hello_from_guest_1" | socat -u STDIN TCP4:__GW1__:10004
 guest2w
-sleep	1
 g2out	MSG2 cat msg
 check	[ "__MSG2__" = "Hello_from_guest_1" ]
 
 test	TCP/IPv6: guest 2 > guest 1
 g2out	GW2_6 ip -j -6 route show|jq -rM '.[] | select(.dst == "default").gateway'
 guest1b	socat -u TCP6-LISTEN:10001 OPEN:msg,create,trunc
+sleep	1
 guest2	echo "Hello_from_guest_2" | socat -u STDIN TCP6:[__GW2_6__%__IFNAME2__]:10001
 guest1w
-sleep	1
 g1out	MSG1 cat msg
 check	[ "__MSG1__" = "Hello_from_guest_2" ]
 
 test	UDP/IPv4: guest 1 > guest 2
 guest2b	socat -u TCP4-LISTEN:10004 OPEN:msg,create,trunc
+sleep	1
 guest1	echo "Hello_from_guest_1" | socat -u STDIN TCP4:__GW1__:10004
 guest2w
-sleep	1
 g2out	MSG2 cat msg
 check	[ "__MSG2__" = "Hello_from_guest_1" ]
 
 test	UDP/IPv6: guest 2 > guest 1
 guest1b	socat -u TCP6-LISTEN:10001 OPEN:msg,create,trunc
+sleep	1
 guest2	echo "Hello_from_guest_2" | socat -u STDIN TCP6:[__GW2_6__%__IFNAME2__]:10001
 guest1w
-sleep	1
 g1out	MSG1 cat msg
 check	[ "__MSG1__" = "Hello_from_guest_2" ]
