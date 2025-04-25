@@ -46,8 +46,8 @@
  *   - avoiding port and address translations whenever possible
  *   - mirroring TCP dynamics by observation of socket parameters (TCP_INFO
  *     socket option) and TCP headers of packets coming from the tap interface,
- *     reapplying those parameters in both flow directions (including TCP_MSS,
- *     TCP_WINDOW_CLAMP socket options)
+ *     reapplying those parameters in both flow directions (including TCP_MSS
+ *     socket option)
  * - simplicity: only a small subset of TCP logic is implemented here and
  *   delegated as much as possible to the TCP implementations of guest and host
  *   kernel. This is achieved by:
@@ -236,12 +236,10 @@
  *     - update @seq_ack_from_tap from ack_seq in header
  *     - on two duplicated ACKs, reset @seq_to_tap to @seq_ack_from_tap, and
  *       resend with steps listed above
- *     - set TCP_WINDOW_CLAMP from TCP header from tap
  *
  * - from tap/guest to socket:
  *   - on packet from tap/guest:
  *     - set @ts_tap_act
- *     - set TCP_WINDOW_CLAMP from TCP header from tap
  *     - check seq from header against @seq_from_tap, if data is missing, send
  *       two ACKs with number @seq_ack_to_tap, discard packet
  *     - otherwise queue data to socket, set @seq_from_tap to seq from header
@@ -276,93 +274,60 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/epoll.h>
-#ifdef HAS_GETRANDOM
-#include <sys/random.h>
-#endif
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <time.h>
+#include <arpa/inet.h>
 
-#include <linux/tcp.h> /* For struct tcp_info */
+#include <linux/sockios.h>
 
 #include "checksum.h"
 #include "util.h"
+#include "iov.h"
+#include "ip.h"
 #include "passt.h"
 #include "tap.h"
 #include "siphash.h"
 #include "pcap.h"
-#include "conf.h"
 #include "tcp_splice.h"
 #include "log.h"
 #include "inany.h"
+#include "flow.h"
+#include "repair.h"
+#include "linux_dep.h"
 
-#include "tcp_conn.h"
+#include "flow_table.h"
+#include "tcp_internal.h"
+#include "tcp_buf.h"
+#include "tcp_vu.h"
 
-#define TCP_FRAMES_MEM			128
-#define TCP_FRAMES							\
-	(c->mode == MODE_PASST ? TCP_FRAMES_MEM : 1)
+#ifndef __USE_MISC
+/* From Linux UAPI, missing in netinet/tcp.h provided by musl */
+struct tcp_repair_opt {
+	__u32	opt_code;
+	__u32	opt_val;
+};
 
-#define TCP_FILE_PRESSURE		30	/* % of c->nofile */
-#define TCP_CONN_PRESSURE		30	/* % of c->tcp.conn_count */
-
-#define TCP_HASH_TABLE_LOAD		70		/* % */
-#define TCP_HASH_TABLE_SIZE		(TCP_MAX_CONNS * 100 /		\
-					 TCP_HASH_TABLE_LOAD)
-
-#define MAX_WS				8
-#define MAX_WINDOW			(1 << (16 + (MAX_WS)))
+enum {
+	TCP_NO_QUEUE,
+	TCP_RECV_QUEUE,
+	TCP_SEND_QUEUE,
+	TCP_QUEUES_NR,
+};
+#endif
 
 /* MSS rounding: see SET_MSS() */
 #define MSS_DEFAULT			536
-
-struct tcp4_l2_head {	/* For MSS4 macro: keep in sync with tcp4_l2_buf_t */
-	uint32_t psum;
-	uint32_t tsum;
-#ifdef __AVX2__
-	uint8_t pad[18];
-#else
-	uint8_t pad[2];
-#endif
-	struct tap_hdr taph;
-	struct iphdr iph;
-	struct tcphdr th;
-#ifdef __AVX2__
-} __attribute__ ((packed, aligned(32)));
-#else
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))));
-#endif
-
-struct tcp6_l2_head {	/* For MSS6 macro: keep in sync with tcp6_l2_buf_t */
-#ifdef __AVX2__
-	uint8_t pad[14];
-#else
-	uint8_t pad[2];
-#endif
-	struct tap_hdr taph;
-	struct ipv6hdr ip6h;
-	struct tcphdr th;
-#ifdef __AVX2__
-} __attribute__ ((packed, aligned(32)));
-#else
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))));
-#endif
-
-#define MSS4	ROUND_DOWN(USHRT_MAX - sizeof(struct tcp4_l2_head), 4)
-#define MSS6	ROUND_DOWN(USHRT_MAX - sizeof(struct tcp6_l2_head), 4)
-
 #define WINDOW_DEFAULT			14600		/* RFC 6928 */
-#ifdef HAS_SND_WND
-# define KERNEL_REPORTS_SND_WND(c)	(c->tcp.kernel_snd_wnd)
-#else
-# define KERNEL_REPORTS_SND_WND(c)	(0 && (c))
-#endif
 
 #define ACK_INTERVAL			10		/* ms */
 #define SYN_TIMEOUT			10		/* s */
@@ -373,40 +338,25 @@ struct tcp6_l2_head {	/* For MSS6 macro: keep in sync with tcp6_l2_buf_t */
 #define LOW_RTT_TABLE_SIZE		8
 #define LOW_RTT_THRESHOLD		10 /* us */
 
-/* We need to include <linux/tcp.h> for tcpi_bytes_acked, instead of
- * <netinet/tcp.h>, but that doesn't include a definition for SOL_TCP
- */
-#define SOL_TCP				IPPROTO_TCP
-
-#define SEQ_LE(a, b)			((b) - (a) < MAX_WINDOW)
-#define SEQ_LT(a, b)			((b) - (a) - 1 < MAX_WINDOW)
-#define SEQ_GE(a, b)			((a) - (b) < MAX_WINDOW)
-#define SEQ_GT(a, b)			((a) - (b) - 1 < MAX_WINDOW)
-
-#define FIN		(1 << 0)
-#define SYN		(1 << 1)
-#define RST		(1 << 2)
-#define ACK		(1 << 4)
-/* Flags for internal usage */
-#define DUP_ACK		(1 << 5)
 #define ACK_IF_NEEDED	0		/* See tcp_send_flag() */
 
-#define OPT_EOL		0
-#define OPT_NOP		1
-#define OPT_MSS		2
-#define OPT_MSS_LEN	4
-#define OPT_WS		3
-#define OPT_WS_LEN	3
-#define OPT_SACKP	4
-#define OPT_SACK	5
-#define OPT_TS		8
-
-#define CONN_V4(conn)		(!!inany_v4(&(conn)->addr))
-#define CONN_V6(conn)		(!CONN_V4(conn))
 #define CONN_IS_CLOSING(conn)						\
-	((conn->events & ESTABLISHED) &&				\
-	 (conn->events & (SOCK_FIN_RCVD | TAP_FIN_RCVD)))
-#define CONN_HAS(conn, set)	((conn->events & (set)) == (set))
+	(((conn)->events & ESTABLISHED) &&				\
+	 ((conn)->events & (SOCK_FIN_RCVD | TAP_FIN_RCVD)))
+#define CONN_HAS(conn, set)	(((conn)->events & (set)) == (set))
+
+/* Buffers to migrate pending data from send and receive queues. No, they don't
+ * use memory if we don't use them. And we're going away after this, so splurge.
+ */
+#define TCP_MIGRATE_SND_QUEUE_MAX	(64 << 20)
+#define TCP_MIGRATE_RCV_QUEUE_MAX	(64 << 20)
+uint8_t tcp_migrate_snd_queue		[TCP_MIGRATE_SND_QUEUE_MAX];
+uint8_t tcp_migrate_rcv_queue		[TCP_MIGRATE_RCV_QUEUE_MAX];
+
+#define TCP_MIGRATE_RESTORE_CHUNK_MIN	1024 /* Try smaller when above this */
+
+/* "Extended" data (not stored in the flow table) for TCP flow migration */
+static struct tcp_tap_transfer_ext migrate_ext[FLOW_MAX];
 
 static const char *tcp_event_str[] __attribute((__unused__)) = {
 	"SOCK_ACCEPTED", "TAP_SYN_RCVD", "ESTABLISHED", "TAP_SYN_ACK_SENT",
@@ -420,182 +370,88 @@ static const char *tcp_state_str[] __attribute((__unused__)) = {
 	"SYN_RCVD",	/* approximately maps to TAP_SYN_ACK_SENT */
 
 	/* Passive close: */
-	"CLOSE_WAIT", "CLOSE_WAIT", "LAST_ACK", "LAST_ACK", "LAST_ACK",
+	"CLOSE_WAIT", "CLOSE_WAIT", "CLOSE_WAIT", "LAST_ACK", "LAST_ACK",
 	/* Active close (+5): */
 	"CLOSING", "FIN_WAIT_1", "FIN_WAIT_1", "FIN_WAIT_2", "TIME_WAIT",
 };
 
 static const char *tcp_flag_str[] __attribute((__unused__)) = {
-	"STALLED", "LOCAL", "WND_CLAMPED", "ACTIVE_CLOSE", "ACK_TO_TAP_DUE",
-	"ACK_FROM_TAP_DUE",
+	"STALLED", "LOCAL", "ACTIVE_CLOSE", "ACK_TO_TAP_DUE",
+	"ACK_FROM_TAP_DUE", "ACK_FROM_TAP_BLOCKS",
 };
 
 /* Listening sockets, used for automatic port forwarding in pasta mode only */
 static int tcp_sock_init_ext	[NUM_PORTS][IP_VERSIONS];
 static int tcp_sock_ns		[NUM_PORTS][IP_VERSIONS];
 
-/* Table of destinations with very low RTT (assumed to be local), LRU */
+/* Table of our guest side addresses with very low RTT (assumed to be local to
+ * the host), LRU
+ */
 static union inany_addr low_rtt_dst[LOW_RTT_TABLE_SIZE];
 
-/* Static buffers */
+char		tcp_buf_discard		[MAX_WINDOW];
 
-/**
- * tcp4_l2_buf_t - Pre-cooked IPv4 packet buffers for tap connections
- * @psum:	Partial IP header checksum (excluding tot_len and saddr)
- * @tsum:	Partial TCP header checksum (excluding length and saddr)
- * @pad:	Align TCP header to 32 bytes, for AVX2 checksum calculation only
- * @taph:	Tap-level headers (partially pre-filled)
- * @iph:	Pre-filled IP header (except for tot_len and saddr)
- * @uh:		Headroom for TCP header
- * @data:	Storage for TCP payload
- */
-static struct tcp4_l2_buf_t {
-	uint32_t psum;		/* 0 */
-	uint32_t tsum;		/* 4 */
-#ifdef __AVX2__
-	uint8_t pad[18];	/* 8, align th to 32 bytes */
-#else
-	uint8_t pad[2];		/*	align iph to 4 bytes	8 */
-#endif
-	struct tap_hdr taph;	/* 26				10 */
-	struct iphdr iph;	/* 44				28 */
-	struct tcphdr th;	/* 64				48 */
-	uint8_t data[MSS4];	/* 84				68 */
-				/* 65536			65532 */
-#ifdef __AVX2__
-} __attribute__ ((packed, aligned(32)))
-#else
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))))
-#endif
-tcp4_l2_buf[TCP_FRAMES_MEM];
+/* Does the kernel support TCP_PEEK_OFF? */
+bool peek_offset_cap;
 
-static unsigned int tcp4_l2_buf_used;
+/* Size of data returned by TCP_INFO getsockopt() */
+socklen_t tcp_info_size;
 
-/**
- * tcp6_l2_buf_t - Pre-cooked IPv6 packet buffers for tap connections
- * @pad:	Align IPv6 header for checksum calculation to 32B (AVX2) or 4B
- * @taph:	Tap-level headers (partially pre-filled)
- * @ip6h:	Pre-filled IP header (except for payload_len and addresses)
- * @th:		Headroom for TCP header
- * @data:	Storage for TCP payload
- */
-struct tcp6_l2_buf_t {
-#ifdef __AVX2__
-	uint8_t pad[14];	/* 0	align ip6h to 32 bytes */
-#else
-	uint8_t pad[2];		/*	align ip6h to 4 bytes	0 */
-#endif
-	struct tap_hdr taph;	/* 14				2 */
-	struct ipv6hdr ip6h;	/* 32				20 */
-	struct tcphdr th;	/* 72				60 */
-	uint8_t data[MSS6];	/* 92				80 */
-				/* 65536			65532 */
-#ifdef __AVX2__
-} __attribute__ ((packed, aligned(32)))
-#else
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))))
-#endif
-tcp6_l2_buf[TCP_FRAMES_MEM];
+#define tcp_info_cap(f_)						\
+	((offsetof(struct tcp_info_linux, tcpi_##f_) +			\
+	  sizeof(((struct tcp_info_linux *)NULL)->tcpi_##f_)) <= tcp_info_size)
 
-static unsigned int tcp6_l2_buf_used;
-
-/* recvmsg()/sendmsg() data for tap */
-static char 		tcp_buf_discard		[MAX_WINDOW];
-static struct iovec	iov_sock		[TCP_FRAMES_MEM + 1];
-
-static struct iovec	tcp4_l2_iov		[TCP_FRAMES_MEM];
-static struct iovec	tcp6_l2_iov		[TCP_FRAMES_MEM];
-static struct iovec	tcp4_l2_flags_iov	[TCP_FRAMES_MEM];
-static struct iovec	tcp6_l2_flags_iov	[TCP_FRAMES_MEM];
-
-static struct mmsghdr	tcp_l2_mh		[TCP_FRAMES_MEM];
+/* Kernel reports sending window in TCP_INFO (kernel commit 8f7baad7f035) */
+#define snd_wnd_cap	tcp_info_cap(snd_wnd)
+/* Kernel reports bytes acked in TCP_INFO (kernel commit 0df48c26d84) */
+#define bytes_acked_cap	tcp_info_cap(bytes_acked)
+/* Kernel reports minimum RTT in TCP_INFO (kernel commit cd9b266095f4) */
+#define min_rtt_cap	tcp_info_cap(min_rtt)
 
 /* sendmsg() to socket */
 static struct iovec	tcp_iov			[UIO_MAXIOV];
 
-/**
- * tcp4_l2_flags_buf_t - IPv4 packet buffers for segments without data (flags)
- * @psum:	Partial IP header checksum (excluding tot_len and saddr)
- * @tsum:	Partial TCP header checksum (excluding length and saddr)
- * @pad:	Align TCP header to 32 bytes, for AVX2 checksum calculation only
- * @taph:	Tap-level headers (partially pre-filled)
- * @iph:	Pre-filled IP header (except for tot_len and saddr)
- * @th:		Headroom for TCP header
- * @opts:	Headroom for TCP options
- */
-static struct tcp4_l2_flags_buf_t {
-	uint32_t psum;		/* 0 */
-	uint32_t tsum;		/* 4 */
-#ifdef __AVX2__
-	uint8_t pad[18];	/* 8, align th to 32 bytes */
-#else
-	uint8_t pad[2];		/*	align iph to 4 bytes	8 */
-#endif
-	struct tap_hdr taph;	/* 26				10 */
-	struct iphdr iph;	/* 44				28 */
-	struct tcphdr th;	/* 64				48 */
-	char opts[OPT_MSS_LEN + OPT_WS_LEN + 1];
-#ifdef __AVX2__
-} __attribute__ ((packed, aligned(32)))
-#else
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))))
-#endif
-tcp4_l2_flags_buf[TCP_FRAMES_MEM];
-
-static unsigned int tcp4_l2_flags_buf_used;
-
-/**
- * tcp6_l2_flags_buf_t - IPv6 packet buffers for segments without data (flags)
- * @pad:	Align IPv6 header for checksum calculation to 32B (AVX2) or 4B
- * @taph:	Tap-level headers (partially pre-filled)
- * @ip6h:	Pre-filled IP header (except for payload_len and addresses)
- * @th:		Headroom for TCP header
- * @opts:	Headroom for TCP options
- */
-static struct tcp6_l2_flags_buf_t {
-#ifdef __AVX2__
-	uint8_t pad[14];	/* 0	align ip6h to 32 bytes */
-#else
-	uint8_t pad[2];		/*	align ip6h to 4 bytes		   0 */
-#endif
-	struct tap_hdr taph;	/* 14					   2 */
-	struct ipv6hdr ip6h;	/* 32					  20 */
-	struct tcphdr th	/* 72 */ __attribute__ ((aligned(4))); /* 60 */
-	char opts[OPT_MSS_LEN + OPT_WS_LEN + 1];
-#ifdef __AVX2__
-} __attribute__ ((packed, aligned(32)))
-#else
-} __attribute__ ((packed, aligned(__alignof__(unsigned int))))
-#endif
-tcp6_l2_flags_buf[TCP_FRAMES_MEM];
-
-static unsigned int tcp6_l2_flags_buf_used;
-
-/* TCP connections */
-union tcp_conn tc[TCP_MAX_CONNS];
-
-#define CONN(index)		(&tc[(index)].tap)
-#define CONN_IDX(conn)		((union tcp_conn *)(conn) - tc)
-
-/** conn_at_idx() - Find a connection by index, if present
- * @index:	Index of connection to lookup
- *
- * Return: pointer to connection, or NULL if @index is out of bounds
- */
-static inline struct tcp_tap_conn *conn_at_idx(int index)
-{
-	if ((index < 0) || (index >= TCP_MAX_CONNS))
-		return NULL;
-	ASSERT(!(CONN(index)->c.spliced));
-	return CONN(index);
-}
-
-/* Table for lookup from remote address, local port, remote port */
-static struct tcp_tap_conn *tc_hash[TCP_HASH_TABLE_SIZE];
-
 /* Pools for pre-opened sockets (in init) */
 int init_sock_pool4		[TCP_SOCK_POOL_SIZE];
 int init_sock_pool6		[TCP_SOCK_POOL_SIZE];
+
+/**
+ * conn_at_sidx() - Get TCP connection specific flow at given sidx
+ * @sidx:	Flow and side to retrieve
+ *
+ * Return: TCP connection at @sidx, or NULL of @sidx is invalid.  Asserts if the
+ *         flow at @sidx is not FLOW_TCP.
+ */
+static struct tcp_tap_conn *conn_at_sidx(flow_sidx_t sidx)
+{
+	union flow *flow = flow_at_sidx(sidx);
+
+	if (!flow)
+		return NULL;
+
+	ASSERT(flow->f.type == FLOW_TCP);
+	return &flow->tcp;
+}
+
+/**
+ * tcp_set_peek_offset() - Set SO_PEEK_OFF offset on connection if supported
+ * @conn:	Pointer to the TCP connection structure
+ * @offset:     Offset in bytes
+ *
+ * Return:      -1 when it fails, 0 otherwise.
+ */
+int tcp_set_peek_offset(const struct tcp_tap_conn *conn, int offset)
+{
+	if (!peek_offset_cap)
+		return 0;
+
+	if (setsockopt(conn->sock, SOL_SOCKET, SO_PEEK_OFF,
+		       &offset, sizeof(offset))) {
+		flow_perror(conn, "Failed to set SO_PEEK_OFF to %i", offset);
+		return -1;
+	}
+	return 0;
+}
 
 /**
  * tcp_conn_epoll_events() - epoll events mask for given connection state
@@ -613,8 +469,12 @@ static uint32_t tcp_conn_epoll_events(uint8_t events, uint8_t conn_flags)
 		if (events & TAP_FIN_SENT)
 			return EPOLLET;
 
-		if (conn_flags & STALLED)
-			return EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+		if (conn_flags & STALLED) {
+			if (conn_flags & ACK_FROM_TAP_BLOCKS)
+				return EPOLLRDHUP | EPOLLET;
+
+			return EPOLLIN | EPOLLRDHUP | EPOLLET;
+		}
 
 		return EPOLLIN | EPOLLRDHUP;
 	}
@@ -622,16 +482,8 @@ static uint32_t tcp_conn_epoll_events(uint8_t events, uint8_t conn_flags)
 	if (events == TAP_SYN_RCVD)
 		return EPOLLOUT | EPOLLET | EPOLLRDHUP;
 
-	return EPOLLRDHUP;
+	return EPOLLET | EPOLLRDHUP;
 }
-
-static void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
-			 unsigned long flag);
-#define conn_flag(c, conn, flag)					\
-	do {								\
-		trace("TCP: flag at %s:%i", __func__, __LINE__);	\
-		conn_flag_do(c, conn, flag);				\
-	} while (0)
 
 /**
  * tcp_epoll_ctl() - Add/modify/delete epoll state from connection events
@@ -642,16 +494,16 @@ static void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
  */
 static int tcp_epoll_ctl(const struct ctx *c, struct tcp_tap_conn *conn)
 {
-	int m = conn->c.in_epoll ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-	union epoll_ref ref = { .r.proto = IPPROTO_TCP, .r.s = conn->sock,
-				.r.p.tcp.tcp.index = CONN_IDX(conn) };
+	int m = conn->in_epoll ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+	union epoll_ref ref = { .type = EPOLL_TYPE_TCP, .fd = conn->sock,
+		                .flowside = FLOW_SIDX(conn, !TAPSIDE(conn)), };
 	struct epoll_event ev = { .data.u64 = ref.u64 };
 
 	if (conn->events == CLOSED) {
-		if (conn->c.in_epoll)
-			epoll_ctl(c->epollfd, EPOLL_CTL_DEL, conn->sock, &ev);
+		if (conn->in_epoll)
+			epoll_del(c, conn->sock);
 		if (conn->timer != -1)
-			epoll_ctl(c->epollfd, EPOLL_CTL_DEL, conn->timer, &ev);
+			epoll_del(c, conn->timer);
 		return 0;
 	}
 
@@ -660,13 +512,12 @@ static int tcp_epoll_ctl(const struct ctx *c, struct tcp_tap_conn *conn)
 	if (epoll_ctl(c->epollfd, m, conn->sock, &ev))
 		return -errno;
 
-	conn->c.in_epoll = true;
+	conn->in_epoll = true;
 
 	if (conn->timer != -1) {
-		union epoll_ref ref_t = { .r.proto = IPPROTO_TCP,
-					  .r.s = conn->sock,
-					  .r.p.tcp.tcp.timer = 1,
-					  .r.p.tcp.tcp.index = CONN_IDX(conn) };
+		union epoll_ref ref_t = { .type = EPOLL_TYPE_TCP_TIMER,
+					  .fd = conn->sock,
+					  .flow = FLOW_IDX(conn) };
 		struct epoll_event ev_t = { .data.u64 = ref_t.u64,
 					    .events = EPOLLIN | EPOLLET };
 
@@ -692,17 +543,16 @@ static void tcp_timer_ctl(const struct ctx *c, struct tcp_tap_conn *conn)
 		return;
 
 	if (conn->timer == -1) {
-		union epoll_ref ref = { .r.proto = IPPROTO_TCP,
-					.r.s = conn->sock,
-					.r.p.tcp.tcp.timer = 1,
-					.r.p.tcp.tcp.index = CONN_IDX(conn) };
+		union epoll_ref ref = { .type = EPOLL_TYPE_TCP_TIMER,
+					.fd = conn->sock,
+					.flow = FLOW_IDX(conn) };
 		struct epoll_event ev = { .data.u64 = ref.u64,
 					  .events = EPOLLIN | EPOLLET };
 		int fd;
 
 		fd = timerfd_create(CLOCK_MONOTONIC, 0);
-		if (fd == -1 || fd > SOCKET_MAX) {
-			debug("TCP: failed to get timer: %s", strerror(errno));
+		if (fd == -1 || fd > FD_REF_MAX) {
+			flow_dbg_perror(conn, "failed to get timer");
 			if (fd > -1)
 				close(fd);
 			conn->timer = -1;
@@ -711,7 +561,7 @@ static void tcp_timer_ctl(const struct ctx *c, struct tcp_tap_conn *conn)
 		conn->timer = fd;
 
 		if (epoll_ctl(c->epollfd, EPOLL_CTL_ADD, conn->timer, &ev)) {
-			debug("TCP: failed to add timer: %s", strerror(errno));
+			flow_dbg_perror(conn, "failed to add timer");
 			close(conn->timer);
 			conn->timer = -1;
 			return;
@@ -731,10 +581,12 @@ static void tcp_timer_ctl(const struct ctx *c, struct tcp_tap_conn *conn)
 		it.it_value.tv_sec = ACT_TIMEOUT;
 	}
 
-	debug("TCP: index %li, timer expires in %lu.%03lus", CONN_IDX(conn),
-	      it.it_value.tv_sec, it.it_value.tv_nsec / 1000 / 1000);
+	flow_dbg(conn, "timer expires in %llu.%03llus",
+		 (unsigned long long)it.it_value.tv_sec,
+		 (unsigned long long)it.it_value.tv_nsec / 1000 / 1000);
 
-	timerfd_settime(conn->timer, 0, &it, NULL);
+	if (timerfd_settime(conn->timer, 0, &it, NULL))
+		flow_perror(conn, "failed to set timer");
 }
 
 /**
@@ -743,8 +595,8 @@ static void tcp_timer_ctl(const struct ctx *c, struct tcp_tap_conn *conn)
  * @conn:	Connection pointer
  * @flag:	Flag to set, or ~flag to unset
  */
-static void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
-			 unsigned long flag)
+void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
+		  unsigned long flag)
 {
 	if (flag & (flag - 1)) {
 		int flag_index = fls(~flag);
@@ -753,10 +605,8 @@ static void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
 			return;
 
 		conn->flags &= flag;
-		if (flag_index >= 0) {
-			debug("TCP: index %li: %s dropped", CONN_IDX(conn),
-			      tcp_flag_str[flag_index]);
-		}
+		if (flag_index >= 0)
+			flow_dbg(conn, "%s dropped", tcp_flag_str[flag_index]);
 	} else {
 		int flag_index = fls(flag);
 
@@ -774,10 +624,8 @@ static void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
 		}
 
 		conn->flags |= flag;
-		if (flag_index >= 0) {
-			debug("TCP: index %li: %s", CONN_IDX(conn),
-			      tcp_flag_str[flag_index]);
-		}
+		if (flag_index >= 0)
+			flow_dbg(conn, "%s", tcp_flag_str[flag_index]);
 	}
 
 	if (flag == STALLED || flag == ~STALLED)
@@ -795,8 +643,8 @@ static void conn_flag_do(const struct ctx *c, struct tcp_tap_conn *conn,
  * @conn:	Connection pointer
  * @event:	Connection event
  */
-static void conn_event_do(const struct ctx *c, struct tcp_tap_conn *conn,
-			  unsigned long event)
+void conn_event_do(const struct ctx *c, struct tcp_tap_conn *conn,
+		   unsigned long event)
 {
 	int prev, new, num = fls(event);
 
@@ -824,17 +672,18 @@ static void conn_event_do(const struct ctx *c, struct tcp_tap_conn *conn,
 	if (conn->flags & ACTIVE_CLOSE)
 		new += 5;
 
-	if (prev != new) {
-		debug("TCP: index %li, %s: %s -> %s", CONN_IDX(conn),
-		      num == -1 	       ? "CLOSED" : tcp_event_str[num],
-		      prev == -1	       ? "CLOSED" : tcp_state_str[prev],
-		      (new == -1 || num == -1) ? "CLOSED" : tcp_state_str[new]);
-	} else {
-		debug("TCP: index %li, %s", CONN_IDX(conn),
-		      num == -1 	       ? "CLOSED" : tcp_event_str[num]);
-	}
+	if (prev != new)
+		flow_dbg(conn, "%s: %s -> %s",
+			 num == -1 	       ? "CLOSED" : tcp_event_str[num],
+			 prev == -1	       ? "CLOSED" : tcp_state_str[prev],
+			 (new == -1 || num == -1) ? "CLOSED" : tcp_state_str[new]);
+	else
+		flow_dbg(conn, "%s",
+			 num == -1 	       ? "CLOSED" : tcp_event_str[num]);
 
-	if ((event == TAP_FIN_RCVD) && !(conn->events & SOCK_FIN_RCVD))
+	if (event == CLOSED)
+		flow_hash_remove(c, TAP_SIDX(conn));
+	else if ((event == TAP_FIN_RCVD) && !(conn->events & SOCK_FIN_RCVD))
 		conn_flag(c, conn, ACTIVE_CLOSE);
 	else
 		tcp_epoll_ctl(c, conn);
@@ -842,12 +691,6 @@ static void conn_event_do(const struct ctx *c, struct tcp_tap_conn *conn,
 	if (CONN_HAS(conn, SOCK_FIN_SENT | TAP_FIN_ACKED))
 		tcp_timer_ctl(c, conn);
 }
-
-#define conn_event(c, conn, event)					\
-	do {								\
-		trace("TCP: event at %s:%i", __func__, __LINE__);	\
-		conn_event_do(c, conn, event);				\
-	} while (0)
 
 /**
  * tcp_rtt_dst_low() - Check if low RTT was seen for connection endpoint
@@ -857,10 +700,11 @@ static void conn_event_do(const struct ctx *c, struct tcp_tap_conn *conn,
  */
 static int tcp_rtt_dst_low(const struct tcp_tap_conn *conn)
 {
+	const struct flowside *tapside = TAPFLOW(conn);
 	int i;
 
 	for (i = 0; i < LOW_RTT_TABLE_SIZE; i++)
-		if (inany_equals(&conn->addr, low_rtt_dst + i))
+		if (inany_equals(&tapside->oaddr, low_rtt_dst + i))
 			return 1;
 
 	return 0;
@@ -872,17 +716,17 @@ static int tcp_rtt_dst_low(const struct tcp_tap_conn *conn)
  * @tinfo:	Pointer to struct tcp_info for socket
  */
 static void tcp_rtt_dst_check(const struct tcp_tap_conn *conn,
-			      const struct tcp_info *tinfo)
+			      const struct tcp_info_linux *tinfo)
 {
-#ifdef HAS_MIN_RTT
+	const struct flowside *tapside = TAPFLOW(conn);
 	int i, hole = -1;
 
-	if (!tinfo->tcpi_min_rtt ||
+	if (!min_rtt_cap ||
 	    (int)tinfo->tcpi_min_rtt > LOW_RTT_THRESHOLD)
 		return;
 
 	for (i = 0; i < LOW_RTT_TABLE_SIZE; i++) {
-		if (inany_equals(&conn->addr, low_rtt_dst + i))
+		if (inany_equals(&tapside->oaddr, low_rtt_dst + i))
 			return;
 		if (hole == -1 && IN6_IS_ADDR_UNSPECIFIED(low_rtt_dst + i))
 			hole = i;
@@ -894,14 +738,10 @@ static void tcp_rtt_dst_check(const struct tcp_tap_conn *conn,
 	if (hole == -1)
 		return;
 
-	low_rtt_dst[hole++] = conn->addr;
+	low_rtt_dst[hole++] = tapside->oaddr;
 	if (hole == LOW_RTT_TABLE_SIZE)
 		hole = 0;
 	inany_from_af(low_rtt_dst + hole, AF_INET6, &in6addr_any);
-#else
-	(void)conn;
-	(void)tinfo;
-#endif /* HAS_MIN_RTT */
 }
 
 /**
@@ -930,177 +770,30 @@ static void tcp_get_sndbuf(struct tcp_tap_conn *conn)
 }
 
 /**
- * tcp_sock_set_bufsize() - Set SO_RCVBUF and SO_SNDBUF to maximum values
+ * tcp_sock_set_nodelay() - Set TCP_NODELAY option (disable Nagle's algorithm)
  * @s:		Socket, can be -1 to avoid check in the caller
  */
-void tcp_sock_set_bufsize(const struct ctx *c, int s)
+static void tcp_sock_set_nodelay(int s)
 {
-	int v = INT_MAX / 2; /* Kernel clamps and rounds, no need to check */
-
 	if (s == -1)
 		return;
 
-	if (!c->low_rmem && setsockopt(s, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v)))
-		trace("TCP: failed to set SO_RCVBUF to %i", v);
-
-	if (!c->low_wmem && setsockopt(s, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v)))
-		trace("TCP: failed to set SO_SNDBUF to %i", v);
+	if (setsockopt(s, SOL_TCP, TCP_NODELAY, &((int){ 1 }), sizeof(int)))
+		debug("TCP: failed to set TCP_NODELAY on socket %i", s);
 }
 
 /**
- * tcp_update_check_ip4() - Update IPv4 with variable parts from stored one
- * @buf:	L2 packet buffer with final IPv4 header
+ * tcp_update_csum() - Calculate TCP checksum
+ * @psum:	Unfolded partial checksum of the IPv4 or IPv6 pseudo-header
+ * @th:		TCP header (updated)
+ * @payload:	TCP payload
  */
-static void tcp_update_check_ip4(struct tcp4_l2_buf_t *buf)
+static void tcp_update_csum(uint32_t psum, struct tcphdr *th,
+			    struct iov_tail *payload)
 {
-	uint32_t sum = buf->psum;
-
-	sum += buf->iph.tot_len;
-	sum += (buf->iph.saddr >> 16) & 0xffff;
-	sum += buf->iph.saddr & 0xffff;
-
-	buf->iph.check = (uint16_t)~csum_fold(sum);
-}
-
-/**
- * tcp_update_check_tcp4() - Update TCP checksum from stored one
- * @buf:	L2 packet buffer with final IPv4 header
- */
-static void tcp_update_check_tcp4(struct tcp4_l2_buf_t *buf)
-{
-	uint16_t tlen = ntohs(buf->iph.tot_len) - 20;
-	uint32_t sum = buf->tsum;
-
-	sum += (buf->iph.saddr >> 16) & 0xffff;
-	sum += buf->iph.saddr & 0xffff;
-	sum += htons(ntohs(buf->iph.tot_len) - 20);
-
-	buf->th.check = 0;
-	buf->th.check = csum(&buf->th, tlen, sum);
-}
-
-/**
- * tcp_update_check_tcp6() - Calculate TCP checksum for IPv6
- * @buf:	L2 packet buffer with final IPv6 header
- */
-static void tcp_update_check_tcp6(struct tcp6_l2_buf_t *buf)
-{
-	int len = ntohs(buf->ip6h.payload_len) + sizeof(struct ipv6hdr);
-
-	buf->ip6h.hop_limit = IPPROTO_TCP;
-	buf->ip6h.version = 0;
-	buf->ip6h.nexthdr = 0;
-
-	buf->th.check = 0;
-	buf->th.check = csum(&buf->ip6h, len, 0);
-
-	buf->ip6h.hop_limit = 255;
-	buf->ip6h.version = 6;
-	buf->ip6h.nexthdr = IPPROTO_TCP;
-}
-
-/**
- * tcp_update_l2_buf() - Update L2 buffers with Ethernet and IPv4 addresses
- * @eth_d:	Ethernet destination address, NULL if unchanged
- * @eth_s:	Ethernet source address, NULL if unchanged
- * @ip_da:	Pointer to IPv4 destination address, NULL if unchanged
- */
-void tcp_update_l2_buf(const unsigned char *eth_d, const unsigned char *eth_s,
-		       const struct in_addr *ip_da)
-{
-	int i;
-
-	for (i = 0; i < TCP_FRAMES_MEM; i++) {
-		struct tcp4_l2_flags_buf_t *b4f = &tcp4_l2_flags_buf[i];
-		struct tcp6_l2_flags_buf_t *b6f = &tcp6_l2_flags_buf[i];
-		struct tcp4_l2_buf_t *b4 = &tcp4_l2_buf[i];
-		struct tcp6_l2_buf_t *b6 = &tcp6_l2_buf[i];
-
-		tap_update_mac(&b4->taph, eth_d, eth_s);
-		tap_update_mac(&b6->taph, eth_d, eth_s);
-		tap_update_mac(&b4f->taph, eth_d, eth_s);
-		tap_update_mac(&b6f->taph, eth_d, eth_s);
-
-		if (ip_da) {
-			b4f->iph.daddr = b4->iph.daddr = ip_da->s_addr;
-			if (!i) {
-				b4f->iph.saddr = b4->iph.saddr = 0;
-				b4f->iph.tot_len = b4->iph.tot_len = 0;
-				b4f->iph.check = b4->iph.check = 0;
-				b4f->psum = b4->psum = sum_16b(&b4->iph, 20);
-
-				b4->tsum = ((ip_da->s_addr >> 16) & 0xffff) +
-					    (ip_da->s_addr & 0xffff) +
-					    htons(IPPROTO_TCP);
-				b4f->tsum = b4->tsum;
-			} else {
-				b4f->psum = b4->psum = tcp4_l2_buf[0].psum;
-				b4f->tsum = b4->tsum = tcp4_l2_buf[0].tsum;
-			}
-		}
-	}
-}
-
-/**
- * tcp_sock4_iov_init() - Initialise scatter-gather L2 buffers for IPv4 sockets
- * @c:		Execution context
- */
-static void tcp_sock4_iov_init(const struct ctx *c)
-{
-	struct iovec *iov;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(tcp4_l2_buf); i++) {
-		tcp4_l2_buf[i] = (struct tcp4_l2_buf_t) {
-			.taph = TAP_HDR_INIT(ETH_P_IP),
-			.iph = L2_BUF_IP4_INIT(IPPROTO_TCP),
-			.th = { .doff = sizeof(struct tcphdr) / 4, .ack = 1 }
-		};
-	}
-
-	for (i = 0; i < ARRAY_SIZE(tcp4_l2_flags_buf); i++) {
-		tcp4_l2_flags_buf[i] = (struct tcp4_l2_flags_buf_t) {
-			.taph = TAP_HDR_INIT(ETH_P_IP),
-			.iph = L2_BUF_IP4_INIT(IPPROTO_TCP)
-		};
-	}
-
-	for (i = 0, iov = tcp4_l2_iov; i < TCP_FRAMES_MEM; i++, iov++)
-		iov->iov_base = tap_iov_base(c, &tcp4_l2_buf[i].taph);
-
-	for (i = 0, iov = tcp4_l2_flags_iov; i < TCP_FRAMES_MEM; i++, iov++)
-		iov->iov_base = tap_iov_base(c, &tcp4_l2_flags_buf[i].taph);
-}
-
-/**
- * tcp_sock6_iov_init() - Initialise scatter-gather L2 buffers for IPv6 sockets
- * @c:		Execution context
- */
-static void tcp_sock6_iov_init(const struct ctx *c)
-{
-	struct iovec *iov;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(tcp6_l2_buf); i++) {
-		tcp6_l2_buf[i] = (struct tcp6_l2_buf_t) {
-			.taph = TAP_HDR_INIT(ETH_P_IPV6),
-			.ip6h = L2_BUF_IP6_INIT(IPPROTO_TCP),
-			.th = { .doff = sizeof(struct tcphdr) / 4, .ack = 1 }
-		};
-	}
-
-	for (i = 0; i < ARRAY_SIZE(tcp6_l2_flags_buf); i++) {
-		tcp6_l2_flags_buf[i] = (struct tcp6_l2_flags_buf_t) {
-			.taph = TAP_HDR_INIT(ETH_P_IPV6),
-			.ip6h = L2_BUF_IP6_INIT(IPPROTO_TCP)
-		};
-	}
-
-	for (i = 0, iov = tcp6_l2_iov; i < TCP_FRAMES_MEM; i++, iov++)
-		iov->iov_base = tap_iov_base(c, &tcp6_l2_buf[i].taph);
-
-	for (i = 0, iov = tcp6_l2_flags_iov; i < TCP_FRAMES_MEM; i++, iov++)
-		iov->iov_base = tap_iov_base(c, &tcp6_l2_flags_buf[i].taph);
+	th->check = 0;
+	psum = csum_unfolded(th, sizeof(*th), psum);
+	th->check = csum_iov_tail(payload, psum);
 }
 
 /**
@@ -1162,356 +855,133 @@ static int tcp_opt_get(const char *opts, size_t len, uint8_t type_find,
 }
 
 /**
- * tcp_hash_match() - Check if a connection entry matches address and ports
- * @conn:	Connection entry to match against
- * @addr:	Remote address
- * @tap_port:	tap-facing port
- * @sock_port:	Socket-facing port
+ * tcp_flow_defer() - Deferred per-flow handling (clean up closed connections)
+ * @conn:	Connection to handle
  *
- * Return: 1 on match, 0 otherwise
+ * Return: true if the connection is ready to free, false otherwise
  */
-static int tcp_hash_match(const struct tcp_tap_conn *conn,
-			  const union inany_addr *addr,
-			  in_port_t tap_port, in_port_t sock_port)
+bool tcp_flow_defer(const struct tcp_tap_conn *conn)
 {
-	if (inany_equals(&conn->addr, addr) &&
-	    conn->tap_port == tap_port && conn->sock_port == sock_port)
-		return 1;
-
-	return 0;
-}
-
-/**
- * tcp_hash() - Calculate hash value for connection given address and ports
- * @c:		Execution context
- * @addr:	Remote address
- * @tap_port:	tap-facing port
- * @sock_port:	Socket-facing port
- *
- * Return: hash value, already modulo size of the hash table
- */
-static unsigned int tcp_hash(const struct ctx *c, const union inany_addr *addr,
-			     in_port_t tap_port, in_port_t sock_port)
-{
-	struct {
-		union inany_addr addr;
-		in_port_t tap_port;
-		in_port_t sock_port;
-	} __attribute__((__packed__)) in = {
-		*addr, tap_port, sock_port
-	};
-	uint64_t b = 0;
-
-	b = siphash_20b((uint8_t *)&in, c->tcp.hash_secret);
-
-	return (unsigned int)(b % TCP_HASH_TABLE_SIZE);
-}
-
-/**
- * tcp_conn_hash() - Calculate hash bucket of an existing connection
- * @c:		Execution context
- * @conn:	Connection
- *
- * Return: hash value, already modulo size of the hash table
- */
-static unsigned int tcp_conn_hash(const struct ctx *c,
-				  const struct tcp_tap_conn *conn)
-{
-	return tcp_hash(c, &conn->addr, conn->tap_port, conn->sock_port);
-}
-
-/**
- * tcp_hash_insert() - Insert connection into hash table, chain link
- * @c:		Execution context
- * @conn:	Connection pointer
- */
-static void tcp_hash_insert(const struct ctx *c, struct tcp_tap_conn *conn)
-{
-	int b;
-
-	b = tcp_hash(c, &conn->addr, conn->tap_port, conn->sock_port);
-	conn->next_index = tc_hash[b] ? CONN_IDX(tc_hash[b]) : -1;
-	tc_hash[b] = conn;
-
-	debug("TCP: hash table insert: index %li, sock %i, bucket: %i, next: "
-	      "%p", CONN_IDX(conn), conn->sock, b, conn_at_idx(conn->next_index));
-}
-
-/**
- * tcp_hash_remove() - Drop connection from hash table, chain unlink
- * @c:		Execution context
- * @conn:	Connection pointer
- */
-static void tcp_hash_remove(const struct ctx *c,
-			    const struct tcp_tap_conn *conn)
-{
-	struct tcp_tap_conn *entry, *prev = NULL;
-	int b = tcp_conn_hash(c, conn);
-
-	for (entry = tc_hash[b]; entry;
-	     prev = entry, entry = conn_at_idx(entry->next_index)) {
-		if (entry == conn) {
-			if (prev)
-				prev->next_index = conn->next_index;
-			else
-				tc_hash[b] = conn_at_idx(conn->next_index);
-			break;
-		}
-	}
-
-	debug("TCP: hash table remove: index %li, sock %i, bucket: %i, new: %p",
-	      CONN_IDX(conn), conn->sock, b,
-	      prev ? conn_at_idx(prev->next_index) : tc_hash[b]);
-}
-
-/**
- * tcp_tap_conn_update() - Update tcp_tap_conn when being moved in the table
- * @c:		Execution context
- * @old:	Old location of tcp_tap_conn
- * @new:	New location of tcp_tap_conn
- */
-static void tcp_tap_conn_update(struct ctx *c, struct tcp_tap_conn *old,
-				struct tcp_tap_conn *new)
-{
-	struct tcp_tap_conn *entry, *prev = NULL;
-	int b = tcp_conn_hash(c, old);
-
-	for (entry = tc_hash[b]; entry;
-	     prev = entry, entry = conn_at_idx(entry->next_index)) {
-		if (entry == old) {
-			if (prev)
-				prev->next_index = CONN_IDX(new);
-			else
-				tc_hash[b] = new;
-			break;
-		}
-	}
-
-	debug("TCP: hash table update: old index %li, new index %li, sock %i, "
-	      "bucket: %i, old: %p, new: %p",
-	      CONN_IDX(old), CONN_IDX(new), new->sock, b, old, new);
-
-	tcp_epoll_ctl(c, new);
-}
-
-/**
- * tcp_hash_lookup() - Look up connection given remote address and ports
- * @c:		Execution context
- * @af:		Address family, AF_INET or AF_INET6
- * @addr:	Remote address, pointer to in_addr or in6_addr
- * @tap_port:	tap-facing port
- * @sock_port:	Socket-facing port
- *
- * Return: connection pointer, if found, -ENOENT otherwise
- */
-static struct tcp_tap_conn *tcp_hash_lookup(const struct ctx *c,
-					    int af, const void *addr,
-					    in_port_t tap_port,
-					    in_port_t sock_port)
-{
-	union inany_addr aany;
-	struct tcp_tap_conn *conn;
-	int b;
-
-	inany_from_af(&aany, af, addr);
-	b = tcp_hash(c, &aany, tap_port, sock_port);
-	for (conn = tc_hash[b]; conn; conn = conn_at_idx(conn->next_index)) {
-		if (tcp_hash_match(conn, &aany, tap_port, sock_port))
-			return conn;
-	}
-
-	return NULL;
-}
-
-/**
- * tcp_table_compact() - Perform compaction on connection table
- * @c:		Execution context
- * @hole:	Pointer to recently closed connection
- */
-void tcp_table_compact(struct ctx *c, union tcp_conn *hole)
-{
-	union tcp_conn *from;
-
-	if (CONN_IDX(hole) == --c->tcp.conn_count) {
-		debug("TCP: table compaction: maximum index was %li (%p)",
-		      CONN_IDX(hole), hole);
-		memset(hole, 0, sizeof(*hole));
-		return;
-	}
-
-	from = tc + c->tcp.conn_count;
-	memcpy(hole, from, sizeof(*hole));
-
-	if (from->c.spliced)
-		tcp_splice_conn_update(c, &hole->splice);
-	else
-		tcp_tap_conn_update(c, &from->tap, &hole->tap);
-
-	debug("TCP: table compaction (spliced=%d): old index %li, new index %li, "
-	      "from: %p, to: %p",
-	      from->c.spliced, CONN_IDX(from), CONN_IDX(hole), from, hole);
-
-	memset(from, 0, sizeof(*from));
-}
-
-/**
- * tcp_conn_destroy() - Close sockets, trigger hash table removal and compaction
- * @c:		Execution context
- * @conn_union:	Connection pointer (container union)
- */
-static void tcp_conn_destroy(struct ctx *c, union tcp_conn *conn_union)
-{
-	struct tcp_tap_conn *conn = &conn_union->tap;
+	if (conn->events != CLOSED)
+		return false;
 
 	close(conn->sock);
 	if (conn->timer != -1)
 		close(conn->timer);
 
-	tcp_hash_remove(c, conn);
-	tcp_table_compact(c, conn_union);
-}
-
-static void tcp_rst_do(struct ctx *c, struct tcp_tap_conn *conn);
-#define tcp_rst(c, conn)						\
-	do {								\
-		debug("TCP: index %li, reset at %s:%i", CONN_IDX(conn), \
-		      __func__, __LINE__);				\
-		tcp_rst_do(c, conn);					\
-	} while (0)
-
-/**
- * tcp_l2_flags_buf_flush() - Send out buffers for segments with no data (flags)
- * @c:		Execution context
- */
-static void tcp_l2_flags_buf_flush(struct ctx *c)
-{
-	tap_send_frames(c, tcp6_l2_flags_iov, tcp6_l2_flags_buf_used);
-	tcp6_l2_flags_buf_used = 0;
-
-	tap_send_frames(c, tcp4_l2_flags_iov, tcp4_l2_flags_buf_used);
-	tcp4_l2_flags_buf_used = 0;
-}
-
-/**
- * tcp_l2_data_buf_flush() - Send out buffers for segments with data
- * @c:		Execution context
- */
-static void tcp_l2_data_buf_flush(struct ctx *c)
-{
-	tap_send_frames(c, tcp6_l2_iov, tcp6_l2_buf_used);
-	tcp6_l2_buf_used = 0;
-
-	tap_send_frames(c, tcp4_l2_iov, tcp4_l2_buf_used);
-	tcp4_l2_buf_used = 0;
+	return true;
 }
 
 /**
  * tcp_defer_handler() - Handler for TCP deferred tasks
  * @c:		Execution context
  */
+/* cppcheck-suppress [constParameterPointer, unmatchedSuppression] */
 void tcp_defer_handler(struct ctx *c)
 {
-	int max_conns = c->tcp.conn_count / 100 * TCP_CONN_PRESSURE;
-	int max_files = c->nofile / 100 * TCP_FILE_PRESSURE;
-	union tcp_conn *conn;
+	tcp_payload_flush(c);
+}
 
-	tcp_l2_flags_buf_flush(c);
-	tcp_l2_data_buf_flush(c);
+/**
+ * tcp_fill_header() - Fill the TCP header fields for a given TCP segment.
+ *
+ * @th:		Pointer to the TCP header structure
+ * @conn:	Pointer to the TCP connection structure
+ * @seq:	Sequence number
+ */
+static void tcp_fill_header(struct tcphdr *th,
+			    const struct tcp_tap_conn *conn, uint32_t seq)
+{
+	const struct flowside *tapside = TAPFLOW(conn);
 
-	if ((c->tcp.conn_count < MIN(max_files, max_conns)) &&
-	    (c->tcp.splice_conn_count < MIN(max_files / 6, max_conns)))
-		return;
+	th->source = htons(tapside->oport);
+	th->dest = htons(tapside->eport);
+	th->seq = htonl(seq);
+	th->ack_seq = htonl(conn->seq_ack_to_tap);
+	if (conn->events & ESTABLISHED)	{
+		th->window = htons(conn->wnd_to_tap);
+	} else {
+		unsigned wnd = conn->wnd_to_tap << conn->ws_to_tap;
 
-	for (conn = tc + c->tcp.conn_count - 1; conn >= tc; conn--) {
-		if (conn->c.spliced) {
-			if (conn->splice.flags & CLOSING)
-				tcp_splice_destroy(c, conn);
-		} else {
-			if (conn->tap.events == CLOSED)
-				tcp_conn_destroy(c, conn);
-		}
+		th->window = htons(MIN(wnd, USHRT_MAX));
 	}
 }
 
 /**
- * tcp_l2_buf_fill_headers() - Fill 802.3, IP, TCP headers in pre-cooked buffers
- * @c:		Execution context
- * @conn:	Connection pointer
- * @p:		Pointer to any type of TCP pre-cooked buffer
- * @plen:	Payload length (including TCP header options)
- * @check:	Checksum, if already known
- * @seq:	Sequence number for this segment
- *
- * Return: frame length including L2 headers, host order
+ * tcp_fill_headers() - Fill 802.3, IP, TCP headers
+ * @conn:		Connection pointer
+ * @taph:		tap backend specific header
+ * @ip4h:		Pointer to IPv4 header, or NULL
+ * @ip6h:		Pointer to IPv6 header, or NULL
+ * @th:			Pointer to TCP header
+ * @payload:		TCP payload
+ * @ip4_check:		IPv4 checksum, if already known
+ * @seq:		Sequence number for this segment
+ * @no_tcp_csum:	Do not set TCP checksum
  */
-static size_t tcp_l2_buf_fill_headers(const struct ctx *c,
-				      const struct tcp_tap_conn *conn,
-				      void *p, size_t plen,
-				      const uint16_t *check, uint32_t seq)
+void tcp_fill_headers(const struct tcp_tap_conn *conn,
+		      struct tap_hdr *taph,
+		      struct iphdr *ip4h, struct ipv6hdr *ip6h,
+		      struct tcphdr *th, struct iov_tail *payload,
+		      const uint16_t *ip4_check, uint32_t seq, bool no_tcp_csum)
 {
-	const struct in_addr *a4 = inany_v4(&conn->addr);
-	size_t ip_len, tlen;
+	const struct flowside *tapside = TAPFLOW(conn);
+	size_t l4len = iov_tail_size(payload) + sizeof(*th);
+	size_t l3len = l4len;
+	uint32_t psum = 0;
 
-#define SET_TCP_HEADER_COMMON_V4_V6(b, conn, seq)			\
-do {									\
-	b->th.source = htons(conn->sock_port);				\
-	b->th.dest = htons(conn->tap_port);				\
-	b->th.seq = htonl(seq);						\
-	b->th.ack_seq = htonl(conn->seq_ack_to_tap);			\
-	if (conn->events & ESTABLISHED)	{				\
-		b->th.window = htons(conn->wnd_to_tap);			\
-	} else {							\
-		unsigned wnd = conn->wnd_to_tap << conn->ws_to_tap;	\
-									\
-		b->th.window = htons(MIN(wnd, USHRT_MAX));		\
-	}								\
-} while (0)
+	if (ip4h) {
+		const struct in_addr *src4 = inany_v4(&tapside->oaddr);
+		const struct in_addr *dst4 = inany_v4(&tapside->eaddr);
 
-	if (a4) {
-		struct tcp4_l2_buf_t *b = (struct tcp4_l2_buf_t *)p;
+		ASSERT(src4 && dst4);
 
-		ip_len = plen + sizeof(struct iphdr) + sizeof(struct tcphdr);
-		b->iph.tot_len = htons(ip_len);
-		b->iph.saddr = a4->s_addr;
-		b->iph.daddr = c->ip4.addr_seen.s_addr;
+		l3len += + sizeof(*ip4h);
 
-		if (check)
-			b->iph.check = *check;
+		ip4h->tot_len = htons(l3len);
+		ip4h->saddr = src4->s_addr;
+		ip4h->daddr = dst4->s_addr;
+
+		if (ip4_check)
+			ip4h->check = *ip4_check;
 		else
-			tcp_update_check_ip4(b);
+			ip4h->check = csum_ip4_header(l3len, IPPROTO_TCP,
+						      *src4, *dst4);
 
-		SET_TCP_HEADER_COMMON_V4_V6(b, conn, seq);
-
-		tcp_update_check_tcp4(b);
-
-		tlen = tap_iov_len(c, &b->taph, ip_len);
-	} else {
-		struct tcp6_l2_buf_t *b = (struct tcp6_l2_buf_t *)p;
-
-		ip_len = plen + sizeof(struct ipv6hdr) + sizeof(struct tcphdr);
-
-		b->ip6h.payload_len = htons(plen + sizeof(struct tcphdr));
-		b->ip6h.saddr = conn->addr.a6;
-		if (IN6_IS_ADDR_LINKLOCAL(&b->ip6h.saddr))
-			b->ip6h.daddr = c->ip6.addr_ll_seen;
-		else
-			b->ip6h.daddr = c->ip6.addr_seen;
-
-		memset(b->ip6h.flow_lbl, 0, 3);
-
-		SET_TCP_HEADER_COMMON_V4_V6(b, conn, seq);
-
-		tcp_update_check_tcp6(b);
-
-		b->ip6h.flow_lbl[0] = (conn->sock >> 16) & 0xf;
-		b->ip6h.flow_lbl[1] = (conn->sock >> 8) & 0xff;
-		b->ip6h.flow_lbl[2] = (conn->sock >> 0) & 0xff;
-
-		tlen = tap_iov_len(c, &b->taph, ip_len);
+		if (!no_tcp_csum) {
+			psum = proto_ipv4_header_psum(l4len, IPPROTO_TCP,
+						      *src4, *dst4);
+		}
 	}
-#undef SET_TCP_HEADER_COMMON_V4_V6
 
-	return tlen;
+	if (ip6h) {
+		l3len += sizeof(*ip6h);
+
+		ip6h->payload_len = htons(l4len);
+		ip6h->saddr = tapside->oaddr.a6;
+		ip6h->daddr = tapside->eaddr.a6;
+
+		ip6h->hop_limit = 255;
+		ip6h->version = 6;
+		ip6h->nexthdr = IPPROTO_TCP;
+
+		ip6_set_flow_lbl(ip6h, conn->sock);
+
+		if (!no_tcp_csum) {
+			psum = proto_ipv6_header_psum(l4len, IPPROTO_TCP,
+						      &ip6h->saddr,
+						      &ip6h->daddr);
+		}
+	}
+
+	tcp_fill_header(th, conn, seq);
+
+	if (no_tcp_csum)
+		th->check = 0;
+	else
+		tcp_update_csum(psum, th, payload);
+
+	tap_hdr_update(taph, l3len + sizeof(struct ethhdr));
 }
 
 /**
@@ -1523,43 +993,42 @@ do {									\
  *
  * Return: 1 if sequence or window were updated, 0 otherwise
  */
-static int tcp_update_seqack_wnd(const struct ctx *c, struct tcp_tap_conn *conn,
-				 int force_seq, struct tcp_info *tinfo)
+int tcp_update_seqack_wnd(const struct ctx *c, struct tcp_tap_conn *conn,
+			  bool force_seq, struct tcp_info_linux *tinfo)
 {
 	uint32_t prev_wnd_to_tap = conn->wnd_to_tap << conn->ws_to_tap;
 	uint32_t prev_ack_to_tap = conn->seq_ack_to_tap;
 	/* cppcheck-suppress [ctunullpointer, unmatchedSuppression] */
 	socklen_t sl = sizeof(*tinfo);
-	struct tcp_info tinfo_new;
+	struct tcp_info_linux tinfo_new;
 	uint32_t new_wnd_to_tap = prev_wnd_to_tap;
 	int s = conn->sock;
 
-#ifndef HAS_BYTES_ACKED
-	(void)force_seq;
-
-	conn->seq_ack_to_tap = conn->seq_from_tap;
-	if (SEQ_LT(conn->seq_ack_to_tap, prev_ack_to_tap))
-		conn->seq_ack_to_tap = prev_ack_to_tap;
-#else
-	if ((unsigned)SNDBUF_GET(conn) < SNDBUF_SMALL || tcp_rtt_dst_low(conn)
-	    || CONN_IS_CLOSING(conn) || (conn->flags & LOCAL) || force_seq) {
+	if (!bytes_acked_cap) {
 		conn->seq_ack_to_tap = conn->seq_from_tap;
-	} else if (conn->seq_ack_to_tap != conn->seq_from_tap) {
-		if (!tinfo) {
-			tinfo = &tinfo_new;
-			if (getsockopt(s, SOL_TCP, TCP_INFO, tinfo, &sl))
-				return 0;
-		}
-
-		conn->seq_ack_to_tap = tinfo->tcpi_bytes_acked +
-				       conn->seq_init_from_tap;
-
 		if (SEQ_LT(conn->seq_ack_to_tap, prev_ack_to_tap))
 			conn->seq_ack_to_tap = prev_ack_to_tap;
-	}
-#endif /* !HAS_BYTES_ACKED */
+	} else {
+		if ((unsigned)SNDBUF_GET(conn) < SNDBUF_SMALL ||
+		    tcp_rtt_dst_low(conn) || CONN_IS_CLOSING(conn) ||
+		    (conn->flags & LOCAL) || force_seq) {
+			conn->seq_ack_to_tap = conn->seq_from_tap;
+		} else if (conn->seq_ack_to_tap != conn->seq_from_tap) {
+			if (!tinfo) {
+				tinfo = &tinfo_new;
+				if (getsockopt(s, SOL_TCP, TCP_INFO, tinfo, &sl))
+					return 0;
+			}
 
-	if (!KERNEL_REPORTS_SND_WND(c)) {
+			conn->seq_ack_to_tap = tinfo->tcpi_bytes_acked +
+				conn->seq_init_from_tap;
+
+			if (SEQ_LT(conn->seq_ack_to_tap, prev_ack_to_tap))
+				conn->seq_ack_to_tap = prev_ack_to_tap;
+		}
+	}
+
+	if (!snd_wnd_cap) {
 		tcp_get_sndbuf(conn);
 		new_wnd_to_tap = MIN(SNDBUF_GET(conn), MAX_WINDOW);
 		conn->wnd_to_tap = MIN(new_wnd_to_tap >> conn->ws_to_tap,
@@ -1570,14 +1039,13 @@ static int tcp_update_seqack_wnd(const struct ctx *c, struct tcp_tap_conn *conn,
 	if (!tinfo) {
 		if (prev_wnd_to_tap > WINDOW_DEFAULT) {
 			goto out;
-}
+		}
 		tinfo = &tinfo_new;
 		if (getsockopt(s, SOL_TCP, TCP_INFO, tinfo, &sl)) {
 			goto out;
-}
+		}
 	}
 
-#ifdef HAS_SND_WND
 	if ((conn->flags & LOCAL) || tcp_rtt_dst_low(conn)) {
 		new_wnd_to_tap = tinfo->tcpi_snd_wnd;
 	} else {
@@ -1585,7 +1053,6 @@ static int tcp_update_seqack_wnd(const struct ctx *c, struct tcp_tap_conn *conn,
 		new_wnd_to_tap = MIN((int)tinfo->tcpi_snd_wnd,
 				     SNDBUF_GET(conn));
 	}
-#endif
 
 	new_wnd_to_tap = MIN(new_wnd_to_tap, MAX_WINDOW);
 	if (!(conn->events & ESTABLISHED))
@@ -1593,6 +1060,13 @@ static int tcp_update_seqack_wnd(const struct ctx *c, struct tcp_tap_conn *conn,
 
 	conn->wnd_to_tap = MIN(new_wnd_to_tap >> conn->ws_to_tap, USHRT_MAX);
 
+	/* Certain cppcheck versions, e.g. 2.12.0 have a bug where they think
+	 * the MIN() above restricts conn->wnd_to_tap to be zero.  That's
+	 * clearly incorrect, but until the bug is fixed, work around it.
+	 *   https://bugzilla.redhat.com/show_bug.cgi?id=2240705
+	 *   https://sourceforge.net/p/cppcheck/discussion/general/thread/f5b1a00646/
+	 */
+	/* cppcheck-suppress [knownConditionTrueFalse, unmatchedSuppression] */
 	if (!conn->wnd_to_tap)
 		conn_flag(c, conn, ACK_TO_TAP_DUE);
 
@@ -1624,72 +1098,48 @@ static void tcp_update_seqack_from_tap(const struct ctx *c,
 }
 
 /**
- * tcp_send_flag() - Send segment with flags to tap (no payload)
+ * tcp_prepare_flags() - Prepare header for flags-only segment (no payload)
  * @c:		Execution context
  * @conn:	Connection pointer
  * @flags:	TCP flags: if not set, send segment only if ACK is due
+ * @th:		TCP header to update
+ * @data:	buffer to store TCP option
+ * @optlen:	size of the TCP option buffer (output parameter)
  *
- * Return: negative error code on connection reset, 0 otherwise
+ * Return: < 0 error code on connection reset,
+ *	     0 if there is no flag to send
+ *	     1 otherwise
  */
-static int tcp_send_flag(struct ctx *c, struct tcp_tap_conn *conn, int flags)
+int tcp_prepare_flags(const struct ctx *c, struct tcp_tap_conn *conn,
+		      int flags, struct tcphdr *th, struct tcp_syn_opts *opts,
+		      size_t *optlen)
 {
-	uint32_t prev_ack_to_tap = conn->seq_ack_to_tap;
-	uint32_t prev_wnd_to_tap = conn->wnd_to_tap;
-	struct tcp4_l2_flags_buf_t *b4 = NULL;
-	struct tcp6_l2_flags_buf_t *b6 = NULL;
-	struct tcp_info tinfo = { 0 };
+	struct tcp_info_linux tinfo = { 0 };
 	socklen_t sl = sizeof(tinfo);
 	int s = conn->sock;
-	size_t optlen = 0;
-	struct iovec *iov;
-	struct tcphdr *th;
-	char *data;
-	void *p;
 
 	if (SEQ_GE(conn->seq_ack_to_tap, conn->seq_from_tap) &&
-	    !flags && conn->wnd_to_tap)
+	    !flags && conn->wnd_to_tap) {
+		conn_flag(c, conn, ~ACK_TO_TAP_DUE);
 		return 0;
+	}
 
 	if (getsockopt(s, SOL_TCP, TCP_INFO, &tinfo, &sl)) {
 		conn_event(c, conn, CLOSED);
 		return -ECONNRESET;
 	}
 
-#ifdef HAS_SND_WND
-	if (!c->tcp.kernel_snd_wnd && tinfo.tcpi_snd_wnd)
-		c->tcp.kernel_snd_wnd = 1;
-#endif
-
 	if (!(conn->flags & LOCAL))
 		tcp_rtt_dst_check(conn, &tinfo);
 
-	if (!tcp_update_seqack_wnd(c, conn, flags, &tinfo) && !flags)
+	if (!tcp_update_seqack_wnd(c, conn, !!flags, &tinfo) && !flags)
 		return 0;
 
-	if (CONN_V4(conn)) {
-		iov = tcp4_l2_flags_iov    + tcp4_l2_flags_buf_used;
-		p = b4 = tcp4_l2_flags_buf + tcp4_l2_flags_buf_used++;
-		th = &b4->th;
-
-		/* gcc 11.2 would complain on data = (char *)(th + 1); */
-		data = b4->opts;
-	} else {
-		iov = tcp6_l2_flags_iov    + tcp6_l2_flags_buf_used;
-		p = b6 = tcp6_l2_flags_buf + tcp6_l2_flags_buf_used++;
-		th = &b6->th;
-		data = b6->opts;
-	}
-
+	*optlen = 0;
 	if (flags & SYN) {
 		int mss;
 
-		/* Options: MSS, NOP and window scale (8 bytes) */
-		optlen = OPT_MSS_LEN + 1 + OPT_WS_LEN;
-
-		*data++ = OPT_MSS;
-		*data++ = OPT_MSS_LEN;
-
-		if (c->mtu == -1) {
+		if (!c->mtu) {
 			mss = tinfo.tcpi_snd_mss;
 		} else {
 			mss = c->mtu - sizeof(struct tcphdr);
@@ -1704,33 +1154,21 @@ static int tcp_send_flag(struct ctx *c, struct tcp_tap_conn *conn, int flags)
 			else if (mss > PAGE_SIZE)
 				mss = ROUND_DOWN(mss, PAGE_SIZE);
 		}
-		*(uint16_t *)data = htons(MIN(USHRT_MAX, mss));
-
-		data += OPT_MSS_LEN - 2;
-		th->doff += OPT_MSS_LEN / 4;
 
 		conn->ws_to_tap = MIN(MAX_WS, tinfo.tcpi_snd_wscale);
 
-		*data++ = OPT_NOP;
-		*data++ = OPT_WS;
-		*data++ = OPT_WS_LEN;
-		*data++ = conn->ws_to_tap;
-
-		th->ack = !!(flags & ACK);
+		*opts = TCP_SYN_OPTS(mss, conn->ws_to_tap);
+		*optlen = sizeof(*opts);
 	} else {
-		th->ack = !!(flags & (ACK | DUP_ACK)) ||
-			  conn->seq_ack_to_tap != prev_ack_to_tap ||
-			  !prev_wnd_to_tap;
+		flags |= ACK;
 	}
 
-	th->doff = (sizeof(*th) + optlen) / 4;
+	th->doff = (sizeof(*th) + *optlen) / 4;
 
+	th->ack = !!(flags & ACK);
 	th->rst = !!(flags & RST);
 	th->syn = !!(flags & SYN);
 	th->fin = !!(flags & FIN);
-
-	iov->iov_len = tcp_l2_buf_fill_headers(c, conn, p, optlen,
-					       NULL, conn->seq_to_tap);
 
 	if (th->ack) {
 		if (SEQ_GE(conn->seq_ack_to_tap, conn->seq_from_tap))
@@ -1746,27 +1184,24 @@ static int tcp_send_flag(struct ctx *c, struct tcp_tap_conn *conn, int flags)
 	if (th->fin || th->syn)
 		conn->seq_to_tap++;
 
-	if (CONN_V4(conn)) {
-		if (flags & DUP_ACK) {
-			memcpy(b4 + 1, b4, sizeof(*b4));
-			(iov + 1)->iov_len = iov->iov_len;
-			tcp4_l2_flags_buf_used++;
-		}
+	return 1;
+}
 
-		if (tcp4_l2_flags_buf_used > ARRAY_SIZE(tcp4_l2_flags_buf) - 2)
-			tcp_l2_flags_buf_flush(c);
-	} else {
-		if (flags & DUP_ACK) {
-			memcpy(b6 + 1, b6, sizeof(*b6));
-			(iov + 1)->iov_len = iov->iov_len;
-			tcp6_l2_flags_buf_used++;
-		}
+/**
+ * tcp_send_flag() - Send segment with flags to tap (no payload)
+ * @c:         Execution context
+ * @conn:      Connection pointer
+ * @flags:     TCP flags: if not set, send segment only if ACK is due
+ *
+ * Return: negative error code on connection reset, 0 otherwise
+ */
+static int tcp_send_flag(const struct ctx *c, struct tcp_tap_conn *conn,
+			 int flags)
+{
+	if (c->mode == MODE_VU)
+		return tcp_vu_send_flag(c, conn, flags);
 
-		if (tcp6_l2_flags_buf_used > ARRAY_SIZE(tcp6_l2_flags_buf) - 2)
-			tcp_l2_flags_buf_flush(c);
-	}
-
-	return 0;
+	return tcp_buf_send_flag(c, conn, flags);
 }
 
 /**
@@ -1774,13 +1209,13 @@ static int tcp_send_flag(struct ctx *c, struct tcp_tap_conn *conn, int flags)
  * @c:		Execution context
  * @conn:	Connection pointer
  */
-static void tcp_rst_do(struct ctx *c, struct tcp_tap_conn *conn)
+void tcp_rst_do(const struct ctx *c, struct tcp_tap_conn *conn)
 {
 	if (conn->events == CLOSED)
 		return;
 
-	if (!tcp_send_flag(c, conn, RST))
-		conn_event(c, conn, CLOSED);
+	tcp_send_flag(c, conn, RST);
+	conn_event(c, conn, CLOSED);
 }
 
 /**
@@ -1801,80 +1236,38 @@ static void tcp_get_tap_ws(struct tcp_tap_conn *conn,
 }
 
 /**
- * tcp_clamp_window() - Set new window for connection, clamp on socket
- * @c:		Execution context
+ * tcp_tap_window_update() - Process an updated window from tap side
  * @conn:	Connection pointer
  * @window:	Window value, host order, unscaled
  */
-static void tcp_clamp_window(const struct ctx *c, struct tcp_tap_conn *conn,
-			     unsigned wnd)
+static void tcp_tap_window_update(struct tcp_tap_conn *conn, unsigned wnd)
 {
-	uint32_t prev_scaled = conn->wnd_from_tap << conn->ws_from_tap;
-	int s = conn->sock;
+	wnd = MIN(MAX_WINDOW, wnd << conn->ws_from_tap);
 
-	wnd <<= conn->ws_from_tap;
-	wnd = MIN(MAX_WINDOW, wnd);
-
-	if (conn->flags & WND_CLAMPED) {
-		if (prev_scaled == wnd)
-			return;
-
-		/* Discard +/- 1% updates to spare some syscalls. */
-		/* TODO: cppcheck, starting from commit b4d455df487c ("Fix
-		 * 11349: FP negativeIndex for clamped array index (#4627)"),
-		 * reports wnd > prev_scaled as always being true, see also:
-		 *
-		 *	https://github.com/danmar/cppcheck/pull/4627
-		 *
-		 * drop this suppression once that's resolved.
-		 */
-		/* cppcheck-suppress [knownConditionTrueFalse, unmatchedSuppression] */
-		if ((wnd > prev_scaled && wnd * 99 / 100 < prev_scaled) ||
-		    (wnd < prev_scaled && wnd * 101 / 100 > prev_scaled))
-			return;
-	}
+	/* Work-around for bug introduced in peer kernel code, commit
+	 * e2142825c120 ("net: tcp: send zero-window ACK when no memory").
+	 * We don't update if window shrank to zero.
+	 */
+	if (!wnd && SEQ_LT(conn->seq_ack_from_tap, conn->seq_to_tap))
+		return;
 
 	conn->wnd_from_tap = MIN(wnd >> conn->ws_from_tap, USHRT_MAX);
-	if (setsockopt(s, SOL_TCP, TCP_WINDOW_CLAMP, &wnd, sizeof(wnd)))
-		trace("TCP: failed to set TCP_WINDOW_CLAMP on socket %i", s);
 
-	conn_flag(c, conn, WND_CLAMPED);
+	/* FIXME: reflect the tap-side receiver's window back to the sock-side
+	 * sender by adjusting SO_RCVBUF? */
 }
 
 /**
- * tcp_seq_init() - Calculate initial sequence number according to RFC 6528
- * @c:		Execution context
- * @conn:	TCP connection, with addr, sock_port and tap_port populated
+ * tcp_init_seq() - Calculate initial sequence number according to RFC 6528
+ * @hash:	Hash of connection details
  * @now:	Current timestamp
  */
-static void tcp_seq_init(const struct ctx *c, struct tcp_tap_conn *conn,
-			 const struct timespec *now)
+static uint32_t tcp_init_seq(uint64_t hash, const struct timespec *now)
 {
-	union inany_addr aany;
-	struct {
-		union inany_addr src;
-		in_port_t srcport;
-		union inany_addr dst;
-		in_port_t dstport;
-	} __attribute__((__packed__)) in = {
-		.src = conn->addr,
-		.srcport = conn->tap_port,
-		.dstport = conn->sock_port,
-	};
-	uint32_t ns, seq = 0;
-
-	if (CONN_V4(conn))
-		inany_from_af(&aany, AF_INET, &c->ip4.addr);
-	else
-		inany_from_af(&aany, AF_INET6, &c->ip6.addr);
-	in.dst = aany;
-
-	seq = siphash_36b((uint8_t *)&in, c->tcp.hash_secret);
-
 	/* 32ns ticks, overflows 32 bits every 137s */
-	ns = (now->tv_sec * 1000000000 + now->tv_nsec) >> 5;
+	uint32_t ns = (now->tv_sec * 1000000000 + now->tv_nsec) >> 5;
 
-	conn->seq_to_tap = seq + ns;
+	return ((uint32_t)(hash >> 32) ^ (uint32_t)hash) + ns;
 }
 
 /**
@@ -1897,18 +1290,17 @@ int tcp_conn_pool_sock(int pool[])
 
 /**
  * tcp_conn_new_sock() - Open and prepare new socket for connection
- * @c:		Execution context
  * @af:		Address family
  *
  * Return: socket number on success, negative code if socket creation failed
  */
-int tcp_conn_new_sock(const struct ctx *c, sa_family_t af)
+static int tcp_conn_new_sock(sa_family_t af)
 {
 	int s;
 
-	s = socket(af, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+	s = socket(af, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
 
-	if (s > SOCKET_MAX) {
+	if (s > FD_REF_MAX) {
 		close(s);
 		return -EIO;
 	}
@@ -1916,9 +1308,34 @@ int tcp_conn_new_sock(const struct ctx *c, sa_family_t af)
 	if (s < 0)
 		return -errno;
 
-	tcp_sock_set_bufsize(c, s);
+	tcp_sock_set_nodelay(s);
 
 	return s;
+}
+
+/**
+ * tcp_conn_sock() - Obtain a connectable socket in the host/init namespace
+ * @af:		Address family (AF_INET or AF_INET6)
+ *
+ * Return: Socket fd on success, -errno on failure
+ */
+int tcp_conn_sock(sa_family_t af)
+{
+	int *pool = af == AF_INET6 ? init_sock_pool6 : init_sock_pool4;
+	int s;
+
+	if ((s = tcp_conn_pool_sock(pool)) >= 0)
+		return s;
+
+	/* If the pool is empty we just open a new one without refilling the
+	 * pool to keep latency down.
+	 */
+	if ((s = tcp_conn_new_sock(af)) >= 0)
+		return s;
+
+	err("TCP: Unable to open socket for new connection: %s",
+	    strerror_(-s));
+	return -1;
 }
 
 /**
@@ -1951,53 +1368,47 @@ static uint16_t tcp_conn_tap_mss(const struct tcp_tap_conn *conn,
 /**
  * tcp_bind_outbound() - Bind socket to outbound address and interface if given
  * @c:		Execution context
+ * @conn:	Connection entry for socket to bind
  * @s:		Outbound TCP socket
- * @af:		Address family
  */
-static void tcp_bind_outbound(const struct ctx *c, int s, sa_family_t af)
+static void tcp_bind_outbound(const struct ctx *c,
+			      const struct tcp_tap_conn *conn, int s)
 {
-	if (af == AF_INET) {
-		if (!IN4_IS_ADDR_UNSPECIFIED(&c->ip4.addr_out)) {
-			struct sockaddr_in addr4 = {
-				.sin_family = AF_INET,
-				.sin_port = 0,
-				.sin_addr = c->ip4.addr_out,
-			};
+	const struct flowside *tgt = &conn->f.side[TGTSIDE];
+	union sockaddr_inany bind_sa;
+	socklen_t sl;
 
-			if (bind(s, (struct sockaddr *)&addr4, sizeof(addr4))) {
-				debug("Can't bind IPv4 TCP socket address: %s",
-				      strerror(errno));
-			}
+
+	pif_sockaddr(c, &bind_sa, &sl, PIF_HOST, &tgt->oaddr, tgt->oport);
+	if (!inany_is_unspecified(&tgt->oaddr) || tgt->oport) {
+		if (bind(s, &bind_sa.sa, sl)) {
+			char sstr[INANY_ADDRSTRLEN];
+
+			flow_dbg_perror(conn,
+					"Can't bind TCP outbound socket to %s:%hu",
+					inany_ntop(&tgt->oaddr, sstr, sizeof(sstr)),
+					tgt->oport);
 		}
+	}
 
+	if (bind_sa.sa_family == AF_INET) {
 		if (*c->ip4.ifname_out) {
 			if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
 				       c->ip4.ifname_out,
 				       strlen(c->ip4.ifname_out))) {
-				debug("Can't bind IPv4 TCP socket to interface:"
-				      " %s", strerror(errno));
+				flow_dbg_perror(conn,
+						"Can't bind IPv4 TCP socket to interface %s",
+						c->ip4.ifname_out);
 			}
 		}
-	} else if (af == AF_INET6) {
-		if (!IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_out)) {
-			struct sockaddr_in6 addr6 = {
-				.sin6_family = AF_INET6,
-				.sin6_port = 0,
-				.sin6_addr = c->ip6.addr_out,
-			};
-
-			if (bind(s, (struct sockaddr *)&addr6, sizeof(addr6))) {
-				debug("Can't bind IPv6 TCP socket address: %s",
-				      strerror(errno));
-			}
-		}
-
+	} else if (bind_sa.sa_family == AF_INET6) {
 		if (*c->ip6.ifname_out) {
 			if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
 				       c->ip6.ifname_out,
 				       strlen(c->ip6.ifname_out))) {
-				debug("Can't bind IPv6 TCP socket to interface:"
-				      " %s", strerror(errno));
+				flow_dbg_perror(conn,
+						"Can't bind IPv6 TCP socket to interface %s",
+						c->ip6.ifname_out);
 			}
 		}
 	}
@@ -2007,69 +1418,94 @@ static void tcp_bind_outbound(const struct ctx *c, int s, sa_family_t af)
  * tcp_conn_from_tap() - Handle connection request (SYN segment) from tap
  * @c:		Execution context
  * @af:		Address family, AF_INET or AF_INET6
- * @addr:	Remote address, pointer to in_addr or in6_addr
+ * @saddr:	Source address, pointer to in_addr or in6_addr
+ * @daddr:	Destination address, pointer to in_addr or in6_addr
  * @th:		TCP header from tap: caller MUST ensure it's there
  * @opts:	Pointer to start of options
  * @optlen:	Bytes in options: caller MUST ensure available length
  * @now:	Current timestamp
+ *
+ * #syscalls:vu getsockname
  */
-static void tcp_conn_from_tap(struct ctx *c, int af, const void *addr,
+static void tcp_conn_from_tap(const struct ctx *c, sa_family_t af,
+			      const void *saddr, const void *daddr,
 			      const struct tcphdr *th, const char *opts,
 			      size_t optlen, const struct timespec *now)
 {
-	int *pool = af == AF_INET6 ? init_sock_pool6 : init_sock_pool4;
-	struct sockaddr_in addr4 = {
-		.sin_family = AF_INET,
-		.sin_port = th->dest,
-		.sin_addr = *(struct in_addr *)addr,
-	};
-	struct sockaddr_in6 addr6 = {
-		.sin6_family = AF_INET6,
-		.sin6_port = th->dest,
-		.sin6_addr = *(struct in6_addr *)addr,
-	};
-	const struct sockaddr *sa;
+	in_port_t srcport = ntohs(th->source);
+	in_port_t dstport = ntohs(th->dest);
+	const struct flowside *ini;
 	struct tcp_tap_conn *conn;
+	union sockaddr_inany sa;
+	struct flowside *tgt;
+	union flow *flow;
+	int s = -1, mss;
+	uint64_t hash;
 	socklen_t sl;
-	int s, mss;
 
-	if (c->tcp.conn_count >= TCP_MAX_CONNS)
+	if (!(flow = flow_alloc()))
 		return;
 
-	if ((s = tcp_conn_pool_sock(pool)) < 0)
-		if ((s = tcp_conn_new_sock(c, af)) < 0)
-			return;
+	ini = flow_initiate_af(flow, PIF_TAP,
+			       af, saddr, srcport, daddr, dstport);
 
-	if (!c->no_map_gw) {
-		if (af == AF_INET && IN4_ARE_ADDR_EQUAL(addr, &c->ip4.gw))
-			addr4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-		if (af == AF_INET6 && IN6_ARE_ADDR_EQUAL(addr, &c->ip6.gw))
-			addr6.sin6_addr	= in6addr_loopback;
+	if (!(tgt = flow_target(c, flow, IPPROTO_TCP)))
+		goto cancel;
+
+	if (flow->f.pif[TGTSIDE] != PIF_HOST) {
+		flow_err(flow, "No support for forwarding TCP from %s to %s",
+			 pif_name(flow->f.pif[INISIDE]),
+			 pif_name(flow->f.pif[TGTSIDE]));
+		goto cancel;
 	}
 
-	if (af == AF_INET6 && IN6_IS_ADDR_LINKLOCAL(&addr6.sin6_addr)) {
-		struct sockaddr_in6 addr6_ll = {
-			.sin6_family = AF_INET6,
-			.sin6_addr = c->ip6.addr_ll,
-			.sin6_scope_id = c->ifi6,
-		};
-		if (bind(s, (struct sockaddr *)&addr6_ll, sizeof(addr6_ll))) {
-			close(s);
-			return;
-		}
+	conn = FLOW_SET_TYPE(flow, FLOW_TCP, tcp);
+
+	if (!inany_is_unicast(&ini->eaddr) || ini->eport == 0 ||
+	    !inany_is_unicast(&ini->oaddr) || ini->oport == 0) {
+		char sstr[INANY_ADDRSTRLEN], dstr[INANY_ADDRSTRLEN];
+
+		debug("Invalid endpoint in TCP SYN: %s:%hu -> %s:%hu",
+		      inany_ntop(&ini->eaddr, sstr, sizeof(sstr)), ini->eport,
+		      inany_ntop(&ini->oaddr, dstr, sizeof(dstr)), ini->oport);
+		goto cancel;
 	}
 
-	conn = CONN(c->tcp.conn_count++);
-	conn->c.spliced = false;
+	if ((s = tcp_conn_sock(af)) < 0)
+		goto cancel;
+
+	pif_sockaddr(c, &sa, &sl, PIF_HOST, &tgt->eaddr, tgt->eport);
+
+	/* Use bind() to check if the target address is local (EADDRINUSE or
+	 * similar) and already bound, and set the LOCAL flag in that case.
+	 *
+	 * If bind() succeeds, in general, we could infer that nobody (else) is
+	 * listening on that address and port and reset the connection attempt
+	 * early, but we can't rely on that if non-local binds are enabled,
+	 * because bind() would succeed for any non-local address we can reach.
+	 *
+	 * So, if bind() succeeds, close the socket, get a new one, and proceed.
+	 */
+	if (bind(s, &sa.sa, sl)) {
+		if (errno != EADDRNOTAVAIL && errno != EACCES)
+			conn_flag(c, conn, LOCAL);
+	} else {
+		/* Not a local, bound destination, inconclusive test */
+		close(s);
+		if ((s = tcp_conn_sock(af)) < 0)
+			goto cancel;
+	}
+
 	conn->sock = s;
 	conn->timer = -1;
+	conn->listening_sock = -1;
 	conn_event(c, conn, TAP_SYN_RCVD);
 
 	conn->wnd_to_tap = WINDOW_DEFAULT;
 
 	mss = tcp_conn_tap_mss(conn, opts, optlen);
 	if (setsockopt(s, SOL_TCP, TCP_MAXSEG, &mss, sizeof(mss)))
-		trace("TCP: failed to set TCP_MAXSEG on socket %i", s);
+		flow_trace(conn, "failed to set TCP_MAXSEG on socket %i", s);
 	MSS_SET(conn, mss);
 
 	tcp_get_tap_ws(conn, opts, optlen);
@@ -2080,44 +1516,20 @@ static void tcp_conn_from_tap(struct ctx *c, int af, const void *addr,
 	if (!(conn->wnd_from_tap = (htons(th->window) >> conn->ws_from_tap)))
 		conn->wnd_from_tap = 1;
 
-	inany_from_af(&conn->addr, af, addr);
-
-	if (af == AF_INET) {
-		sa = (struct sockaddr *)&addr4;
-		sl = sizeof(addr4);
-	} else {
-		sa = (struct sockaddr *)&addr6;
-		sl = sizeof(addr6);
-	}
-
-	conn->sock_port = ntohs(th->dest);
-	conn->tap_port = ntohs(th->source);
-
 	conn->seq_init_from_tap = ntohl(th->seq);
 	conn->seq_from_tap = conn->seq_init_from_tap + 1;
 	conn->seq_ack_to_tap = conn->seq_from_tap;
 
-	tcp_seq_init(c, conn, now);
+	hash = flow_hash_insert(c, TAP_SIDX(conn));
+	conn->seq_to_tap = tcp_init_seq(hash, now);
 	conn->seq_ack_from_tap = conn->seq_to_tap;
 
-	tcp_hash_insert(c, conn);
+	tcp_bind_outbound(c, conn, s);
 
-	if (!bind(s, sa, sl)) {
-		tcp_rst(c, conn);	/* Nobody is listening then */
-		return;
-	}
-	if (errno != EADDRNOTAVAIL && errno != EACCES)
-		conn_flag(c, conn, LOCAL);
-
-	if ((af == AF_INET &&  !IN4_IS_ADDR_LOOPBACK(&addr4.sin_addr)) ||
-	    (af == AF_INET6 && !IN6_IS_ADDR_LOOPBACK(&addr6.sin6_addr) &&
-			       !IN6_IS_ADDR_LINKLOCAL(&addr6.sin6_addr)))
-		tcp_bind_outbound(c, s, af);
-
-	if (connect(s, sa, sl)) {
+	if (connect(s, &sa.sa, sl)) {
 		if (errno != EINPROGRESS) {
 			tcp_rst(c, conn);
-			return;
+			goto cancel;
 		}
 
 		tcp_get_sndbuf(conn);
@@ -2125,22 +1537,47 @@ static void tcp_conn_from_tap(struct ctx *c, int af, const void *addr,
 		tcp_get_sndbuf(conn);
 
 		if (tcp_send_flag(c, conn, SYN | ACK))
-			return;
+			goto cancel;
 
 		conn_event(c, conn, TAP_SYN_ACK_SENT);
 	}
 
 	tcp_epoll_ctl(c, conn);
+
+	if (c->mode == MODE_VU) { /* To rebind to same oport after migration */
+		sl = sizeof(sa);
+		if (!getsockname(s, &sa.sa, &sl))
+			inany_from_sockaddr(&tgt->oaddr, &tgt->oport, &sa);
+		else
+			err_perror("Can't get local address for socket %i", s);
+	}
+
+	FLOW_ACTIVATE(conn);
+	return;
+
+cancel:
+	if (s >= 0)
+		close(s);
+	flow_alloc_cancel(flow);
 }
 
 /**
- * tcp_sock_consume() - Consume (discard) data from buffer, update ACK sequence
+ * tcp_sock_consume() - Consume (discard) data from buffer
  * @conn:	Connection pointer
  * @ack_seq:	ACK sequence, host order
  *
  * Return: 0 on success, negative error code from recv() on failure
  */
-static int tcp_sock_consume(struct tcp_tap_conn *conn, uint32_t ack_seq)
+#ifdef VALGRIND
+/* valgrind doesn't realise that passing a NULL buffer to recv() is ok if using
+ * MSG_TRUNC.  We have a suppression for this in the tests, but it relies on
+ * valgrind being able to see the tcp_sock_consume() stack frame, which it won't
+ * if this gets inlined.  This has a single caller making it a likely inlining
+ * candidate, and certain compiler versions will do so even at -O0.
+ */
+ __attribute__((noinline))
+#endif /* VALGRIND */
+static int tcp_sock_consume(const struct tcp_tap_conn *conn, uint32_t ack_seq)
 {
 	/* Simply ignore out-of-order ACKs: we already consumed the data we
 	 * needed from the buffer, and we won't rewind back to a lower ACK
@@ -2158,40 +1595,6 @@ static int tcp_sock_consume(struct tcp_tap_conn *conn, uint32_t ack_seq)
 }
 
 /**
- * tcp_data_to_tap() - Finalise (queue) highest-numbered scatter-gather buffer
- * @c:		Execution context
- * @conn:	Connection pointer
- * @plen:	Payload length at L4
- * @no_csum:	Don't compute IPv4 checksum, use the one from previous buffer
- * @seq:	Sequence number to be sent
- * @now:	Current timestamp
- */
-static void tcp_data_to_tap(struct ctx *c, struct tcp_tap_conn *conn,
-			    ssize_t plen, int no_csum, uint32_t seq)
-{
-	struct iovec *iov;
-
-	if (CONN_V4(conn)) {
-		struct tcp4_l2_buf_t *b = &tcp4_l2_buf[tcp4_l2_buf_used];
-		uint16_t *check = no_csum ? &(b - 1)->iph.check : NULL;
-
-		iov = tcp4_l2_iov + tcp4_l2_buf_used++;
-		iov->iov_len = tcp_l2_buf_fill_headers(c, conn, b, plen,
-						       check, seq);
-		if (tcp4_l2_buf_used > ARRAY_SIZE(tcp4_l2_buf) - 1)
-			tcp_l2_data_buf_flush(c);
-	} else if (CONN_V6(conn)) {
-		struct tcp6_l2_buf_t *b = &tcp6_l2_buf[tcp6_l2_buf_used];
-
-		iov = tcp6_l2_iov + tcp6_l2_buf_used++;
-		iov->iov_len = tcp_l2_buf_fill_headers(c, conn, b, plen,
-						       NULL, seq);
-		if (tcp6_l2_buf_used > ARRAY_SIZE(tcp6_l2_buf) - 1)
-			tcp_l2_data_buf_flush(c);
-	}
-}
-
-/**
  * tcp_data_from_sock() - Handle new data from socket, queue to tap, in window
  * @c:		Execution context
  * @conn:	Connection pointer
@@ -2200,124 +1603,12 @@ static void tcp_data_to_tap(struct ctx *c, struct tcp_tap_conn *conn,
  *
  * #syscalls recvmsg
  */
-static int tcp_data_from_sock(struct ctx *c, struct tcp_tap_conn *conn)
+static int tcp_data_from_sock(const struct ctx *c, struct tcp_tap_conn *conn)
 {
-	uint32_t wnd_scaled = conn->wnd_from_tap << conn->ws_from_tap;
-	int fill_bufs, send_bufs = 0, last_len, iov_rem = 0;
-	int sendlen, len, plen, v4 = CONN_V4(conn);
-	int s = conn->sock, i, ret = 0;
-	struct msghdr mh_sock = { 0 };
-	uint16_t mss = MSS_GET(conn);
-	uint32_t already_sent;
-	struct iovec *iov;
+	if (c->mode == MODE_VU)
+		return tcp_vu_data_from_sock(c, conn);
 
-	already_sent = conn->seq_to_tap - conn->seq_ack_from_tap;
-
-	if (SEQ_LT(already_sent, 0)) {
-		/* RFC 761, section 2.1. */
-		trace("TCP: ACK sequence gap: ACK for %u, sent: %u",
-		      conn->seq_ack_from_tap, conn->seq_to_tap);
-		conn->seq_to_tap = conn->seq_ack_from_tap;
-		already_sent = 0;
-	}
-
-	if (!wnd_scaled || already_sent >= wnd_scaled) {
-		conn_flag(c, conn, STALLED);
-		conn_flag(c, conn, ACK_FROM_TAP_DUE);
-		return 0;
-	}
-
-	/* Set up buffer descriptors we'll fill completely and partially. */
-	fill_bufs = DIV_ROUND_UP(wnd_scaled - already_sent, mss);
-	if (fill_bufs > TCP_FRAMES) {
-		fill_bufs = TCP_FRAMES;
-		iov_rem = 0;
-	} else {
-		iov_rem = (wnd_scaled - already_sent) % mss;
-	}
-
-	mh_sock.msg_iov = iov_sock;
-	mh_sock.msg_iovlen = fill_bufs + 1;
-
-	iov_sock[0].iov_base = tcp_buf_discard;
-	iov_sock[0].iov_len = already_sent;
-
-	if (( v4 && tcp4_l2_buf_used + fill_bufs > ARRAY_SIZE(tcp4_l2_buf)) ||
-	    (!v4 && tcp6_l2_buf_used + fill_bufs > ARRAY_SIZE(tcp6_l2_buf))) {
-		tcp_l2_data_buf_flush(c);
-
-		/* Silence Coverity CWE-125 false positive */
-		tcp4_l2_buf_used = tcp6_l2_buf_used = 0;
-	}
-
-	for (i = 0, iov = iov_sock + 1; i < fill_bufs; i++, iov++) {
-		if (v4)
-			iov->iov_base = &tcp4_l2_buf[tcp4_l2_buf_used + i].data;
-		else
-			iov->iov_base = &tcp6_l2_buf[tcp6_l2_buf_used + i].data;
-		iov->iov_len = mss;
-	}
-	if (iov_rem)
-		iov_sock[fill_bufs].iov_len = iov_rem;
-
-	/* Receive into buffers, don't dequeue until acknowledged by guest. */
-	do
-		len = recvmsg(s, &mh_sock, MSG_PEEK);
-	while (len < 0 && errno == EINTR);
-
-	if (len < 0)
-		goto err;
-
-	if (!len) {
-		if ((conn->events & (SOCK_FIN_RCVD | TAP_FIN_SENT)) == SOCK_FIN_RCVD) {
-			if ((ret = tcp_send_flag(c, conn, FIN | ACK))) {
-				tcp_rst(c, conn);
-				return ret;
-			}
-
-			conn_event(c, conn, TAP_FIN_SENT);
-		}
-
-		return 0;
-	}
-
-	sendlen = len - already_sent;
-	if (sendlen <= 0) {
-		conn_flag(c, conn, STALLED);
-		return 0;
-	}
-
-	conn_flag(c, conn, ~STALLED);
-
-	send_bufs = DIV_ROUND_UP(sendlen, mss);
-	last_len = sendlen - (send_bufs - 1) * mss;
-
-	/* Likely, some new data was acked too. */
-	tcp_update_seqack_wnd(c, conn, 0, NULL);
-
-	/* Finally, queue to tap */
-	plen = mss;
-	for (i = 0; i < send_bufs; i++) {
-		int no_csum = i && i != send_bufs - 1 && tcp4_l2_buf_used;
-
-		if (i == send_bufs - 1)
-			plen = last_len;
-
-		tcp_data_to_tap(c, conn, plen, no_csum, conn->seq_to_tap);
-		conn->seq_to_tap += plen;
-	}
-
-	conn_flag(c, conn, ACK_FROM_TAP_DUE);
-
-	return 0;
-
-err:
-	if (errno != EAGAIN && errno != EWOULDBLOCK) {
-		ret = -errno;
-		tcp_rst(c, conn);
-	}
-
-	return ret;
+	return tcp_buf_data_from_sock(c, conn);
 }
 
 /**
@@ -2325,11 +1616,14 @@ err:
  * @c:		Execution context
  * @conn:	Connection pointer
  * @p:		Pool of TCP packets, with TCP headers
+ * @idx:	Index of first data packet in pool
  *
  * #syscalls sendmsg
+ *
+ * Return: count of consumed packets
  */
-static void tcp_data_from_tap(struct ctx *c, struct tcp_tap_conn *conn,
-			      const struct pool *p)
+static int tcp_data_from_tap(const struct ctx *c, struct tcp_tap_conn *conn,
+			     const struct pool *p, int idx)
 {
 	int i, iov_i, ack = 0, fin = 0, retr = 0, keep = -1, partial_send = 0;
 	uint16_t max_ack_seq_wnd = conn->wnd_from_tap;
@@ -2340,36 +1634,28 @@ static void tcp_data_from_tap(struct ctx *c, struct tcp_tap_conn *conn,
 	ssize_t n;
 
 	if (conn->events == CLOSED)
-		return;
+		return p->count - idx;
 
 	ASSERT(conn->events & ESTABLISHED);
 
-	for (i = 0, iov_i = 0; i < (int)p->count; i++) {
+	for (i = idx, iov_i = 0; i < (int)p->count; i++) {
 		uint32_t seq, seq_offset, ack_seq;
-		struct tcphdr *th;
+		const struct tcphdr *th;
 		char *data;
 		size_t off;
 
-		if (!packet_get(p, i, 0, 0, &len)) {
-			tcp_rst(c, conn);
-			return;
-		}
-
-		th = packet_get(p, i, 0, sizeof(*th), NULL);
-		if (!th) {
-			tcp_rst(c, conn);
-			return;
-		}
+		th = packet_get(p, i, 0, sizeof(*th), &len);
+		if (!th)
+			return -1;
+		len += sizeof(*th);
 
 		off = th->doff * 4UL;
-		if (off < sizeof(*th) || off > len) {
-			tcp_rst(c, conn);
-			return;
-		}
+		if (off < sizeof(*th) || off > len)
+			return -1;
 
 		if (th->rst) {
 			conn_event(c, conn, CLOSED);
-			return;
+			return 1;
 		}
 
 		len -= off;
@@ -2378,6 +1664,22 @@ static void tcp_data_from_tap(struct ctx *c, struct tcp_tap_conn *conn,
 			continue;
 
 		seq = ntohl(th->seq);
+		if (SEQ_LT(seq, conn->seq_from_tap) && len <= 1) {
+			flow_trace(conn,
+				   "keep-alive sequence: %u, previous: %u",
+				   seq, conn->seq_from_tap);
+
+			tcp_send_flag(c, conn, ACK);
+			tcp_timer_ctl(c, conn);
+
+			if (p->count == 1) {
+				tcp_tap_window_update(conn, ntohs(th->window));
+				return 1;
+			}
+
+			continue;
+		}
+
 		ack_seq = ntohl(th->ack_seq);
 
 		if (th->ack) {
@@ -2445,17 +1747,21 @@ static void tcp_data_from_tap(struct ctx *c, struct tcp_tap_conn *conn,
 			i = keep - 1;
 	}
 
-	tcp_clamp_window(c, conn, max_ack_seq_wnd);
-
 	/* On socket flush failure, pretend there was no ACK, try again later */
 	if (ack && !tcp_sock_consume(conn, max_ack_seq))
 		tcp_update_seqack_from_tap(c, conn, max_ack_seq);
 
+	tcp_tap_window_update(conn, max_ack_seq_wnd);
+
 	if (retr) {
-		trace("TCP: fast re-transmit, ACK: %u, previous sequence: %u",
-		      max_ack_seq, conn->seq_to_tap);
-		conn->seq_ack_from_tap = max_ack_seq;
+		flow_trace(conn,
+			   "fast re-transmit, ACK: %u, previous sequence: %u",
+			   max_ack_seq, conn->seq_to_tap);
 		conn->seq_to_tap = max_ack_seq;
+		if (tcp_set_peek_offset(conn, 0)) {
+			tcp_rst(c, conn);
+			return -1;
+		}
 		tcp_data_from_sock(c, conn);
 	}
 
@@ -2480,10 +1786,10 @@ eintr:
 
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			tcp_send_flag(c, conn, ACK_IF_NEEDED);
-			return;
+			return p->count - idx;
+
 		}
-		tcp_rst(c, conn);
-		return;
+		return -1;
 	}
 
 	if (n < (int)(seq_from_tap - conn->seq_from_tap)) {
@@ -2502,9 +1808,9 @@ out:
 		 */
 		if (conn->seq_dup_ack_approx != (conn->seq_from_tap & 0xff)) {
 			conn->seq_dup_ack_approx = conn->seq_from_tap & 0xff;
-			tcp_send_flag(c, conn, DUP_ACK);
+			tcp_send_flag(c, conn, ACK | DUP_ACK);
 		}
-		return;
+		return p->count - idx;
 	}
 
 	if (ack && conn->events & TAP_FIN_SENT &&
@@ -2518,6 +1824,8 @@ out:
 	} else {
 		tcp_send_flag(c, conn, ACK_IF_NEEDED);
 	}
+
+	return p->count - idx;
 }
 
 /**
@@ -2528,11 +1836,12 @@ out:
  * @opts:	Pointer to start of options
  * @optlen:	Bytes in options: caller MUST ensure available length
  */
-static void tcp_conn_from_sock_finish(struct ctx *c, struct tcp_tap_conn *conn,
+static void tcp_conn_from_sock_finish(const struct ctx *c,
+				      struct tcp_tap_conn *conn,
 				      const struct tcphdr *th,
 				      const char *opts, size_t optlen)
 {
-	tcp_clamp_window(c, conn, ntohs(th->window));
+	tcp_tap_window_update(conn, ntohs(th->window));
 	tcp_get_tap_ws(conn, opts, optlen);
 
 	/* First value is not scaled */
@@ -2546,84 +1855,176 @@ static void tcp_conn_from_sock_finish(struct ctx *c, struct tcp_tap_conn *conn,
 	conn->seq_ack_to_tap = conn->seq_from_tap;
 
 	conn_event(c, conn, ESTABLISHED);
+	if (tcp_set_peek_offset(conn, 0)) {
+		tcp_rst(c, conn);
+		return;
+	}
+
+	tcp_send_flag(c, conn, ACK);
 
 	/* The client might have sent data already, which we didn't
 	 * dequeue waiting for SYN,ACK from tap -- check now.
 	 */
 	tcp_data_from_sock(c, conn);
-	tcp_send_flag(c, conn, ACK_IF_NEEDED);
+}
+
+/**
+ * tcp_rst_no_conn() - Send RST in response to a packet with no connection
+ * @c:		Execution context
+ * @af:		Address family, AF_INET or AF_INET6
+ * @saddr:	Source address of the packet we're responding to
+ * @daddr:	Destination address of the packet we're responding to
+ * @flow_lbl:	IPv6 flow label (ignored for IPv4)
+ * @th:		TCP header of the packet we're responding to
+ * @l4len:	Packet length, including TCP header
+ */
+static void tcp_rst_no_conn(const struct ctx *c, int af,
+			    const void *saddr, const void *daddr,
+			    uint32_t flow_lbl,
+			    const struct tcphdr *th, size_t l4len)
+{
+	struct iov_tail payload = IOV_TAIL(NULL, 0, 0);
+	struct tcphdr *rsth;
+	char buf[USHRT_MAX];
+	uint32_t psum = 0;
+	size_t rst_l2len;
+
+	/* Don't respond to RSTs without a connection */
+	if (th->rst)
+		return;
+
+	if (af == AF_INET) {
+		struct iphdr *ip4h = tap_push_l2h(c, buf, ETH_P_IP);
+		const struct in_addr *rst_src = daddr;
+		const struct in_addr *rst_dst = saddr;
+
+		rsth = tap_push_ip4h(ip4h, *rst_src, *rst_dst,
+				     sizeof(*rsth), IPPROTO_TCP);
+		psum = proto_ipv4_header_psum(sizeof(*rsth), IPPROTO_TCP,
+					      *rst_src, *rst_dst);
+
+	} else {
+		struct ipv6hdr *ip6h = tap_push_l2h(c, buf, ETH_P_IPV6);
+		const struct in6_addr *rst_src = daddr;
+		const struct in6_addr *rst_dst = saddr;
+
+		rsth = tap_push_ip6h(ip6h, rst_src, rst_dst,
+				     sizeof(*rsth), IPPROTO_TCP, flow_lbl);
+		psum = proto_ipv6_header_psum(sizeof(*rsth), IPPROTO_TCP,
+					      rst_src, rst_dst);
+	}
+
+	memset(rsth, 0, sizeof(*rsth));
+
+	rsth->source = th->dest;
+	rsth->dest = th->source;
+	rsth->rst = 1;
+	rsth->doff = sizeof(*rsth) / 4UL;
+
+	/* Sequence matching logic from RFC 9293 section 3.10.7.1 */
+	if (th->ack) {
+		rsth->seq = th->ack_seq;
+	} else {
+		size_t dlen = l4len - th->doff * 4UL;
+		uint32_t ack = ntohl(th->seq) + dlen;
+
+		rsth->ack_seq = htonl(ack);
+		rsth->ack = 1;
+	}
+
+	tcp_update_csum(psum, rsth, &payload);
+	rst_l2len = ((char *)rsth - buf) + sizeof(*rsth);
+	tap_send_single(c, buf, rst_l2len);
 }
 
 /**
  * tcp_tap_handler() - Handle packets from tap and state transitions
  * @c:		Execution context
+ * @pif:	pif on which the packet is arriving
  * @af:		Address family, AF_INET or AF_INET6
- * @addr:	Destination address
+ * @saddr:	Source address
+ * @daddr:	Destination address
+ * @flow_lbl:	IPv6 flow label (ignored for IPv4)
  * @p:		Pool of TCP packets, with TCP headers
+ * @idx:	Index of first packet in pool to process
  * @now:	Current timestamp
  *
  * Return: count of consumed packets
  */
-int tcp_tap_handler(struct ctx *c, int af, const void *addr,
-		    const struct pool *p, const struct timespec *now)
+int tcp_tap_handler(const struct ctx *c, uint8_t pif, sa_family_t af,
+		    const void *saddr, const void *daddr, uint32_t flow_lbl,
+		    const struct pool *p, int idx, const struct timespec *now)
 {
 	struct tcp_tap_conn *conn;
+	const struct tcphdr *th;
 	size_t optlen, len;
-	struct tcphdr *th;
+	const char *opts;
+	union flow *flow;
+	flow_sidx_t sidx;
 	int ack_due = 0;
-	char *opts;
+	int count;
 
-	if (!packet_get(p, 0, 0, 0, &len))
-		return 1;
+	(void)pif;
 
-	th = packet_get(p, 0, 0, sizeof(*th), NULL);
+	th = packet_get(p, idx, 0, sizeof(*th), &len);
 	if (!th)
 		return 1;
+	len += sizeof(*th);
 
 	optlen = th->doff * 4UL - sizeof(*th);
 	/* Static checkers might fail to see this: */
 	optlen = MIN(optlen, ((1UL << 4) /* from doff width */ - 6) * 4UL);
-	opts = packet_get(p, 0, sizeof(*th), optlen, NULL);
+	opts = packet_get(p, idx, sizeof(*th), optlen, NULL);
 
-	conn = tcp_hash_lookup(c, af, addr, htons(th->source), htons(th->dest));
+	sidx = flow_lookup_af(c, IPPROTO_TCP, PIF_TAP, af, saddr, daddr,
+			      ntohs(th->source), ntohs(th->dest));
+	flow = flow_at_sidx(sidx);
 
 	/* New connection from tap */
-	if (!conn) {
+	if (!flow) {
 		if (opts && th->syn && !th->ack)
-			tcp_conn_from_tap(c, af, addr, th, opts, optlen, now);
+			tcp_conn_from_tap(c, af, saddr, daddr, th,
+					  opts, optlen, now);
+		else
+			tcp_rst_no_conn(c, af, saddr, daddr, flow_lbl, th, len);
 		return 1;
 	}
 
-	trace("TCP: packet length %lu from tap for index %lu", len, CONN_IDX(conn));
+	ASSERT(flow->f.type == FLOW_TCP);
+	ASSERT(pif_at_sidx(sidx) == PIF_TAP);
+	conn = &flow->tcp;
+
+	flow_trace(conn, "packet length %zu from tap", len);
 
 	if (th->rst) {
 		conn_event(c, conn, CLOSED);
-		return p->count;
+		return 1;
 	}
 
 	if (th->ack && !(conn->events & ESTABLISHED))
 		tcp_update_seqack_from_tap(c, conn, ntohl(th->ack_seq));
 
-	conn_flag(c, conn, ~STALLED);
-
 	/* Establishing connection from socket */
 	if (conn->events & SOCK_ACCEPTED) {
-		if (th->syn && th->ack && !th->fin)
+		if (th->syn && th->ack && !th->fin) {
 			tcp_conn_from_sock_finish(c, conn, th, opts, optlen);
-		else
-			tcp_rst(c, conn);
+			return 1;
+		}
 
-		return 1;
+		goto reset;
 	}
 
 	/* Establishing connection from tap */
 	if (conn->events & TAP_SYN_RCVD) {
-		if (!(conn->events & TAP_SYN_ACK_SENT)) {
-			tcp_rst(c, conn);
-			return p->count;
-		}
+		if (th->syn && !th->ack && !th->fin)
+			return 1;	/* SYN retry: ignore and keep waiting */
+
+		if (!(conn->events & TAP_SYN_ACK_SENT))
+			goto reset;
 
 		conn_event(c, conn, ESTABLISHED);
+		if (tcp_set_peek_offset(conn, 0))
+			goto reset;
 
 		if (th->fin) {
 			conn->seq_from_tap++;
@@ -2632,25 +2033,26 @@ int tcp_tap_handler(struct ctx *c, int af, const void *addr,
 			tcp_send_flag(c, conn, ACK);
 			conn_event(c, conn, SOCK_FIN_SENT);
 
-			return p->count;
+			return 1;
 		}
 
-		if (!th->ack) {
-			tcp_rst(c, conn);
-			return p->count;
-		}
+		if (!th->ack)
+			goto reset;
 
-		tcp_clamp_window(c, conn, ntohs(th->window));
+		tcp_tap_window_update(conn, ntohs(th->window));
 
 		tcp_data_from_sock(c, conn);
 
-		if (p->count == 1)
+		if (p->count - idx == 1)
 			return 1;
 	}
 
 	/* Established connections not accepting data from tap */
 	if (conn->events & TAP_FIN_RCVD) {
+		tcp_sock_consume(conn, ntohl(th->ack_seq));
 		tcp_update_seqack_from_tap(c, conn, ntohl(th->ack_seq));
+		tcp_tap_window_update(conn, ntohs(th->window));
+		tcp_data_from_sock(c, conn);
 
 		if (conn->events & SOCK_FIN_RCVD &&
 		    conn->seq_ack_from_tap == conn->seq_to_tap)
@@ -2660,21 +2062,51 @@ int tcp_tap_handler(struct ctx *c, int af, const void *addr,
 	}
 
 	/* Established connections accepting data from tap */
-	tcp_data_from_tap(c, conn, p);
+	count = tcp_data_from_tap(c, conn, p, idx);
+	if (count == -1)
+		goto reset;
+
+	conn_flag(c, conn, ~STALLED);
+
 	if (conn->seq_ack_to_tap != conn->seq_from_tap)
 		ack_due = 1;
 
 	if ((conn->events & TAP_FIN_RCVD) && !(conn->events & SOCK_FIN_SENT)) {
+		socklen_t sl;
+		struct tcp_info tinfo;
+
 		shutdown(conn->sock, SHUT_WR);
 		conn_event(c, conn, SOCK_FIN_SENT);
 		tcp_send_flag(c, conn, ACK);
 		ack_due = 0;
+
+		/* If we received a FIN, but the socket is in TCP_ESTABLISHED
+		 * state, it must be a migrated socket. The kernel saw the FIN
+		 * on the source socket, but not on the target socket.
+		 *
+		 * Approximate the effect of that FIN: as we're sending a FIN
+		 * out ourselves, the socket is now in a state equivalent to
+		 * LAST_ACK. Now that we sent the FIN out, close it with a RST.
+		 */
+		sl = sizeof(tinfo);
+		getsockopt(conn->sock, SOL_TCP, TCP_INFO, &tinfo, &sl);
+		if (tinfo.tcpi_state == TCP_ESTABLISHED &&
+		    conn->events & SOCK_FIN_RCVD)
+			goto reset;
 	}
 
 	if (ack_due)
 		conn_flag(c, conn, ACK_TO_TAP_DUE);
 
-	return p->count;
+	return count;
+
+reset:
+	/* Something's gone wrong, so reset the connection.  We discard
+	 * remaining packets in the batch, since they'd be invalidated when our
+	 * RST is received, even if otherwise good.
+	 */
+	tcp_rst(c, conn);
+	return p->count - idx;
 }
 
 /**
@@ -2682,7 +2114,7 @@ int tcp_tap_handler(struct ctx *c, int af, const void *addr,
  * @c:		Execution context
  * @conn:	Connection pointer
  */
-static void tcp_connect_finish(struct ctx *c, struct tcp_tap_conn *conn)
+static void tcp_connect_finish(const struct ctx *c, struct tcp_tap_conn *conn)
 {
 	socklen_t sl;
 	int so;
@@ -2701,60 +2133,26 @@ static void tcp_connect_finish(struct ctx *c, struct tcp_tap_conn *conn)
 }
 
 /**
- * tcp_snat_inbound() - Translate source address for inbound data if needed
- * @c:		Execution context
- * @addr:	Source address of inbound packet/connection
- */
-static void tcp_snat_inbound(const struct ctx *c, union inany_addr *addr)
-{
-	struct in_addr *addr4 = inany_v4(addr);
-
-	if (addr4) {
-		if (IN4_IS_ADDR_LOOPBACK(addr4) ||
-		    IN4_IS_ADDR_UNSPECIFIED(addr4) ||
-		    IN4_ARE_ADDR_EQUAL(addr4, &c->ip4.addr_seen))
-			*addr4 = c->ip4.gw;
-	} else {
-		struct in6_addr *addr6 = &addr->a6;
-
-		if (IN6_IS_ADDR_LOOPBACK(addr6) ||
-		    IN6_ARE_ADDR_EQUAL(addr6, &c->ip6.addr_seen) ||
-		    IN6_ARE_ADDR_EQUAL(addr6, &c->ip6.addr)) {
-			if (IN6_IS_ADDR_LINKLOCAL(&c->ip6.gw))
-				*addr6 = c->ip6.gw;
-			else
-				*addr6 = c->ip6.addr_ll;
-		}
-	}
-}
-
-/**
  * tcp_tap_conn_from_sock() - Initialize state for non-spliced connection
  * @c:		Execution context
- * @ref:	epoll reference of listening socket
- * @conn:	connection structure to initialize
+ * @flow:	flow to initialise
  * @s:		Accepted socket
  * @sa:		Peer socket address (from accept())
  * @now:	Current timestamp
  */
-static void tcp_tap_conn_from_sock(struct ctx *c, union epoll_ref ref,
-				   struct tcp_tap_conn *conn, int s,
-				   struct sockaddr *sa,
-				   const struct timespec *now)
+static void tcp_tap_conn_from_sock(const struct ctx *c, union flow *flow,
+				   int s, const struct timespec *now)
 {
-	conn->c.spliced = false;
+	struct tcp_tap_conn *conn = FLOW_SET_TYPE(flow, FLOW_TCP, tcp);
+	uint64_t hash;
+
 	conn->sock = s;
 	conn->timer = -1;
 	conn->ws_to_tap = conn->ws_from_tap = 0;
 	conn_event(c, conn, SOCK_ACCEPTED);
 
-	inany_from_sockaddr(&conn->addr, &conn->sock_port, sa);
-	conn->tap_port = ref.r.p.tcp.tcp.index;
-
-	tcp_snat_inbound(c, &conn->addr);
-
-	tcp_seq_init(c, conn, now);
-	tcp_hash_insert(c, conn);
+	hash = flow_hash_insert(c, TAP_SIDX(conn));
+	conn->seq_to_tap = tcp_init_seq(hash, now);
 
 	conn->seq_ack_from_tap = conn->seq_to_tap;
 
@@ -2764,46 +2162,86 @@ static void tcp_tap_conn_from_sock(struct ctx *c, union epoll_ref ref,
 	conn_flag(c, conn, ACK_FROM_TAP_DUE);
 
 	tcp_get_sndbuf(conn);
+
+	FLOW_ACTIVATE(conn);
 }
 
 /**
- * tcp_conn_from_sock() - Handle new connection request from listening socket
+ * tcp_listen_handler() - Handle new connection request from listening socket
  * @c:		Execution context
  * @ref:	epoll reference of listening socket
  * @now:	Current timestamp
  */
-static void tcp_conn_from_sock(struct ctx *c, union epoll_ref ref,
-			       const struct timespec *now)
+void tcp_listen_handler(const struct ctx *c, union epoll_ref ref,
+			const struct timespec *now)
 {
-	struct sockaddr_storage sa;
-	union tcp_conn *conn;
-	socklen_t sl;
+	struct tcp_tap_conn *conn;
+	union sockaddr_inany sa;
+	socklen_t sl = sizeof(sa);
+	struct flowside *ini;
+	union flow *flow;
 	int s;
 
-	ASSERT(ref.r.p.tcp.tcp.listen);
+	ASSERT(!c->no_tcp);
 
-	if (c->tcp.conn_count >= TCP_MAX_CONNS)
+	if (!(flow = flow_alloc()))
 		return;
 
-	sl = sizeof(sa);
-	/* FIXME: Workaround clang-tidy not realizing that accept4()
-	 * writes the socket address.  See
-	 * https://github.com/llvm/llvm-project/issues/58992
-	 */
-	memset(&sa, 0, sizeof(struct sockaddr_in6));
-	s = accept4(ref.r.s, (struct sockaddr *)&sa, &sl, SOCK_NONBLOCK);
+	s = accept4(ref.fd, &sa.sa, &sl, SOCK_NONBLOCK);
 	if (s < 0)
-		return;
+		goto cancel;
 
-	conn = tc + c->tcp.conn_count++;
+	conn = (struct tcp_tap_conn *)flow;
+	conn->listening_sock = ref.fd;
 
-	if (c->mode == MODE_PASTA &&
-	    tcp_splice_conn_from_sock(c, ref, &conn->splice,
-				      s, (struct sockaddr *)&sa))
-		return;
+	tcp_sock_set_nodelay(s);
 
-	tcp_tap_conn_from_sock(c, ref, &conn->tap, s,
-			       (struct sockaddr *)&sa, now);
+	/* FIXME: If useful: when the listening port has a specific bound
+	 * address, record that as our address, as implemented for vhost-user
+	 * mode only, below.
+	 */
+	ini = flow_initiate_sa(flow, ref.tcp_listen.pif, &sa,
+			       ref.tcp_listen.port);
+
+	if (c->mode == MODE_VU) { /* Rebind to same address after migration */
+		if (!getsockname(s, &sa.sa, &sl))
+			inany_from_sockaddr(&ini->oaddr, &ini->oport, &sa);
+		else
+			err_perror("Can't get local address for socket %i", s);
+	}
+
+	if (!inany_is_unicast(&ini->eaddr) || ini->eport == 0) {
+		char sastr[SOCKADDR_STRLEN];
+
+		err("Invalid endpoint from TCP accept(): %s",
+		    sockaddr_ntop(&sa, sastr, sizeof(sastr)));
+		goto cancel;
+	}
+
+	if (!flow_target(c, flow, IPPROTO_TCP))
+		goto cancel;
+
+	switch (flow->f.pif[TGTSIDE]) {
+	case PIF_SPLICE:
+	case PIF_HOST:
+		tcp_splice_conn_from_sock(c, flow, s);
+		break;
+
+	case PIF_TAP:
+		tcp_tap_conn_from_sock(c, flow, s, now);
+		break;
+
+	default:
+		flow_err(flow, "No support for forwarding TCP from %s to %s",
+			 pif_name(flow->f.pif[INISIDE]),
+			 pif_name(flow->f.pif[TGTSIDE]));
+		goto cancel;
+	}
+
+	return;
+
+cancel:
+	flow_alloc_cancel(flow);
 }
 
 /**
@@ -2811,21 +2249,23 @@ static void tcp_conn_from_sock(struct ctx *c, union epoll_ref ref,
  * @c:		Execution context
  * @ref:	epoll reference of timer (not connection)
  *
- * #syscalls timerfd_gettime
+ * #syscalls timerfd_gettime arm:timerfd_gettime64 i686:timerfd_gettime64
  */
-static void tcp_timer_handler(struct ctx *c, union epoll_ref ref)
+void tcp_timer_handler(const struct ctx *c, union epoll_ref ref)
 {
-	struct tcp_tap_conn *conn = conn_at_idx(ref.r.p.tcp.tcp.index);
 	struct itimerspec check_armed = { { 0 }, { 0 } };
+	struct tcp_tap_conn *conn = &FLOW(ref.flow)->tcp;
 
-	if (!conn)
-		return;
+	ASSERT(!c->no_tcp);
+	ASSERT(conn->f.type == FLOW_TCP);
 
 	/* We don't reset timers on ~ACK_FROM_TAP_DUE, ~ACK_TO_TAP_DUE. If the
 	 * timer is currently armed, this event came from a previous setting,
 	 * and we just set the timer to a new point in the future: discard it.
 	 */
-	timerfd_gettime(conn->timer, &check_armed);
+	if (timerfd_gettime(conn->timer, &check_armed))
+		flow_perror(conn, "failed to read timer");
+
 	if (check_armed.it_value.tv_sec || check_armed.it_value.tv_nsec)
 		return;
 
@@ -2834,21 +2274,26 @@ static void tcp_timer_handler(struct ctx *c, union epoll_ref ref)
 		tcp_timer_ctl(c, conn);
 	} else if (conn->flags & ACK_FROM_TAP_DUE) {
 		if (!(conn->events & ESTABLISHED)) {
-			debug("TCP: index %li, handshake timeout", CONN_IDX(conn));
+			flow_dbg(conn, "handshake timeout");
 			tcp_rst(c, conn);
 		} else if (CONN_HAS(conn, SOCK_FIN_SENT | TAP_FIN_ACKED)) {
-			debug("TCP: index %li, FIN timeout", CONN_IDX(conn));
+			flow_dbg(conn, "FIN timeout");
 			tcp_rst(c, conn);
 		} else if (conn->retrans == TCP_MAX_RETRANS) {
-			debug("TCP: index %li, retransmissions count exceeded",
-			      CONN_IDX(conn));
+			flow_dbg(conn, "retransmissions count exceeded");
 			tcp_rst(c, conn);
 		} else {
-			debug("TCP: index %li, ACK timeout, retry", CONN_IDX(conn));
+			flow_dbg(conn, "ACK timeout, retry");
 			conn->retrans++;
 			conn->seq_to_tap = conn->seq_ack_from_tap;
-			tcp_data_from_sock(c, conn);
-			tcp_timer_ctl(c, conn);
+			if (!conn->wnd_from_tap)
+				conn->wnd_from_tap = 1; /* Zero-window probe */
+			if (tcp_set_peek_offset(conn, 0)) {
+				tcp_rst(c, conn);
+			} else {
+				tcp_data_from_sock(c, conn);
+				tcp_timer_ctl(c, conn);
+			}
 		}
 	} else {
 		struct itimerspec new = { { 0 }, { ACT_TIMEOUT, 0 } };
@@ -2860,23 +2305,30 @@ static void tcp_timer_handler(struct ctx *c, union epoll_ref ref)
 		 * case. This avoids having to preemptively reset the timer on
 		 * ~ACK_TO_TAP_DUE or ~ACK_FROM_TAP_DUE.
 		 */
-		timerfd_settime(conn->timer, 0, &new, &old);
+		if (timerfd_settime(conn->timer, 0, &new, &old))
+			flow_perror(conn, "failed to set timer");
+
 		if (old.it_value.tv_sec == ACT_TIMEOUT) {
-			debug("TCP: index %li, activity timeout", CONN_IDX(conn));
+			flow_dbg(conn, "activity timeout");
 			tcp_rst(c, conn);
 		}
 	}
 }
 
 /**
- * tcp_tap_sock_handler() - Handle new data from non-spliced socket
+ * tcp_sock_handler() - Handle new data from non-spliced socket
  * @c:		Execution context
- * @conn:	Connection state
+ * @ref:	epoll reference
  * @events:	epoll events bitmap
  */
-static void tcp_tap_sock_handler(struct ctx *c, struct tcp_tap_conn *conn,
-				 uint32_t events)
+void tcp_sock_handler(const struct ctx *c, union epoll_ref ref,
+		      uint32_t events)
 {
+	struct tcp_tap_conn *conn = conn_at_sidx(ref.flowside);
+
+	ASSERT(!c->no_tcp);
+	ASSERT(pif_at_sidx(ref.flowside) != PIF_TAP);
+
 	if (conn->events == CLOSED)
 		return;
 
@@ -2900,8 +2352,10 @@ static void tcp_tap_sock_handler(struct ctx *c, struct tcp_tap_conn *conn,
 		if (events & EPOLLIN)
 			tcp_data_from_sock(c, conn);
 
-		if (events & EPOLLOUT)
-			tcp_update_seqack_wnd(c, conn, 0, NULL);
+		if (events & EPOLLOUT) {
+			if (tcp_update_seqack_wnd(c, conn, false, NULL))
+				tcp_send_flag(c, conn, ACK);
+		}
 
 		return;
 	}
@@ -2924,96 +2378,70 @@ static void tcp_tap_sock_handler(struct ctx *c, struct tcp_tap_conn *conn,
 }
 
 /**
- * tcp_sock_handler() - Handle new data from socket, or timerfd event
+ * tcp_sock_init_one() - Initialise listening socket for address and port
  * @c:		Execution context
- * @ref:	epoll reference
- * @events:	epoll events bitmap
- * @now:	Current timestamp
- */
-void tcp_sock_handler(struct ctx *c, union epoll_ref ref, uint32_t events,
-		      const struct timespec *now)
-{
-	union tcp_conn *conn;
-
-	if (ref.r.p.tcp.tcp.timer) {
-		tcp_timer_handler(c, ref);
-		return;
-	}
-
-	if (ref.r.p.tcp.tcp.listen) {
-		tcp_conn_from_sock(c, ref, now);
-		return;
-	}
-
-	conn = tc + ref.r.p.tcp.tcp.index;
-
-	if (conn->c.spliced)
-		tcp_splice_sock_handler(c, &conn->splice, ref.r.s, events);
-	else
-		tcp_tap_sock_handler(c, &conn->tap, events);
-}
-
-/**
- * tcp_sock_init_af() - Initialise listening socket for a given af and port
- * @c:		Execution context
- * @af:		Address family to listen on
- * @port:	Port, host order
- * @addr:	Pointer to address for binding, NULL if not configured
+ * @addr:	Pointer to address for binding, NULL for dual stack any
  * @ifname:	Name of interface to bind to, NULL if not configured
+ * @port:	Port, host order
  *
  * Return: fd for the new listening socket, negative error code on failure
  */
-static int tcp_sock_init_af(const struct ctx *c, int af, in_port_t port,
-			    const struct in_addr *addr, const char *ifname)
+static int tcp_sock_init_one(const struct ctx *c, const union inany_addr *addr,
+			     const char *ifname, in_port_t port)
 {
-	in_port_t idx = port + c->tcp.fwd_in.delta[port];
-	union tcp_epoll_ref tref = { .tcp.listen = 1, .tcp.index = idx };
+	union tcp_listen_epoll_ref tref = {
+		.port = port,
+		.pif = PIF_HOST,
+	};
 	int s;
 
-	s = sock_l4(c, af, IPPROTO_TCP, addr, ifname, port, tref.u32);
+	s = pif_sock_l4(c, EPOLL_TYPE_TCP_LISTEN, PIF_HOST, addr,
+				ifname, port, tref.u32);
 
 	if (c->tcp.fwd_in.mode == FWD_AUTO) {
-		if (af == AF_INET  || af == AF_UNSPEC)
+		if (!addr || inany_v4(addr))
 			tcp_sock_init_ext[port][V4] = s < 0 ? -1 : s;
-		if (af == AF_INET6 || af == AF_UNSPEC)
+		if (!addr || !inany_v4(addr))
 			tcp_sock_init_ext[port][V6] = s < 0 ? -1 : s;
 	}
 
 	if (s < 0)
 		return s;
 
-	tcp_sock_set_bufsize(c, s);
 	return s;
 }
 
 /**
  * tcp_sock_init() - Create listening sockets for a given host ("inbound") port
  * @c:		Execution context
- * @af:		Address family to select a specific IP version, or AF_UNSPEC
  * @addr:	Pointer to address for binding, NULL if not configured
  * @ifname:	Name of interface to bind to, NULL if not configured
  * @port:	Port, host order
  *
  * Return: 0 on (partial) success, negative error code on (complete) failure
  */
-int tcp_sock_init(const struct ctx *c, sa_family_t af, const void *addr,
+int tcp_sock_init(const struct ctx *c, const union inany_addr *addr,
 		  const char *ifname, in_port_t port)
 {
-	int r4 = SOCKET_MAX + 1, r6 = SOCKET_MAX + 1;
+	int r4 = FD_REF_MAX + 1, r6 = FD_REF_MAX + 1;
 
-	if (af == AF_UNSPEC && c->ifi4 && c->ifi6)
+	ASSERT(!c->no_tcp);
+
+	if (!addr && c->ifi4 && c->ifi6)
 		/* Attempt to get a dual stack socket */
-		if (tcp_sock_init_af(c, AF_UNSPEC, port, addr, ifname) >= 0)
+		if (tcp_sock_init_one(c, NULL, ifname, port) >= 0)
 			return 0;
 
 	/* Otherwise create a socket per IP version */
-	if ((af == AF_INET  || af == AF_UNSPEC) && c->ifi4)
-		r4 = tcp_sock_init_af(c, AF_INET, port, addr, ifname);
+	if ((!addr || inany_v4(addr)) && c->ifi4)
+		r4 = tcp_sock_init_one(c, addr ? addr : &inany_any4,
+				       ifname, port);
 
-	if ((af == AF_INET6 || af == AF_UNSPEC) && c->ifi6)
-		r6 = tcp_sock_init_af(c, AF_INET6, port, addr, ifname);
+	if ((!addr || !inany_v4(addr)) && c->ifi6)
+		r6 = tcp_sock_init_one(c, addr ? addr : &inany_any6,
+				       ifname, port);
 
-	if (IN_INTERVAL(0, SOCKET_MAX, r4) || IN_INTERVAL(0, SOCKET_MAX, r6))
+	if (IN_INTERVAL(0, FD_REF_MAX, r4) || IN_INTERVAL(0, FD_REF_MAX, r6))
 		return 0;
 
 	return r4 < 0 ? r4 : r6;
@@ -3026,18 +2454,17 @@ int tcp_sock_init(const struct ctx *c, sa_family_t af, const void *addr,
  */
 static void tcp_ns_sock_init4(const struct ctx *c, in_port_t port)
 {
-	in_port_t idx = port + c->tcp.fwd_out.delta[port];
-	union tcp_epoll_ref tref = { .tcp.listen = 1, .tcp.outbound = 1,
-				     .tcp.index = idx };
-	struct in_addr loopback = { htonl(INADDR_LOOPBACK) };
+	union tcp_listen_epoll_ref tref = {
+		.port = port,
+		.pif = PIF_SPLICE,
+	};
 	int s;
 
 	ASSERT(c->mode == MODE_PASTA);
 
-	s = sock_l4(c, AF_INET, IPPROTO_TCP, &loopback, NULL, port, tref.u32);
-	if (s >= 0)
-		tcp_sock_set_bufsize(c, s);
-	else
+	s = pif_sock_l4(c, EPOLL_TYPE_TCP_LISTEN, PIF_SPLICE, &inany_loopback4,
+			NULL, port, tref.u32);
+	if (s < 0)
 		s = -1;
 
 	if (c->tcp.fwd_out.mode == FWD_AUTO)
@@ -3051,18 +2478,17 @@ static void tcp_ns_sock_init4(const struct ctx *c, in_port_t port)
  */
 static void tcp_ns_sock_init6(const struct ctx *c, in_port_t port)
 {
-	in_port_t idx = port + c->tcp.fwd_out.delta[port];
-	union tcp_epoll_ref tref = { .tcp.listen = 1, .tcp.outbound = 1,
-				     .tcp.index = idx };
+	union tcp_listen_epoll_ref tref = {
+		.port = port,
+		.pif = PIF_SPLICE,
+	};
 	int s;
 
 	ASSERT(c->mode == MODE_PASTA);
 
-	s = sock_l4(c, AF_INET6, IPPROTO_TCP, &in6addr_loopback, NULL, port,
-		    tref.u32);
-	if (s >= 0)
-		tcp_sock_set_bufsize(c, s);
-	else
+	s = pif_sock_l4(c, EPOLL_TYPE_TCP_LISTEN, PIF_SPLICE, &inany_loopback6,
+			NULL, port, tref.u32);
+	if (s < 0)
 		s = -1;
 
 	if (c->tcp.fwd_out.mode == FWD_AUTO)
@@ -3074,8 +2500,10 @@ static void tcp_ns_sock_init6(const struct ctx *c, in_port_t port)
  * @c:		Execution context
  * @port:	Port, host order
  */
-void tcp_ns_sock_init(const struct ctx *c, in_port_t port)
+static void tcp_ns_sock_init(const struct ctx *c, in_port_t port)
 {
+	ASSERT(!c->no_tcp);
+
 	if (c->ifi4)
 		tcp_ns_sock_init4(c, port);
 	if (c->ifi6)
@@ -3088,9 +2516,10 @@ void tcp_ns_sock_init(const struct ctx *c, in_port_t port)
  *
  * Return: 0
  */
+/* cppcheck-suppress [constParameterCallback, unmatchedSuppression] */
 static int tcp_ns_socks_init(void *arg)
 {
-	struct ctx *c = (struct ctx *)arg;
+	const struct ctx *c = (const struct ctx *)arg;
 	unsigned port;
 
 	ns_enter(c);
@@ -3107,20 +2536,28 @@ static int tcp_ns_socks_init(void *arg)
 
 /**
  * tcp_sock_refill_pool() - Refill one pool of pre-opened sockets
- * @c:		Execution context
  * @pool:	Pool of sockets to refill
  * @af:		Address family to use
+ *
+ * Return: 0 on success, negative error code if there was at least one error
  */
-void tcp_sock_refill_pool(const struct ctx *c, int pool[], int af)
+int tcp_sock_refill_pool(int pool[], sa_family_t af)
 {
 	int i;
 
 	for (i = 0; i < TCP_SOCK_POOL_SIZE; i++) {
-		if (pool[i] >= 0)
-			break;
+		int fd;
 
-		pool[i] = tcp_conn_new_sock(c, af);
+		if (pool[i] >= 0)
+			continue;
+
+		if ((fd = tcp_conn_new_sock(af)) < 0)
+			return fd;
+
+		pool[i] = fd;
 	}
+
+	return 0;
 }
 
 /**
@@ -3129,10 +2566,69 @@ void tcp_sock_refill_pool(const struct ctx *c, int pool[], int af)
  */
 static void tcp_sock_refill_init(const struct ctx *c)
 {
-	if (c->ifi4)
-		tcp_sock_refill_pool(c, init_sock_pool4, AF_INET);
-	if (c->ifi6)
-		tcp_sock_refill_pool(c, init_sock_pool6, AF_INET6);
+	if (c->ifi4) {
+		int rc = tcp_sock_refill_pool(init_sock_pool4, AF_INET);
+		if (rc < 0)
+			warn("TCP: Error refilling IPv4 host socket pool: %s",
+			     strerror_(-rc));
+	}
+	if (c->ifi6) {
+		int rc = tcp_sock_refill_pool(init_sock_pool6, AF_INET6);
+		if (rc < 0)
+			warn("TCP: Error refilling IPv6 host socket pool: %s",
+			     strerror_(-rc));
+	}
+}
+
+/**
+ * tcp_probe_peek_offset_cap() - Check if SO_PEEK_OFF is supported by kernel
+ * @af:		Address family, IPv4 or IPv6
+ *
+ * Return: true if supported, false otherwise
+ */
+static bool tcp_probe_peek_offset_cap(sa_family_t af)
+{
+	bool ret = false;
+	int s, optv = 0;
+
+	s = socket(af, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+	if (s < 0) {
+		warn_perror("Temporary TCP socket creation failed");
+	} else {
+		if (!setsockopt(s, SOL_SOCKET, SO_PEEK_OFF, &optv, sizeof(int)))
+			ret = true;
+		close(s);
+	}
+
+	return ret;
+}
+
+/**
+ * tcp_probe_tcp_info() - Check what data TCP_INFO reports
+ *
+ * Return: Number of bytes returned by TCP_INFO getsockopt()
+ */
+static socklen_t tcp_probe_tcp_info(void)
+{
+	struct tcp_info_linux tinfo;
+	socklen_t sl = sizeof(tinfo);
+	int s;
+
+	s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+	if (s < 0) {
+		warn_perror("Temporary TCP socket creation failed");
+		return false;
+	}
+
+	if (getsockopt(s, SOL_TCP, TCP_INFO, &tinfo, &sl)) {
+		warn_perror("Failed to get TCP_INFO on temporary socket");
+		close(s);
+		return false;
+	}
+
+	close(s);
+
+	return sl;
 }
 
 /**
@@ -3143,43 +2639,9 @@ static void tcp_sock_refill_init(const struct ctx *c)
  */
 int tcp_init(struct ctx *c)
 {
-	int i;
-#ifndef HAS_GETRANDOM
-	int dev_random = open("/dev/random", O_RDONLY);
-	unsigned int random_read = 0;
+	ASSERT(!c->no_tcp);
 
-	while (dev_random && random_read < sizeof(c->tcp.hash_secret)) {
-		int ret = read(dev_random,
-			       (uint8_t *)&c->tcp.hash_secret + random_read,
-			       sizeof(c->tcp.hash_secret) - random_read);
-
-		if (ret == -1 && errno == EINTR)
-			continue;
-
-		if (ret <= 0)
-			break;
-
-		random_read += ret;
-	}
-	if (dev_random >= 0)
-		close(dev_random);
-	if (random_read < sizeof(c->tcp.hash_secret)) {
-#else
-	if (getrandom(&c->tcp.hash_secret, sizeof(c->tcp.hash_secret),
-		      GRND_RANDOM) < 0) {
-#endif /* !HAS_GETRANDOM */
-		perror("TCP initial sequence getrandom");
-		exit(EXIT_FAILURE);
-	}
-
-	for (i = 0; i < ARRAY_SIZE(tcp_l2_mh); i++)
-		tcp_l2_mh[i] = (struct mmsghdr) { .msg_hdr.msg_iovlen = 1 };
-
-	if (c->ifi4)
-		tcp_sock4_iov_init(c);
-
-	if (c->ifi6)
-		tcp_sock6_iov_init(c);
+	tcp_sock_iov_init(c);
 
 	memset(init_sock_pool4,		0xff,	sizeof(init_sock_pool4));
 	memset(init_sock_pool6,		0xff,	sizeof(init_sock_pool6));
@@ -3194,112 +2656,79 @@ int tcp_init(struct ctx *c)
 		NS_CALL(tcp_ns_socks_init, c);
 	}
 
-	return 0;
-}
+	peek_offset_cap = (!c->ifi4 || tcp_probe_peek_offset_cap(AF_INET)) &&
+			  (!c->ifi6 || tcp_probe_peek_offset_cap(AF_INET6));
+	debug("SO_PEEK_OFF%ssupported", peek_offset_cap ? " " : " not ");
 
-/**
- * struct tcp_port_detect_arg - Arguments for tcp_port_detect()
- * @c:			Execution context
- * @detect_in_ns:	Detect ports bound in namespace, not in init
- */
-struct tcp_port_detect_arg {
-	struct ctx *c;
-	int detect_in_ns;
-};
+	tcp_info_size = tcp_probe_tcp_info();
 
-/**
- * tcp_port_detect() - Detect ports bound in namespace or init
- * @arg:		See struct tcp_port_detect_arg
- *
- * Return: 0
- */
-static int tcp_port_detect(void *arg)
-{
-	struct tcp_port_detect_arg *a = (struct tcp_port_detect_arg *)arg;
-
-	if (a->detect_in_ns) {
-		ns_enter(a->c);
-
-		get_bound_ports(a->c, 1, IPPROTO_TCP);
-	} else {
-		get_bound_ports(a->c, 0, IPPROTO_TCP);
-	}
+#define dbg_tcpi(f_)	debug("TCP_INFO tcpi_%s field%s supported",	\
+			      STRINGIFY(f_), tcp_info_cap(f_) ? " " : " not ")
+	dbg_tcpi(snd_wnd);
+	dbg_tcpi(bytes_acked);
+	dbg_tcpi(min_rtt);
+#undef dbg_tcpi
 
 	return 0;
 }
 
 /**
- * struct tcp_port_rebind_arg - Arguments for tcp_port_rebind()
- * @c:			Execution context
- * @bind_in_ns:		Rebind ports in namespace, not in init
- */
-struct tcp_port_rebind_arg {
-	struct ctx *c;
-	int bind_in_ns;
-};
-
-/**
- * tcp_port_rebind() - Rebind ports in namespace or init
- * @arg:		See struct tcp_port_rebind_arg
+ * tcp_port_rebind() - Rebind ports to match forward maps
+ * @c:		Execution context
+ * @outbound:	True to remap outbound forwards, otherwise inbound
  *
- * Return: 0
+ * Must be called in namespace context if @outbound is true.
  */
-static int tcp_port_rebind(void *arg)
+static void tcp_port_rebind(struct ctx *c, bool outbound)
 {
-	struct tcp_port_rebind_arg *a = (struct tcp_port_rebind_arg *)arg;
+	const uint8_t *fmap = outbound ? c->tcp.fwd_out.map : c->tcp.fwd_in.map;
+	const uint8_t *rmap = outbound ? c->tcp.fwd_in.map : c->tcp.fwd_out.map;
+	int (*socks)[IP_VERSIONS] = outbound ? tcp_sock_ns : tcp_sock_init_ext;
 	unsigned port;
 
-	if (a->bind_in_ns) {
-		ns_enter(a->c);
-
-		for (port = 0; port < NUM_PORTS; port++) {
-			if (!bitmap_isset(a->c->tcp.fwd_out.map, port)) {
-				if (tcp_sock_ns[port][V4] >= 0) {
-					close(tcp_sock_ns[port][V4]);
-					tcp_sock_ns[port][V4] = -1;
-				}
-
-				if (tcp_sock_ns[port][V6] >= 0) {
-					close(tcp_sock_ns[port][V6]);
-					tcp_sock_ns[port][V6] = -1;
-				}
-
-				continue;
+	for (port = 0; port < NUM_PORTS; port++) {
+		if (!bitmap_isset(fmap, port)) {
+			if (socks[port][V4] >= 0) {
+				close(socks[port][V4]);
+				socks[port][V4] = -1;
 			}
 
-			/* Don't loop back our own ports */
-			if (bitmap_isset(a->c->tcp.fwd_in.map, port))
-				continue;
+			if (socks[port][V6] >= 0) {
+				close(socks[port][V6]);
+				socks[port][V6] = -1;
+			}
 
-			if ((a->c->ifi4 && tcp_sock_ns[port][V4] == -1) ||
-			    (a->c->ifi6 && tcp_sock_ns[port][V6] == -1))
-				tcp_ns_sock_init(a->c, port);
+			continue;
 		}
-	} else {
-		for (port = 0; port < NUM_PORTS; port++) {
-			if (!bitmap_isset(a->c->tcp.fwd_in.map, port)) {
-				if (tcp_sock_init_ext[port][V4] >= 0) {
-					close(tcp_sock_init_ext[port][V4]);
-					tcp_sock_init_ext[port][V4] = -1;
-				}
 
-				if (tcp_sock_init_ext[port][V6] >= 0) {
-					close(tcp_sock_init_ext[port][V6]);
-					tcp_sock_init_ext[port][V6] = -1;
-				}
-				continue;
-			}
+		/* Don't loop back our own ports */
+		if (bitmap_isset(rmap, port))
+			continue;
 
-			/* Don't loop back our own ports */
-			if (bitmap_isset(a->c->tcp.fwd_out.map, port))
-				continue;
-
-			if ((a->c->ifi4 && tcp_sock_init_ext[port][V4] == -1) ||
-			    (a->c->ifi6 && tcp_sock_init_ext[port][V6] == -1))
-				tcp_sock_init(a->c, AF_UNSPEC, NULL, NULL,
-					      port);
+		if ((c->ifi4 && socks[port][V4] == -1) ||
+		    (c->ifi6 && socks[port][V6] == -1)) {
+			if (outbound)
+				tcp_ns_sock_init(c, port);
+			else
+				tcp_sock_init(c, NULL, NULL, port);
 		}
 	}
+}
+
+/**
+ * tcp_port_rebind_outbound() - Rebind ports in namespace
+ * @arg:	Execution context
+ *
+ * Called with NS_CALL()
+ *
+ * Return: 0
+ */
+static int tcp_port_rebind_outbound(void *arg)
+{
+	struct ctx *c = (struct ctx *)arg;
+
+	ns_enter(c);
+	tcp_port_rebind(c, true);
 
 	return 0;
 }
@@ -3307,43 +2736,986 @@ static int tcp_port_rebind(void *arg)
 /**
  * tcp_timer() - Periodic tasks: port detection, closed connections, pool refill
  * @c:		Execution context
- * @ts:		Unused
+ * @now:	Current timestamp
  */
-void tcp_timer(struct ctx *c, const struct timespec *ts)
+void tcp_timer(struct ctx *c, const struct timespec *now)
 {
-	union tcp_conn *conn;
-
-	(void)ts;
+	(void)now;
 
 	if (c->mode == MODE_PASTA) {
-		struct tcp_port_detect_arg detect_arg = { c, 0 };
-		struct tcp_port_rebind_arg rebind_arg = { c, 0 };
-
 		if (c->tcp.fwd_out.mode == FWD_AUTO) {
-			detect_arg.detect_in_ns = 0;
-			tcp_port_detect(&detect_arg);
-			rebind_arg.bind_in_ns = 1;
-			NS_CALL(tcp_port_rebind, &rebind_arg);
+			fwd_scan_ports_tcp(&c->tcp.fwd_out, &c->tcp.fwd_in);
+			NS_CALL(tcp_port_rebind_outbound, c);
 		}
 
 		if (c->tcp.fwd_in.mode == FWD_AUTO) {
-			detect_arg.detect_in_ns = 1;
-			NS_CALL(tcp_port_detect, &detect_arg);
-			rebind_arg.bind_in_ns = 0;
-			tcp_port_rebind(&rebind_arg);
-		}
-	}
-
-	for (conn = tc + c->tcp.conn_count - 1; conn >= tc; conn--) {
-		if (conn->c.spliced) {
-			tcp_splice_timer(c, conn);
-		} else {
-			if (conn->tap.events == CLOSED)
-				tcp_conn_destroy(c, conn);
+			fwd_scan_ports_tcp(&c->tcp.fwd_in, &c->tcp.fwd_out);
+			tcp_port_rebind(c, false);
 		}
 	}
 
 	tcp_sock_refill_init(c);
 	if (c->mode == MODE_PASTA)
 		tcp_splice_refill(c);
+}
+
+/**
+ * tcp_flow_is_established() - Was the connection established? Includes closing
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: true if the connection was established, false otherwise
+ */
+bool tcp_flow_is_established(const struct tcp_tap_conn *conn)
+{
+	return conn->events & ESTABLISHED;
+}
+
+/**
+ * tcp_flow_repair_on() - Enable repair mode for a single TCP flow
+ * @c:		Execution context
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int tcp_flow_repair_on(struct ctx *c, const struct tcp_tap_conn *conn)
+{
+	int rc = 0;
+
+	if (conn->sock < 0)
+		return 0;
+
+	if ((rc = repair_set(c, conn->sock, TCP_REPAIR_ON)))
+		err("Failed to set TCP_REPAIR");
+
+	return rc;
+}
+
+/**
+ * tcp_flow_repair_off() - Clear repair mode for a single TCP flow
+ * @c:		Execution context
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int tcp_flow_repair_off(struct ctx *c, const struct tcp_tap_conn *conn)
+{
+	int rc = 0;
+
+	if (conn->sock < 0)
+		return 0;
+
+	if ((rc = repair_set(c, conn->sock, TCP_REPAIR_OFF)))
+		err("Failed to clear TCP_REPAIR");
+
+	return rc;
+}
+
+/**
+ * tcp_flow_dump_tinfo() - Dump window scale, tcpi_state, tcpi_options
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_dump_tinfo(const struct tcp_tap_conn *conn,
+			       struct tcp_tap_transfer_ext *t)
+{
+	struct tcp_info tinfo;
+	socklen_t sl;
+
+	sl = sizeof(tinfo);
+	if (getsockopt(conn->sock, SOL_TCP, TCP_INFO, &tinfo, &sl)) {
+		int rc = -errno;
+		flow_perror(conn, "Querying TCP_INFO");
+		return rc;
+	}
+
+	t->snd_ws		= tinfo.tcpi_snd_wscale;
+	t->rcv_ws		= tinfo.tcpi_rcv_wscale;
+	t->tcpi_state		= tinfo.tcpi_state;
+	t->tcpi_options		= tinfo.tcpi_options;
+
+	return 0;
+}
+
+/**
+ * tcp_flow_dump_mss() - Dump MSS clamp (not current MSS) via TCP_MAXSEG
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_dump_mss(const struct tcp_tap_conn *conn,
+			     struct tcp_tap_transfer_ext *t)
+{
+	socklen_t sl = sizeof(t->mss);
+	int val;
+
+	if (getsockopt(conn->sock, SOL_TCP, TCP_MAXSEG, &val, &sl)) {
+		int rc = -errno;
+		flow_perror(conn, "Getting MSS");
+		return rc;
+	}
+
+	t->mss = (uint32_t)val;
+
+	return 0;
+}
+
+
+/**
+ * tcp_flow_dump_timestamp() - Dump RFC 7323 timestamp via TCP_TIMESTAMP
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data (tcpi_options must be populated)
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_dump_timestamp(const struct tcp_tap_conn *conn,
+				   struct tcp_tap_transfer_ext *t)
+{
+	int val = 0;
+
+	if (t->tcpi_options & TCPI_OPT_TIMESTAMPS) {
+		socklen_t sl = sizeof(val);
+
+		if (getsockopt(conn->sock, SOL_TCP, TCP_TIMESTAMP, &val, &sl)) {
+			int rc = -errno;
+			flow_perror(conn, "Getting RFC 7323 timestamp");
+			return rc;
+		}
+	}
+
+	t->timestamp = (uint32_t)val;
+	return 0;
+}
+
+/**
+ * tcp_flow_repair_timestamp() - Restore RFC 7323 timestamp via TCP_TIMESTAMP
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_timestamp(const struct tcp_tap_conn *conn,
+				   const struct tcp_tap_transfer_ext *t)
+{
+	int val = (int)t->timestamp;
+
+	if (t->tcpi_options & TCPI_OPT_TIMESTAMPS) {
+		if (setsockopt(conn->sock, SOL_TCP, TCP_TIMESTAMP,
+			       &val, sizeof(val))) {
+			int rc = -errno;
+			flow_perror(conn, "Setting RFC 7323 timestamp");
+			return rc;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_dump_wnd() - Dump current tcp_repair_window parameters
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_dump_wnd(const struct tcp_tap_conn *conn,
+			     struct tcp_tap_transfer_ext *t)
+{
+	struct tcp_repair_window wnd;
+	socklen_t sl = sizeof(wnd);
+
+	if (getsockopt(conn->sock, IPPROTO_TCP, TCP_REPAIR_WINDOW, &wnd, &sl)) {
+		int rc = -errno;
+		flow_perror(conn, "Getting window repair data");
+		return rc;
+	}
+
+	t->snd_wl1	= wnd.snd_wl1;
+	t->snd_wnd	= wnd.snd_wnd;
+	t->max_window	= wnd.max_window;
+	t->rcv_wnd	= wnd.rcv_wnd;
+	t->rcv_wup	= wnd.rcv_wup;
+
+	/* If we received a FIN, we also need to adjust window parameters.
+	 *
+	 * This must be called after tcp_flow_dump_tinfo(), for t->tcpi_state.
+	 */
+	if (t->tcpi_state == TCP_CLOSE_WAIT || t->tcpi_state == TCP_LAST_ACK) {
+		t->rcv_wup--;
+		t->rcv_wnd++;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_repair_wnd() - Restore window parameters from extended data
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_wnd(const struct tcp_tap_conn *conn,
+			       const struct tcp_tap_transfer_ext *t)
+{
+	struct tcp_repair_window wnd;
+
+	wnd.snd_wl1	= t->snd_wl1;
+	wnd.snd_wnd	= t->snd_wnd;
+	wnd.max_window	= t->max_window;
+	wnd.rcv_wnd	= t->rcv_wnd;
+	wnd.rcv_wup	= t->rcv_wup;
+
+	if (setsockopt(conn->sock, IPPROTO_TCP, TCP_REPAIR_WINDOW,
+		       &wnd, sizeof(wnd))) {
+		int rc = -errno;
+		flow_perror(conn, "Setting window data");
+		return rc;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_select_queue() - Select queue (receive or send) for next operation
+ * @conn:	Connection to select queue for
+ * @queue:	TCP_RECV_QUEUE or TCP_SEND_QUEUE
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_select_queue(const struct tcp_tap_conn *conn, int queue)
+{
+	if (setsockopt(conn->sock, SOL_TCP, TCP_REPAIR_QUEUE,
+		       &queue, sizeof(queue))) {
+		int rc = -errno;
+		flow_perror(conn, "Selecting TCP_SEND_QUEUE");
+		return rc;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_dump_sndqueue() - Dump send queue, length of sent and not sent data
+ * @conn:	Connection to dump queue for
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ *
+ * #syscalls:vu ioctl
+ */
+static int tcp_flow_dump_sndqueue(const struct tcp_tap_conn *conn,
+				  struct tcp_tap_transfer_ext *t)
+{
+	int s = conn->sock;
+	ssize_t rc;
+
+	if (ioctl(s, SIOCOUTQ, &t->sndq) < 0) {
+		rc = -errno;
+		flow_perror(conn, "Getting send queue size");
+		return rc;
+	}
+
+	if (ioctl(s, SIOCOUTQNSD, &t->notsent) < 0) {
+		rc = -errno;
+		flow_perror(conn, "Getting not sent count");
+		return rc;
+	}
+
+	/* If we sent a FIN, SIOCOUTQ and SIOCOUTQNSD are one greater than the
+	 * actual pending queue length, because they are based on the sequence
+	 * numbers, not directly on the buffer contents.
+	 *
+	 * This must be called after tcp_flow_dump_tinfo(), for t->tcpi_state.
+	 */
+	if (t->tcpi_state == TCP_FIN_WAIT1 || t->tcpi_state == TCP_FIN_WAIT2 ||
+	    t->tcpi_state == TCP_LAST_ACK  || t->tcpi_state == TCP_CLOSING) {
+		if (t->sndq)
+			t->sndq--;
+		if (t->notsent)
+			t->notsent--;
+	}
+
+	if (t->notsent > t->sndq) {
+		flow_err(conn,
+			 "Invalid notsent count socket %i, send: %u, not sent: %u",
+			 s, t->sndq, t->notsent);
+		return -EINVAL;
+	}
+
+	if (t->sndq > TCP_MIGRATE_SND_QUEUE_MAX) {
+		flow_err(conn,
+			 "Send queue too large to migrate socket %i: %u bytes",
+			 s, t->sndq);
+		return -ENOBUFS;
+	}
+
+	rc = recv(s, tcp_migrate_snd_queue,
+		  MIN(t->sndq, TCP_MIGRATE_SND_QUEUE_MAX), MSG_PEEK);
+	if (rc < 0) {
+		if (errno == EAGAIN)  { /* EAGAIN means empty */
+			rc = 0;
+		} else {
+			rc = -errno;
+			flow_perror(conn, "Can't read send queue");
+			return rc;
+		}
+	}
+
+	if ((uint32_t)rc < t->sndq) {
+		flow_err(conn, "Short read migrating send queue");
+		return -ENXIO;
+	}
+
+	t->notsent = MIN(t->notsent, t->sndq);
+
+	return 0;
+}
+
+/**
+ * tcp_flow_repair_queue() - Restore contents of a given (pre-selected) queue
+ * @conn:	Connection to repair queue for
+ * @len:	Length of data to be restored
+ * @buf:	Buffer with content of pending data queue
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_queue(const struct tcp_tap_conn *conn,
+				 size_t len, uint8_t *buf)
+{
+	size_t chunk = len;
+	uint8_t *p = buf;
+
+	while (len > 0) {
+		ssize_t rc = send(conn->sock, p, MIN(len, chunk), 0);
+
+		if (rc < 0) {
+			if ((errno == ENOBUFS || errno == ENOMEM) &&
+			    chunk >= TCP_MIGRATE_RESTORE_CHUNK_MIN) {
+				chunk /= 2;
+				continue;
+			}
+
+			rc = -errno;
+			flow_perror(conn, "Can't write queue");
+			return rc;
+		}
+
+		len -= rc;
+		p += rc;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_dump_seq() - Dump current sequence of pre-selected queue
+ * @conn:	Pointer to the TCP connection structure
+ * @v:		Sequence value, set on return
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_dump_seq(const struct tcp_tap_conn *conn, uint32_t *v)
+{
+	socklen_t sl = sizeof(*v);
+
+	if (getsockopt(conn->sock, SOL_TCP, TCP_QUEUE_SEQ, v, &sl)) {
+		int rc = -errno;
+		flow_perror(conn, "Dumping sequence");
+		return rc;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_repair_seq() - Restore sequence for pre-selected queue
+ * @conn:	Connection to repair sequences for
+ * @v:		Sequence value to be set
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_seq(const struct tcp_tap_conn *conn,
+			       const uint32_t *v)
+{
+	if (setsockopt(conn->sock, SOL_TCP, TCP_QUEUE_SEQ, v, sizeof(*v))) {
+		int rc = -errno;
+		flow_perror(conn, "Setting sequence");
+		return rc;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_dump_rcvqueue() - Dump receive queue and its length, seal/block it
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ *
+ * #syscalls:vu ioctl
+ */
+static int tcp_flow_dump_rcvqueue(const struct tcp_tap_conn *conn,
+				  struct tcp_tap_transfer_ext *t)
+{
+	int s = conn->sock;
+	ssize_t rc;
+
+	if (ioctl(s, SIOCINQ, &t->rcvq) < 0) {
+		rc = -errno;
+		err_perror("Get receive queue size, socket %i", s);
+		return rc;
+	}
+
+	/* If we received a FIN, SIOCINQ is one greater than the actual number
+	 * of bytes on the queue, because it's based on the sequence number
+	 * rather than directly on the buffer contents.
+	 *
+	 * This must be called after tcp_flow_dump_tinfo(), for t->tcpi_state.
+	 */
+	if (t->rcvq &&
+	    (t->tcpi_state == TCP_CLOSE_WAIT || t->tcpi_state == TCP_LAST_ACK))
+		t->rcvq--;
+
+	if (t->rcvq > TCP_MIGRATE_RCV_QUEUE_MAX) {
+		flow_err(conn,
+			 "Receive queue too large to migrate socket: %u bytes",
+			 t->rcvq);
+		return -ENOBUFS;
+	}
+
+	rc = recv(s, tcp_migrate_rcv_queue, t->rcvq, MSG_PEEK);
+	if (rc < 0) {
+		if (errno == EAGAIN)  { /* EAGAIN means empty */
+			rc = 0;
+		} else {
+			rc = -errno;
+			flow_perror(conn, "Can't read receive queue");
+			return rc;
+		}
+	}
+
+	if ((uint32_t)rc < t->rcvq) {
+		flow_err(conn, "Short read migrating receive queue");
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_repair_opt() - Set repair "options" (MSS, scale, SACK, timestamps)
+ * @conn:	Pointer to the TCP connection structure
+ * @t:		Extended migration data
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_opt(const struct tcp_tap_conn *conn,
+			       const struct tcp_tap_transfer_ext *t)
+{
+	const struct tcp_repair_opt opts[] = {
+		{ TCPOPT_WINDOW,		t->snd_ws + (t->rcv_ws << 16) },
+		{ TCPOPT_MAXSEG,		t->mss },
+		{ TCPOPT_SACK_PERMITTED,	0 },
+		{ TCPOPT_TIMESTAMP,		0 },
+	};
+	socklen_t sl;
+
+	sl = sizeof(opts[0]) * (2 +
+				!!(t->tcpi_options & TCPI_OPT_SACK) +
+				!!(t->tcpi_options & TCPI_OPT_TIMESTAMPS));
+
+	if (setsockopt(conn->sock, SOL_TCP, TCP_REPAIR_OPTIONS, opts, sl)) {
+		int rc = -errno;
+		flow_perror(conn, "Setting repair options");
+		return rc;
+	}
+
+	return 0;
+}
+
+/**
+ * tcp_flow_migrate_source() - Send data (flow table) for flow, close listening
+ * @fd:		Descriptor for state migration
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int tcp_flow_migrate_source(int fd, struct tcp_tap_conn *conn)
+{
+	struct tcp_tap_transfer t = {
+		.retrans		= conn->retrans,
+		.ws_from_tap		= conn->ws_from_tap,
+		.ws_to_tap		= conn->ws_to_tap,
+		.events			= conn->events,
+
+		.tap_mss		= htonl(MSS_GET(conn)),
+
+		.sndbuf			= htonl(conn->sndbuf),
+
+		.flags			= conn->flags,
+		.seq_dup_ack_approx	= conn->seq_dup_ack_approx,
+
+		.wnd_from_tap		= htons(conn->wnd_from_tap),
+		.wnd_to_tap		= htons(conn->wnd_to_tap),
+
+		.seq_to_tap		= htonl(conn->seq_to_tap),
+		.seq_ack_from_tap	= htonl(conn->seq_ack_from_tap),
+		.seq_from_tap		= htonl(conn->seq_from_tap),
+		.seq_ack_to_tap		= htonl(conn->seq_ack_to_tap),
+		.seq_init_from_tap	= htonl(conn->seq_init_from_tap),
+	};
+
+	memcpy(&t.pif, conn->f.pif, sizeof(t.pif));
+	memcpy(&t.side, conn->f.side, sizeof(t.side));
+
+	if (write_all_buf(fd, &t, sizeof(t))) {
+		int rc = -errno;
+		err_perror("Can't write migration data, socket %i", conn->sock);
+		return rc;
+	}
+
+	if (conn->listening_sock != -1 && !fcntl(conn->listening_sock, F_GETFD))
+		close(conn->listening_sock);
+
+	return 0;
+}
+
+/**
+ * tcp_flow_migrate_source_ext() - Dump queues, close sockets, send final data
+ * @fd:		Descriptor for state migration
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: 0 on success, negative (not -EIO) on failure, -EIO on sending failure
+ */
+int tcp_flow_migrate_source_ext(int fd, const struct tcp_tap_conn *conn)
+{
+	uint32_t peek_offset = conn->seq_to_tap - conn->seq_ack_from_tap;
+	struct tcp_tap_transfer_ext *t = &migrate_ext[FLOW_IDX(conn)];
+	int s = conn->sock;
+	int rc;
+
+	/* Disable SO_PEEK_OFF, it will make accessing the queues in repair mode
+	 * weird.
+	 */
+	if (tcp_set_peek_offset(conn, -1)) {
+		rc = -errno;
+		goto fail;
+	}
+
+	if ((rc = tcp_flow_dump_tinfo(conn, t)))
+		goto fail;
+
+	if ((rc = tcp_flow_dump_mss(conn, t)))
+		goto fail;
+
+	if ((rc = tcp_flow_dump_timestamp(conn, t)))
+		goto fail;
+
+	if ((rc = tcp_flow_dump_wnd(conn, t)))
+		goto fail;
+
+	if ((rc = tcp_flow_select_queue(conn, TCP_SEND_QUEUE)))
+		goto fail;
+
+	if ((rc = tcp_flow_dump_sndqueue(conn, t)))
+		goto fail;
+
+	if ((rc = tcp_flow_dump_seq(conn, &t->seq_snd)))
+		goto fail;
+
+	if ((rc = tcp_flow_select_queue(conn, TCP_RECV_QUEUE)))
+		goto fail;
+
+	if ((rc = tcp_flow_dump_rcvqueue(conn, t)))
+		goto fail;
+
+	if ((rc = tcp_flow_dump_seq(conn, &t->seq_rcv)))
+		goto fail;
+
+	close(s);
+
+	/* Adjustments unrelated to FIN segments: sequence numbers we dumped are
+	 * based on the end of the queues.
+	 */
+	t->seq_rcv	-= t->rcvq;
+	t->seq_snd	-= t->sndq;
+
+	flow_dbg(conn, "Extended migration data, socket %i sequences send %u receive %u",
+		 s, t->seq_snd, t->seq_rcv);
+	flow_dbg(conn, "  pending queues: send %u not sent %u receive %u",
+		 t->sndq, t->notsent, t->rcvq);
+	flow_dbg(conn, "  window: snd_wl1 %u snd_wnd %u max %u rcv_wnd %u rcv_wup %u",
+		 t->snd_wl1, t->snd_wnd, t->max_window, t->rcv_wnd, t->rcv_wup);
+	flow_dbg(conn, "  SO_PEEK_OFF %s  offset=%"PRIu32,
+		 peek_offset_cap ? "enabled" : "disabled", peek_offset);
+
+	/* Endianness fix-ups */
+	t->seq_snd	= htonl(t->seq_snd);
+	t->seq_rcv 	= htonl(t->seq_rcv);
+	t->sndq		= htonl(t->sndq);
+	t->notsent	= htonl(t->notsent);
+	t->rcvq		= htonl(t->rcvq);
+	t->mss		= htonl(t->mss);
+	t->timestamp	= htonl(t->timestamp);
+
+	t->snd_wl1	= htonl(t->snd_wl1);
+	t->snd_wnd	= htonl(t->snd_wnd);
+	t->max_window	= htonl(t->max_window);
+	t->rcv_wnd	= htonl(t->rcv_wnd);
+	t->rcv_wup	= htonl(t->rcv_wup);
+
+	if (write_all_buf(fd, t, sizeof(*t))) {
+		flow_perror(conn, "Failed to write extended data");
+		return -EIO;
+	}
+
+	if (write_all_buf(fd, tcp_migrate_snd_queue, ntohl(t->sndq))) {
+		flow_perror(conn, "Failed to write send queue data");
+		return -EIO;
+	}
+
+	if (write_all_buf(fd, tcp_migrate_rcv_queue, ntohl(t->rcvq))) {
+		flow_perror(conn, "Failed to write receive queue data");
+		return -EIO;
+	}
+
+	return 0;
+
+fail:
+	/* For any type of failure dumping data, write an invalid extended data
+	 * descriptor that allows us to keep the stream in sync, but tells the
+	 * target to skip the flow. If we fail to transfer data, that's fatal:
+	 * return -EIO in that case (and only in that case).
+	 */
+	t->tcpi_state = 0; /* Not defined: tell the target to skip this flow */
+
+	if (write_all_buf(fd, t, sizeof(*t))) {
+		flow_perror(conn, "Failed to write extended data");
+		return -EIO;
+	}
+
+	if (rc == -EIO) /* but not a migration data transfer failure */
+		return -ENODATA;
+
+	return rc;
+}
+
+/**
+ * tcp_flow_repair_socket() - Open and bind socket, request repair mode
+ * @c:		Execution context
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_socket(struct ctx *c, struct tcp_tap_conn *conn)
+{
+	sa_family_t af = CONN_V4(conn) ? AF_INET : AF_INET6;
+	const struct flowside *sockside = HOSTFLOW(conn);
+	union sockaddr_inany a;
+	socklen_t sl;
+	int s, rc;
+
+	pif_sockaddr(c, &a, &sl, PIF_HOST, &sockside->oaddr, sockside->oport);
+
+	if ((conn->sock = socket(af, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+				 IPPROTO_TCP)) < 0) {
+		rc = -errno;
+		flow_perror(conn, "Failed to create socket for migrated flow");
+		return rc;
+	}
+	s = conn->sock;
+
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 }, sizeof(int)))
+		flow_dbg_perror(conn, "Failed to set SO_REUSEADDR on socket %i",
+				s);
+
+	tcp_sock_set_nodelay(s);
+
+	if (bind(s, &a.sa, sizeof(a))) {
+		rc = -errno;
+		flow_perror(conn, "Failed to bind socket for migrated flow");
+		goto err;
+	}
+
+	if ((rc = tcp_flow_repair_on(c, conn)))
+		goto err;
+
+	return 0;
+
+err:
+	close(s);
+	conn->sock = -1;
+	return rc;
+}
+
+/**
+ * tcp_flow_repair_connect() - Connect socket in repair mode, then turn it off
+ * @c:		Execution context
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_connect(const struct ctx *c,
+				   struct tcp_tap_conn *conn)
+{
+	const struct flowside *tgt = HOSTFLOW(conn);
+	int rc;
+
+	rc = flowside_connect(c, conn->sock, PIF_HOST, tgt);
+	if (rc) {
+		rc = -errno;
+		flow_perror(conn, "Failed to connect migrated socket");
+		return rc;
+	}
+
+	conn->in_epoll = 0;
+	conn->timer = -1;
+	conn->listening_sock = -1;
+
+	return 0;
+}
+
+/**
+ * tcp_flow_migrate_target() - Receive data (flow table part) for flow, insert
+ * @c:		Execution context
+ * @fd:		Descriptor for state migration
+ *
+ * Return: 0 on success, negative on fatal failure, but 0 on single flow failure
+ */
+int tcp_flow_migrate_target(struct ctx *c, int fd)
+{
+	struct tcp_tap_transfer t;
+	struct tcp_tap_conn *conn;
+	union flow *flow;
+	int rc;
+
+	if (!(flow = flow_alloc())) {
+		err("Flow table full on migration target");
+		return 0;
+	}
+
+	if (read_all_buf(fd, &t, sizeof(t))) {
+		flow_perror(flow, "Failed to receive migration data");
+		flow_alloc_cancel(flow);
+		return -errno;
+	}
+
+	flow->f.state = FLOW_STATE_TGT;
+	memcpy(&flow->f.pif, &t.pif, sizeof(flow->f.pif));
+	memcpy(&flow->f.side, &t.side, sizeof(flow->f.side));
+	conn = FLOW_SET_TYPE(flow, FLOW_TCP, tcp);
+
+	conn->retrans			= t.retrans;
+	conn->ws_from_tap		= t.ws_from_tap;
+	conn->ws_to_tap			= t.ws_to_tap;
+	conn->events			= t.events;
+
+	conn->sndbuf			= htonl(t.sndbuf);
+
+	conn->flags			= t.flags;
+	conn->seq_dup_ack_approx	= t.seq_dup_ack_approx;
+
+	MSS_SET(conn,			  ntohl(t.tap_mss));
+
+	conn->wnd_from_tap		= ntohs(t.wnd_from_tap);
+	conn->wnd_to_tap		= ntohs(t.wnd_to_tap);
+
+	conn->seq_to_tap		= ntohl(t.seq_to_tap);
+	conn->seq_ack_from_tap		= ntohl(t.seq_ack_from_tap);
+	conn->seq_from_tap		= ntohl(t.seq_from_tap);
+	conn->seq_ack_to_tap		= ntohl(t.seq_ack_to_tap);
+	conn->seq_init_from_tap		= ntohl(t.seq_init_from_tap);
+
+	if ((rc = tcp_flow_repair_socket(c, conn))) {
+		flow_err(flow, "Can't set up socket: %s, drop", strerror_(-rc));
+		/* Can't leave the flow in an incomplete state */
+		FLOW_ACTIVATE(conn);
+		return 0;
+	}
+
+	flow_hash_insert(c, TAP_SIDX(conn));
+	FLOW_ACTIVATE(conn);
+
+	return 0;
+}
+
+/**
+ * tcp_flow_migrate_target_ext() - Receive extended data for flow, set, connect
+ * @c:		Execution context
+ * @conn:	Connection entry to complete with extra data
+ * @fd:		Descriptor for state migration
+ *
+ * Return: 0 on success, negative on fatal failure, but 0 on single flow failure
+ */
+int tcp_flow_migrate_target_ext(struct ctx *c, struct tcp_tap_conn *conn, int fd)
+{
+	uint32_t peek_offset = conn->seq_to_tap - conn->seq_ack_from_tap;
+	struct tcp_tap_transfer_ext t;
+	int s = conn->sock, rc;
+
+	if (read_all_buf(fd, &t, sizeof(t))) {
+		rc = -errno;
+		flow_perror(conn, "Failed to read extended data");
+		return rc;
+	}
+
+	if (!t.tcpi_state) { /* Source wants us to skip this flow */
+		flow_err(conn, "Dropping as requested by source");
+		goto fail;
+	}
+
+	/* Endianness fix-ups */
+	t.seq_snd	= ntohl(t.seq_snd);
+	t.seq_rcv 	= ntohl(t.seq_rcv);
+	t.sndq		= ntohl(t.sndq);
+	t.notsent	= ntohl(t.notsent);
+	t.rcvq		= ntohl(t.rcvq);
+	t.mss		= ntohl(t.mss);
+	t.timestamp	= ntohl(t.timestamp);
+
+	t.snd_wl1	= ntohl(t.snd_wl1);
+	t.snd_wnd	= ntohl(t.snd_wnd);
+	t.max_window	= ntohl(t.max_window);
+	t.rcv_wnd	= ntohl(t.rcv_wnd);
+	t.rcv_wup	= ntohl(t.rcv_wup);
+
+	flow_dbg(conn,
+		 "Extended migration data, socket %i sequences send %u receive %u",
+		 s, t.seq_snd, t.seq_rcv);
+	flow_dbg(conn, "  pending queues: send %u not sent %u receive %u",
+		 t.sndq, t.notsent, t.rcvq);
+	flow_dbg(conn,
+		 "  window: snd_wl1 %u snd_wnd %u max %u rcv_wnd %u rcv_wup %u",
+		 t.snd_wl1, t.snd_wnd, t.max_window, t.rcv_wnd, t.rcv_wup);
+	flow_dbg(conn, "  SO_PEEK_OFF %s  offset=%"PRIu32,
+		 peek_offset_cap ? "enabled" : "disabled", peek_offset);
+
+	if (t.sndq > TCP_MIGRATE_SND_QUEUE_MAX || t.notsent > t.sndq ||
+	    t.rcvq > TCP_MIGRATE_RCV_QUEUE_MAX) {
+		flow_err(conn,
+			 "Bad queues socket %i, send: %u, not sent: %u, receive: %u",
+			 s, t.sndq, t.notsent, t.rcvq);
+		return -EINVAL;
+	}
+
+	if (read_all_buf(fd, tcp_migrate_snd_queue, t.sndq)) {
+		rc = -errno;
+		flow_perror(conn, "Failed to read send queue data");
+		return rc;
+	}
+
+	if (read_all_buf(fd, tcp_migrate_rcv_queue, t.rcvq)) {
+		rc = -errno;
+		flow_perror(conn, "Failed to read receive queue data");
+		return rc;
+	}
+
+	if (conn->sock < 0)
+		/* We weren't able to create the socket, discard flow */
+		goto fail;
+
+	if (tcp_flow_repair_timestamp(conn, &t))
+		goto fail;
+
+	if (tcp_flow_select_queue(conn, TCP_SEND_QUEUE))
+		goto fail;
+
+	if (tcp_flow_repair_seq(conn, &t.seq_snd))
+		goto fail;
+
+	if (tcp_flow_select_queue(conn, TCP_RECV_QUEUE))
+		goto fail;
+
+	if (tcp_flow_repair_seq(conn, &t.seq_rcv))
+		goto fail;
+
+	if (tcp_flow_repair_connect(c, conn))
+		goto fail;
+
+	if (tcp_flow_repair_queue(conn, t.rcvq, tcp_migrate_rcv_queue))
+		goto fail;
+
+	if (tcp_flow_select_queue(conn, TCP_SEND_QUEUE))
+		goto fail;
+
+	if (tcp_flow_repair_queue(conn, t.sndq - t.notsent,
+				  tcp_migrate_snd_queue))
+		goto fail;
+
+	if (tcp_flow_repair_opt(conn, &t))
+		goto fail;
+
+	/* If we sent a FIN sent and it was acknowledged (TCP_FIN_WAIT2), don't
+	 * send it out, because we already sent it for sure.
+	 *
+	 * Call shutdown(x, SHUT_WR) in repair mode, so that we move to
+	 * FIN_WAIT_1 (tcp_shutdown()) without sending anything
+	 * (goto in tcp_write_xmit()).
+	 */
+	if (t.tcpi_state == TCP_FIN_WAIT2) {
+		int v;
+
+		v = TCP_SEND_QUEUE;
+		if (setsockopt(s, SOL_TCP, TCP_REPAIR_QUEUE, &v, sizeof(v)))
+			flow_perror(conn, "Selecting repair queue");
+		else
+			shutdown(s, SHUT_WR);
+	}
+
+	if (tcp_flow_repair_wnd(conn, &t))
+		goto fail;
+
+	tcp_flow_repair_off(c, conn);
+	repair_flush(c);
+
+	if (t.notsent) {
+		if (tcp_flow_repair_queue(conn, t.notsent,
+					  tcp_migrate_snd_queue +
+					  (t.sndq - t.notsent))) {
+			/* This sometimes seems to fail for unclear reasons.
+			 * Don't fail the whole migration, just reset the flow
+			 * and carry on to the next one.
+			 */
+			goto fail;
+		}
+	}
+
+	/* If we sent a FIN but it wasn't acknowledged yet (TCP_FIN_WAIT1), send
+	 * it out, because we don't know if we already sent it.
+	 *
+	 * Call shutdown(x, SHUT_WR) *not* in repair mode, which moves us to
+	 * TCP_FIN_WAIT1.
+	 */
+	if (t.tcpi_state == TCP_FIN_WAIT1)
+		shutdown(s, SHUT_WR);
+
+	if (tcp_set_peek_offset(conn, peek_offset))
+		goto fail;
+
+	tcp_send_flag(c, conn, ACK);
+	tcp_data_from_sock(c, conn);
+
+	if ((rc = tcp_epoll_ctl(c, conn))) {
+		flow_dbg(conn,
+			 "Failed to subscribe to epoll for migrated socket: %s",
+			 strerror_(-rc));
+		goto fail;
+	}
+
+	return 0;
+
+fail:
+	if (conn->sock >= 0) {
+		tcp_flow_repair_off(c, conn);
+		repair_flush(c);
+	}
+
+	conn->flags = 0; /* Not waiting for ACK, don't schedule timer */
+	tcp_rst(c, conn);
+
+	return 0;
 }

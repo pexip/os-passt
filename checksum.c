@@ -49,12 +49,17 @@
 #include <arpa/inet.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <netinet/ip_icmp.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include <linux/udp.h>
-#include <linux/icmp.h>
 #include <linux/icmpv6.h>
+
+#include "util.h"
+#include "ip.h"
+#include "checksum.h"
+#include "iov.h"
 
 /* Checksums are optional for UDP over IPv4, so we usually just set
  * them to 0.  Change this to 1 to calculate real UDP over IPv4
@@ -69,9 +74,18 @@
  *
  * Return: 32-bit sum of 16-bit words
 */
+/* Type-Based Alias Analysis (TBAA) optimisation in gcc 11 and 12 (-flto -O2)
+ * makes these functions essentially useless by allowing reordering of stores of
+ * input data across function calls. Not even declaring @in as char pointer is
+ * enough: disable gcc's interpretation of strict aliasing altogether. See also:
+ *
+ *	https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106706
+ *	https://stackoverflow.com/questions/2958633/gcc-strict-aliasing-and-horror-stories
+ *	https://lore.kernel.org/all/alpine.LFD.2.00.0901121128080.6528__33422.5328093909$1232291247$gmane$org@localhost.localdomain/
+ */
 /* NOLINTNEXTLINE(clang-diagnostic-unknown-attributes) */
-__attribute__((optimize("-fno-strict-aliasing")))	/* See siphash_8b() */
-uint32_t sum_16b(const void *buf, size_t len)
+__attribute__((optimize("-fno-strict-aliasing")))
+static uint32_t sum_16b(const void *buf, size_t len)
 {
 	const uint16_t *p = buf;
 	uint32_t sum = 0;
@@ -93,7 +107,7 @@ uint32_t sum_16b(const void *buf, size_t len)
  *
  * Return: 16-bit folded sum
  */
-uint16_t csum_fold(uint32_t sum)
+static uint16_t csum_fold(uint32_t sum)
 {
 	while (sum >> 16)
 		sum = (sum & 0xffff) + (sum >> 16);
@@ -102,28 +116,64 @@ uint16_t csum_fold(uint32_t sum)
 }
 
 /**
- * csum_unaligned() - Compute TCP/IP-style checksum for not 32-byte aligned data
- * @buf:	Input data
- * @len:	Input length
- * @init:	Initial 32-bit checksum, 0 for no pre-computed checksum
+ * csum_ip4_header() - Calculate IPv4 header checksum
+ * @l3len:	IPv4 packet length (host order)
+ * @protocol:	Protocol number
+ * @saddr:	IPv4 source address
+ * @daddr:	IPv4 destination address
  *
- * Return: 16-bit IPv4-style checksum
+ * Return: 16-bit folded sum of the IPv4 header
  */
-/* NOLINTNEXTLINE(clang-diagnostic-unknown-attributes) */
-__attribute__((optimize("-fno-strict-aliasing")))	/* See siphash_8b() */
-uint16_t csum_unaligned(const void *buf, size_t len, uint32_t init)
+uint16_t csum_ip4_header(uint16_t l3len, uint8_t protocol,
+			 struct in_addr saddr, struct in_addr daddr)
 {
-	return (uint16_t)~csum_fold(sum_16b(buf, len) + init);
+	uint32_t sum = L2_BUF_IP4_PSUM(protocol);
+
+	sum += htons(l3len);
+	sum += (saddr.s_addr >> 16) & 0xffff;
+	sum += saddr.s_addr & 0xffff;
+	sum += (daddr.s_addr >> 16) & 0xffff;
+	sum += daddr.s_addr & 0xffff;
+
+	return ~csum_fold(sum);
 }
 
 /**
- * csum_ip4_header() - Calculate and set IPv4 header checksum
- * @ip4h:	IPv4 header
+ * proto_ipv4_header_psum() - Calculates the partial checksum of an
+ * 			      IPv4 header for UDP or TCP
+ * @l4len:	IPv4 Payload length (host order)
+ * @proto:	Protocol number
+ * @saddr:	Source address
+ * @daddr:	Destination address
+ * Returns:	Partial checksum of the IPv4 header
  */
-void csum_ip4_header(struct iphdr *ip4h)
+uint32_t proto_ipv4_header_psum(uint16_t l4len, uint8_t protocol,
+				struct in_addr saddr, struct in_addr daddr)
 {
-	ip4h->check = 0;
-	ip4h->check = csum_unaligned(ip4h, (size_t)ip4h->ihl * 4, 0);
+	uint32_t psum = htons(protocol);
+
+	psum += (saddr.s_addr >> 16) & 0xffff;
+	psum += saddr.s_addr & 0xffff;
+	psum += (daddr.s_addr >> 16) & 0xffff;
+	psum += daddr.s_addr & 0xffff;
+	psum += htons(l4len);
+
+	return psum;
+}
+
+/**
+ * csum() - Compute TCP/IP-style checksum
+ * @buf:	Input buffer
+ * @len:	Input length
+ * @init:	Initial 32-bit checksum, 0 for no pre-computed checksum
+ *
+ * Return: 16-bit folded, complemented checksum
+ */
+/* NOLINTNEXTLINE(clang-diagnostic-unknown-attributes) */
+__attribute__((optimize("-fno-strict-aliasing")))	/* See csum_16b() */
+static uint16_t csum(const void *buf, size_t len, uint32_t init)
+{
+	return (uint16_t)~csum_fold(csum_unfolded(buf, len, init));
 }
 
 /**
@@ -131,26 +181,22 @@ void csum_ip4_header(struct iphdr *ip4h)
  * @udp4hr:	UDP header, initialised apart from checksum
  * @saddr:	IPv4 source address
  * @daddr:	IPv4 destination address
- * @payload:	ICMPv4 packet payload
- * @len:	Length of @payload (not including UDP)
+ * @data:	UDP payload (as IO vector tail)
  */
 void csum_udp4(struct udphdr *udp4hr,
 	       struct in_addr saddr, struct in_addr daddr,
-	       const void *payload, size_t len)
+	       struct iov_tail *data)
 {
 	/* UDP checksums are optional, so don't bother */
 	udp4hr->check = 0;
 
 	if (UDP4_REAL_CHECKSUMS) {
-		/* UNTESTED: if we did want real UDPv4 checksums, this
-		 * is roughly what we'd need */
-		uint32_t psum = csum_fold(saddr.s_addr)
-			+ csum_fold(daddr.s_addr)
-			+ htons(len + sizeof(*udp4hr))
-			+ htons(IPPROTO_UDP);
-		/* Add in partial checksum for the UDP header alone */
-		psum += sum_16b(udp4hr, sizeof(*udp4hr));
-		udp4hr->check = csum_unaligned(payload, len, psum);
+		uint16_t l4len = iov_tail_size(data) + sizeof(struct udphdr);
+		uint32_t psum = proto_ipv4_header_psum(l4len, IPPROTO_UDP,
+						       saddr, daddr);
+
+		psum = csum_unfolded(udp4hr, sizeof(struct udphdr), psum);
+		udp4hr->check = csum_iov_tail(data, psum);
 	}
 }
 
@@ -158,9 +204,9 @@ void csum_udp4(struct udphdr *udp4hr,
  * csum_icmp4() - Calculate and set checksum for an ICMP packet
  * @icmp4hr:	ICMP header, initialised apart from checksum
  * @payload:	ICMP packet payload
- * @len:	Length of @payload (not including ICMP header)
+ * @dlen:	Length of @payload (not including ICMP header)
  */
-void csum_icmp4(struct icmphdr *icmp4hr, const void *payload, size_t len)
+void csum_icmp4(struct icmphdr *icmp4hr, const void *payload, size_t dlen)
 {
 	uint32_t psum;
 
@@ -169,28 +215,49 @@ void csum_icmp4(struct icmphdr *icmp4hr, const void *payload, size_t len)
 	/* Partial checksum for ICMP header alone */
 	psum = sum_16b(icmp4hr, sizeof(*icmp4hr));
 
-	icmp4hr->checksum = csum_unaligned(payload, len, psum);
+	icmp4hr->checksum = csum(payload, dlen, psum);
+}
+
+/**
+ * proto_ipv6_header_psum() - Calculates the partial checksum of an
+ * 			      IPv6 header for UDP or TCP
+ * @payload_len:	IPv6 payload length (host order)
+ * @proto:		Protocol number
+ * @saddr:		Source address
+ * @daddr:		Destination address
+ * Returns:	Partial checksum of the IPv6 header
+ */
+uint32_t proto_ipv6_header_psum(uint16_t payload_len, uint8_t protocol,
+				const struct in6_addr *saddr,
+				const struct in6_addr *daddr)
+{
+	uint32_t sum = htons(protocol) + htons(payload_len);
+
+	sum += sum_16b(saddr, sizeof(*saddr));
+	sum += sum_16b(daddr, sizeof(*daddr));
+
+	return sum;
 }
 
 /**
  * csum_udp6() - Calculate and set checksum for a UDP over IPv6 packet
  * @udp6hr:	UDP header, initialised apart from checksum
- * @payload:	UDP packet payload
- * @len:	Length of @payload (not including UDP header)
+ * @saddr:	Source address
+ * @daddr:	Destination address
+ * @data:	UDP payload (as IO vector tail)
  */
 void csum_udp6(struct udphdr *udp6hr,
 	       const struct in6_addr *saddr, const struct in6_addr *daddr,
-	       const void *payload, size_t len)
+	       struct iov_tail *data)
 {
-	/* Partial checksum for the pseudo-IPv6 header */
-	uint32_t psum = sum_16b(saddr, sizeof(*saddr)) +
-		        sum_16b(daddr, sizeof(*daddr)) +
-		        htons(len + sizeof(*udp6hr)) + htons(IPPROTO_UDP);
+	uint16_t l4len = iov_tail_size(data) + sizeof(struct udphdr);
+	uint32_t psum = proto_ipv6_header_psum(l4len, IPPROTO_UDP,
+					       saddr, daddr);
 
 	udp6hr->check = 0;
-	/* Add in partial checksum for the UDP header alone */
-	psum += sum_16b(udp6hr, sizeof(*udp6hr));
-	udp6hr->check = csum_unaligned(payload, len, psum);
+
+	psum = csum_unfolded(udp6hr, sizeof(struct udphdr), psum);
+	udp6hr->check = csum_iov_tail(data, psum);
 }
 
 /**
@@ -199,21 +266,19 @@ void csum_udp6(struct udphdr *udp6hr,
  * @saddr:	IPv6 source address
  * @daddr:	IPv6 destination address
  * @payload:	ICMP packet payload
- * @len:	Length of @payload (not including ICMPv6 header)
+ * @dlen:	Length of @payload (not including ICMPv6 header)
  */
 void csum_icmp6(struct icmp6hdr *icmp6hr,
 		const struct in6_addr *saddr, const struct in6_addr *daddr,
-		const void *payload, size_t len)
+		const void *payload, size_t dlen)
 {
-	/* Partial checksum for the pseudo-IPv6 header */
-	uint32_t psum = sum_16b(saddr, sizeof(*saddr)) +
-		        sum_16b(daddr, sizeof(*daddr)) +
-		        htons(len + sizeof(*icmp6hr)) + htons(IPPROTO_ICMPV6);
+	uint32_t psum = proto_ipv6_header_psum(dlen + sizeof(*icmp6hr),
+					       IPPROTO_ICMPV6, saddr, daddr);
 
 	icmp6hr->icmp6_cksum = 0;
 	/* Add in partial checksum for the ICMPv6 header alone */
 	psum += sum_16b(icmp6hr, sizeof(*icmp6hr));
-	icmp6hr->icmp6_cksum = csum_unaligned(payload, len, psum);
+	icmp6hr->icmp6_cksum = csum(payload, dlen, psum);
 }
 
 #ifdef __AVX2__
@@ -247,7 +312,7 @@ void csum_icmp6(struct icmp6hdr *icmp6hr,
  * - coding style adaptation
  */
 /* NOLINTNEXTLINE(clang-diagnostic-unknown-attributes) */
-__attribute__((optimize("-fno-strict-aliasing")))	/* See siphash_8b() */
+__attribute__((optimize("-fno-strict-aliasing")))	/* See csum_16b() */
 static uint32_t csum_avx2(const void *buf, size_t len, uint32_t init)
 {
 	__m256i a, b, sum256, sum_a_hi, sum_a_lo, sum_b_hi, sum_b_lo, c, d;
@@ -387,35 +452,69 @@ less_than_128_bytes:
 }
 
 /**
- * csum() - Compute TCP/IP-style checksum
- * @buf:	Input buffer, must be aligned to 32-byte boundary
- * @len:	Input length
- * @init:	Initial 32-bit checksum, 0 for no pre-computed checksum
+ * csum_unfolded - Calculate the unfolded checksum of a data buffer.
  *
- * Return: 16-bit folded, complemented checksum sum
+ * @buf:   Input buffer
+ * @len:   Input length
+ * @init:  Initial 32-bit checksum, 0 for no pre-computed checksum
+ *
+ * Return: 32-bit unfolded
  */
 /* NOLINTNEXTLINE(clang-diagnostic-unknown-attributes) */
-__attribute__((optimize("-fno-strict-aliasing")))	/* See siphash_8b() */
-uint16_t csum(const void *buf, size_t len, uint32_t init)
+__attribute__((optimize("-fno-strict-aliasing")))	/* See csum_16b() */
+uint32_t csum_unfolded(const void *buf, size_t len, uint32_t init)
 {
-	return (uint16_t)~csum_fold(csum_avx2(buf, len, init));
-}
+	intptr_t align = ROUND_UP((intptr_t)buf, sizeof(__m256i));
+	unsigned int pad = align - (intptr_t)buf;
 
+	/* Don't mix sum_16b() and csum_avx2() with odd padding lengths */
+	if (pad & 1 || len < pad)
+		pad = len;
+
+	if (pad)
+		init += sum_16b(buf, pad);
+
+	if (len > pad)
+		init = csum_avx2((void *)align, len - pad, init);
+
+	return init;
+}
 #else /* __AVX2__ */
+/**
+ * csum_unfolded - Calculate the unfolded checksum of a data buffer.
+ *
+ * @buf:   Input buffer
+ * @len:   Input length
+ * @init:  Initial 32-bit checksum, 0 for no pre-computed checksum
+ *
+ * Return: 32-bit unfolded checksum
+ */
+/* NOLINTNEXTLINE(clang-diagnostic-unknown-attributes) */
+__attribute__((optimize("-fno-strict-aliasing")))	/* See csum_16b() */
+uint32_t csum_unfolded(const void *buf, size_t len, uint32_t init)
+{
+	return sum_16b(buf, len) + init;
+}
+#endif /* !__AVX2__ */
 
 /**
- * csum() - Compute TCP/IP-style checksum
- * @buf:	Input buffer
- * @len:	Input length
- * @sum:	Initial 32-bit checksum, 0 for no pre-computed checksum
+ * csum_iov_tail() - Calculate unfolded checksum for the tail of an IO vector
+ * @tail:	IO vector tail to checksum
+ * @init	Initial 32-bit checksum, 0 for no pre-computed checksum
  *
  * Return: 16-bit folded, complemented checksum
  */
-/* NOLINTNEXTLINE(clang-diagnostic-unknown-attributes) */
-__attribute__((optimize("-fno-strict-aliasing")))	/* See siphash_8b() */
-uint16_t csum(const void *buf, size_t len, uint32_t init)
+uint16_t csum_iov_tail(struct iov_tail *tail, uint32_t init)
 {
-	return csum_unaligned(buf, len, init);
-}
+	if (iov_tail_prune(tail)) {
+		size_t i;
 
-#endif /* !__AVX2__ */
+		init = csum_unfolded((char *)tail->iov[0].iov_base + tail->off,
+				     tail->iov[0].iov_len - tail->off, init);
+		for (i = 1; i < tail->cnt; i++) {
+			const struct iovec *iov = &tail->iov[i];
+			init = csum_unfolded(iov->iov_base, iov->iov_len, init);
+		}
+	}
+	return (uint16_t)~csum_fold(init);
+}

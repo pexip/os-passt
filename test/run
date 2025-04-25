@@ -38,6 +38,9 @@ TRACE=${TRACE:-0}
 # If set, tell passt and pasta to take packet captures
 PCAP=${PCAP:-0}
 
+# Custom kernel to boot guests with, if given
+KERNEL=${KERNEL:-"/boot/vmlinuz-$(uname -r)"}
+
 COMMIT="$(git log --oneline --no-decorate -1)"
 
 . lib/util
@@ -82,10 +85,15 @@ run() {
 	test pasta_options/log_to_file
 	teardown pasta_options
 
+	setup build
+	test pasta_podman/bats
+	teardown build
+
 	setup memory
 	test memory/passt
 	teardown memory
 
+	VHOST_USER=0
 	setup passt
 	test passt/ndp
 	test passt/dhcp
@@ -97,7 +105,7 @@ run() {
 	VALGRIND=1
 	setup passt_in_ns
 	test passt/ndp
-	test passt/dhcp
+	test passt_in_ns/dhcp
 	test passt_in_ns/icmp
 	test passt_in_ns/tcp
 	test passt_in_ns/udp
@@ -108,15 +116,76 @@ run() {
 	test two_guests/basic
 	teardown two_guests
 
+	VHOST_USER=1
+	setup passt_in_ns
+	test passt_vu/ndp
+	test passt_vu_in_ns/dhcp
+	test passt_vu_in_ns/icmp
+	test passt_vu_in_ns/tcp
+	test passt_vu_in_ns/udp
+	test passt_vu_in_ns/shutdown
+	teardown passt_in_ns
+
+	setup two_guests
+	test two_guests_vu/basic
+	teardown two_guests
+
+	setup migrate
+	test migrate/basic
+	teardown migrate
+	setup migrate
+	test migrate/basic_fin
+	teardown migrate
+	setup migrate
+	test migrate/bidirectional
+	teardown migrate
+	setup migrate
+	test migrate/bidirectional_fin
+	teardown migrate
+	setup migrate
+	test migrate/iperf3_out4
+	teardown migrate
+	setup migrate
+	test migrate/iperf3_out6
+	teardown migrate
+	setup migrate
+	test migrate/iperf3_in4
+	teardown migrate
+	setup migrate
+	test migrate/iperf3_in6
+	teardown migrate
+	setup migrate
+	test migrate/iperf3_bidir6
+	teardown migrate
+	setup migrate
+	test migrate/iperf3_many_out6
+	teardown migrate
+	setup migrate
+	test migrate/rampstream_in
+	teardown migrate
+	setup migrate
+	test migrate/rampstream_out
+	teardown migrate
+
 	VALGRIND=0
+	VHOST_USER=0
 	setup passt_in_ns
 	test passt/ndp
-	test passt/dhcp
+	test passt_in_ns/dhcp
 	test perf/passt_tcp
 	test perf/passt_udp
 	test perf/pasta_tcp
 	test perf/pasta_udp
 	test passt_in_ns/shutdown
+	teardown passt_in_ns
+
+	VHOST_USER=1
+	setup passt_in_ns
+	test passt_vu/ndp
+	test passt_vu_in_ns/dhcp
+	test perf/passt_vu_tcp
+	test perf/passt_vu_udp
+	test passt_vu_in_ns/shutdown
 	teardown passt_in_ns
 
 	# TODO: Make those faster by at least pre-installing gcc and make on
@@ -154,7 +223,10 @@ run_selected() {
 
 	__setup=
 	for __test; do
-		if [ "${__test%%/*}" != "${__setup}" ]; then
+		# HACK: the migrate tests need the setup repeated for
+		#       each test
+		if [ "${__test%%/*}" != "${__setup}" -o		\
+		     "${__test%%/*}" = "migrate" ]; then
 			[ -n "${__setup}" ] && teardown "${__setup}"
 			__setup="${__test%%/*}"
 			setup "${__setup}"

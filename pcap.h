@@ -6,8 +6,10 @@
 #ifndef PCAP_H
 #define PCAP_H
 
-void pcap(const char *pkt, size_t len);
-void pcap_multiple(const struct iovec *iov, unsigned int n, size_t offset);
+void pcap(const char *pkt, size_t l2len);
+void pcap_multiple(const struct iovec *iov, size_t frame_parts, unsigned int n,
+		   size_t offset);
+void pcap_iov(const struct iovec *iov, size_t iovcnt, size_t offset);
 void pcap_init(struct ctx *c);
 
 #endif /* PCAP_H */

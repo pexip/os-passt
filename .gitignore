@@ -3,8 +3,10 @@
 /passt.avx2
 /pasta
 /pasta.avx2
+/passt-repair
 /qrap
 /pasta.1
 /seccomp.h
-/s*.json
+/seccomp_repair.h
+/c*.json
 README.plain.md

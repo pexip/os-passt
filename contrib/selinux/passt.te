@@ -20,8 +20,18 @@ require {
 	type fs_t;
 	type tmp_t;
 	type user_tmp_t;
+	type user_home_t;
 	type tmpfs_t;
 	type root_t;
+
+	# Workaround: passt --vhost-user needs to map guest memory, but
+	# libvirt doesn't maintain its own policy, which makes updates
+	# particularly complicated. To avoid breakage in the short term,
+	# deal with it in passt's own policy.
+	type svirt_image_t;
+	type svirt_tmpfs_t;
+	type svirt_t;
+	type null_device_t;
 
 	class file { ioctl getattr setattr create read write unlink open relabelto execute execute_no_trans map };
 	class dir { search write add_name remove_name mounton };
@@ -38,7 +48,7 @@ require {
 	type net_conf_t;
 	type proc_net_t;
 	type node_t;
-	class tcp_socket { create accept listen name_bind name_connect };
+	class tcp_socket { create accept listen name_bind name_connect getattr ioctl };
 	class udp_socket { create accept listen };
 	class icmp_socket { bind create name_bind node_bind setopt read write };
 	class sock_file { create unlink write };
@@ -48,9 +58,11 @@ require {
 	type http_port_t;
 
 	class netlink_route_socket { bind create nlmsg_read };
+	type sysctl_net_t;
 
-	class capability sys_tty_config;
+	class capability { sys_tty_config setuid setgid };
 	class cap_userns { setpcap sys_admin sys_ptrace };
+	class user_namespace create;
 }
 
 type passt_t;
@@ -78,6 +90,9 @@ allow passt_t root_t:dir mounton;
 allow passt_t tmp_t:dir { add_name mounton remove_name write };
 allow passt_t tmpfs_t:filesystem mount;
 allow passt_t fs_t:filesystem unmount;
+allow passt_t user_home_t:dir search;
+allow passt_t user_tmp_t:fifo_file append;
+allow passt_t user_tmp_t:file map;
 
 manage_files_pattern(passt_t, user_tmp_t, user_tmp_t)
 files_pid_filetrans(passt_t, user_tmp_t, file)
@@ -88,14 +103,20 @@ logging_send_syslog_msg(passt_t)
 allow syslogd_t self:cap_userns sys_ptrace;
 
 allow passt_t self:process setcap;
-allow passt_t self:capability { sys_tty_config setpcap net_bind_service };
+allow passt_t self:capability { sys_tty_config setpcap net_bind_service setuid setgid};
 allow passt_t self:cap_userns { setpcap sys_admin sys_ptrace };
+allow passt_t self:user_namespace create;
+
+auth_read_passwd(passt_t)
 
 allow passt_t proc_net_t:file read;
 allow passt_t net_conf_t:file { open read };
 allow passt_t net_conf_t:lnk_file read;
 allow passt_t tmp_t:sock_file { create unlink write };
 allow passt_t self:netlink_route_socket { bind create nlmsg_read read write setopt };
+kernel_search_network_sysctl(passt_t)
+allow passt_t sysctl_net_t:dir search;
+allow passt_t sysctl_net_t:file { open read };
 
 corenet_tcp_bind_all_nodes(passt_t)
 corenet_udp_bind_all_nodes(passt_t)
@@ -111,10 +132,19 @@ corenet_udp_sendrecv_all_ports(passt_t)
 allow passt_t node_t:icmp_socket { name_bind node_bind };
 allow passt_t port_t:icmp_socket name_bind;
 
-allow passt_t self:tcp_socket { create getopt setopt connect bind listen accept shutdown read write };
+allow passt_t self:tcp_socket { create getopt setopt connect bind listen accept shutdown read write getattr ioctl };
 allow passt_t self:udp_socket { create getopt setopt connect bind read write };
 allow passt_t self:icmp_socket { bind create setopt read write };
 
 allow passt_t user_tmp_t:dir { add_name write };
 allow passt_t user_tmp_t:file { create open };
 allow passt_t user_tmp_t:sock_file { create read write unlink };
+allow passt_t unconfined_t:unix_stream_socket { read write };
+
+# Workaround: passt --vhost-user needs to map guest memory, but
+# libvirt doesn't maintain its own policy, which makes updates
+# particularly complicated. To avoid breakage in the short term,
+# deal with it in passt's own policy.
+allow passt_t svirt_image_t:file { read write map };
+allow passt_t svirt_tmpfs_t:file { read write map };
+allow passt_t null_device_t:chr_file map;

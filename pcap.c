@@ -31,32 +31,13 @@
 #include "util.h"
 #include "passt.h"
 #include "log.h"
+#include "pcap.h"
+#include "iov.h"
+#include "tap.h"
 
 #define PCAP_VERSION_MINOR 4
 
 static int pcap_fd = -1;
-
-/* See pcap.h from libpcap, or pcap-savefile(5) */
-static const struct {
-	uint32_t magic;
-#define PCAP_MAGIC		0xa1b2c3d4
-
-	uint16_t major;
-#define PCAP_VERSION_MAJOR	2
-
-	uint16_t minor;
-#define PCAP_VERSION_MINOR	4
-
-	int32_t thiszone;
-	uint32_t sigfigs;
-	uint32_t snaplen;
-
-	uint32_t linktype;
-#define PCAP_LINKTYPE_ETHERNET	1
-} pcap_hdr = {
-	PCAP_MAGIC, PCAP_VERSION_MAJOR, PCAP_VERSION_MINOR, 0, 0, ETH_MAX_MTU,
-	PCAP_LINKTYPE_ETHERNET
-};
 
 struct pcap_pkthdr {
 	uint32_t tv_sec;
@@ -67,67 +48,91 @@ struct pcap_pkthdr {
 
 /**
  * pcap_frame() - Capture a single frame to pcap file with given timestamp
- * @pkt:	Pointer to data buffer, including L2 headers
- * @len:	L2 packet length
- * @tv:		Timestamp
+ * @iov:	IO vector containing frame (with L2 headers and tap headers)
+ * @iovcnt:	Number of buffers (@iov entries) in frame
+ * @offset:	Byte offset of the L2 headers within @iov
+ * @now:	Timestamp
  *
  * Returns: 0 on success, -errno on error writing to the file
  */
-static int pcap_frame(const char *pkt, size_t len, const struct timeval *tv)
+static void pcap_frame(const struct iovec *iov, size_t iovcnt,
+		       size_t offset, const struct timespec *now)
 {
-	struct pcap_pkthdr h;
+	size_t l2len = iov_size(iov, iovcnt) - offset;
+	struct pcap_pkthdr h = {
+		.tv_sec = now->tv_sec,
+		.tv_usec = DIV_ROUND_CLOSEST(now->tv_nsec, 1000),
+		.caplen = l2len,
+		.len = l2len
+	};
 
-	h.tv_sec = tv->tv_sec;
-	h.tv_usec = tv->tv_usec;
-	h.caplen = h.len = len;
-
-	if (write(pcap_fd, &h, sizeof(h)) < 0 || write(pcap_fd, pkt, len) < 0)
-		return -errno;
-
-	return 0;
+	if (write_all_buf(pcap_fd, &h, sizeof(h)) < 0 ||
+	    write_remainder(pcap_fd, iov, iovcnt, offset) < 0)
+		debug_perror("Cannot log packet, length %zu", l2len);
 }
 
 /**
  * pcap() - Capture a single frame to pcap file
  * @pkt:	Pointer to data buffer, including L2 headers
- * @len:	L2 packet length
+ * @l2len:	L2 frame length
  */
-void pcap(const char *pkt, size_t len)
+void pcap(const char *pkt, size_t l2len)
 {
-	struct timeval tv;
+	struct iovec iov = { (char *)pkt, l2len };
+	struct timespec now = { 0 };
 
 	if (pcap_fd == -1)
 		return;
 
-	gettimeofday(&tv, NULL);
-	if (pcap_frame(pkt, len, &tv) != 0)
-		debug("Cannot log packet, length %lu", len);
+	if (clock_gettime(CLOCK_REALTIME, &now))
+		err_perror("Failed to get CLOCK_REALTIME time");
+
+	pcap_frame(&iov, 1, 0, &now);
 }
 
 /**
  * pcap_multiple() - Capture multiple frames
- * @iov:	Array of iovecs, one entry per frame
- * @n:		Number of frames to capture
- * @offset:	Offset of the frame within each iovec buffer
+ * @iov:		IO vector with @frame_parts * @n entries
+ * @frame_parts:	Number of IO vector items for each frame
+ * @n:			Number of frames to capture
+ * @offset:		Offset of the L2 frame within each iovec buffer
  */
-void pcap_multiple(const struct iovec *iov, unsigned int n, size_t offset)
+void pcap_multiple(const struct iovec *iov, size_t frame_parts, unsigned int n,
+		   size_t offset)
 {
-	struct timeval tv;
+	struct timespec now = { 0 };
 	unsigned int i;
 
 	if (pcap_fd == -1)
 		return;
 
-	gettimeofday(&tv, NULL);
+	if (clock_gettime(CLOCK_REALTIME, &now))
+		err_perror("Failed to get CLOCK_REALTIME time");
 
-	for (i = 0; i < n; i++) {
-		if (pcap_frame((char *)iov[i].iov_base + offset,
-			       iov[i].iov_len - offset, &tv) != 0) {
-			debug("Cannot log packet, length %lu",
-			      iov->iov_len - offset);
-			return;
-		}
-	}
+	for (i = 0; i < n; i++)
+		pcap_frame(iov + i * frame_parts, frame_parts, offset, &now);
+}
+
+/*
+ * pcap_iov - Write packet data described by an I/O vector
+ *		to a pcap file descriptor.
+ *
+ * @iov:	Pointer to the array of struct iovec describing the I/O vector
+ *		containing packet data to write, including L2 header
+ * @iovcnt:	Number of buffers (@iov entries)
+ * @offset:	Offset of the L2 frame within the full data length
+ */
+void pcap_iov(const struct iovec *iov, size_t iovcnt, size_t offset)
+{
+	struct timespec now = { 0 };
+
+	if (pcap_fd == -1)
+		return;
+
+	if (clock_gettime(CLOCK_REALTIME, &now))
+		err_perror("Failed to get CLOCK_REALTIME time");
+
+	pcap_frame(iov, iovcnt, offset, &now);
 }
 
 /**
@@ -136,7 +141,28 @@ void pcap_multiple(const struct iovec *iov, unsigned int n, size_t offset)
  */
 void pcap_init(struct ctx *c)
 {
-	int flags = O_WRONLY | O_CREAT | O_TRUNC;
+	/* See pcap.h from libpcap, or pcap-savefile(5) */
+#define PCAP_MAGIC		0xa1b2c3d4
+#define PCAP_VERSION_MAJOR	2
+#define PCAP_VERSION_MINOR	4
+#define PCAP_LINKTYPE_ETHERNET	1
+	const struct {
+		uint32_t magic;
+		uint16_t major;
+		uint16_t minor;
+
+		int32_t thiszone;
+		uint32_t sigfigs;
+		uint32_t snaplen;
+
+		uint32_t linktype;
+	} pcap_hdr = {
+		.magic = PCAP_MAGIC,
+		.major = PCAP_VERSION_MAJOR,
+		.minor = PCAP_VERSION_MINOR,
+		.snaplen = tap_l2_max_len(c),
+		.linktype = PCAP_LINKTYPE_ETHERNET
+	};
 
 	if (pcap_fd != -1)
 		return;
@@ -144,15 +170,14 @@ void pcap_init(struct ctx *c)
 	if (!*c->pcap)
 		return;
 
-	flags |= c->foreground ? O_CLOEXEC : 0;
-	pcap_fd = open(c->pcap, flags, S_IRUSR | S_IWUSR);
+	pcap_fd = output_file_open(c->pcap, O_WRONLY);
 	if (pcap_fd == -1) {
-		perror("open");
+		err_perror("Couldn't open pcap file %s", c->pcap);
 		return;
 	}
 
 	info("Saving packet capture to %s", c->pcap);
 
 	if (write(pcap_fd, &pcap_hdr, sizeof(pcap_hdr)) < 0)
-		warn("Cannot write PCAP header: %s", strerror(errno));
+		warn_perror("Cannot write PCAP header");
 }

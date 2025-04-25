@@ -33,14 +33,26 @@
 #include "util.h"
 #include "passt.h"
 #include "log.h"
+#include "ip.h"
 #include "netlink.h"
 
-#define NLBUFSIZ	(8192 * sizeof(struct nlmsghdr)) /* See netlink(7) */
+/* Same as RTA_NEXT() but for nexthops: RTNH_NEXT() doesn't take 'attrlen' */
+#define RTNH_NEXT_AND_DEC(rtnh, attrlen)				\
+	((attrlen) -= RTNH_ALIGN((rtnh)->rtnh_len), RTNH_NEXT(rtnh))
+
+/* Netlink expects a buffer of at least 8kiB or the system page size,
+ * whichever is larger.  32kiB is recommended for more efficient.
+ * Since the largest page size on any remotely common Linux setup is
+ * 64kiB (ppc64), that should cover it.
+ *
+ * https://www.kernel.org/doc/html/next/userspace-api/netlink/intro.html#buffer-sizing
+ */
+#define NLBUFSIZ 65536
 
 /* Socket in init, in target namespace, sequence (just needs to be monotonic) */
-static int nl_sock	= -1;
-static int nl_sock_ns	= -1;
-static int nl_seq;
+int nl_sock	= -1;
+int nl_sock_ns	= -1;
+static int nl_seq = 1;
 
 /**
  * nl_sock_init_do() - Set up netlink sockets in init or target namespace
@@ -97,103 +109,349 @@ fail:
 }
 
 /**
- * nl_req() - Send netlink request and read response
- * @ns:		Use netlink socket in namespace
- * @buf:	Buffer for response (at least NLBUFSIZ long)
- * @req:	Request with netlink header
+ * nl_send() - Prepare and send netlink request
+ * @s:		Netlink socket
+ * @req:	Request (will fill netlink header)
+ * @type:	Request type
+ * @flags:	Extra request flags (NLM_F_REQUEST and NLM_F_ACK assumed)
  * @len:	Request length
  *
- * Return: received length on success, negative error code on failure
+ * Return: sequence number of request on success, terminates on error
  */
-static int nl_req(int ns, char *buf, const void *req, ssize_t len)
+static uint32_t nl_send(int s, void *req, uint16_t type,
+		       uint16_t flags, ssize_t len)
 {
-	int s = ns ? nl_sock_ns : nl_sock, done = 0;
-	char flush[NLBUFSIZ];
+	struct nlmsghdr *nh;
 	ssize_t n;
 
-	while (!done && (n = recv(s, flush, sizeof(flush), MSG_DONTWAIT)) > 0) {
-		struct nlmsghdr *nh = (struct nlmsghdr *)flush;
-		size_t nm = n;
+	nh = (struct nlmsghdr *)req;
+	nh->nlmsg_type = type;
+	nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | flags;
+	nh->nlmsg_len = len;
+	nh->nlmsg_seq = nl_seq++;
+	nh->nlmsg_pid = 0;
 
-		for ( ; NLMSG_OK(nh, nm); nh = NLMSG_NEXT(nh, nm)) {
-			if (nh->nlmsg_type == NLMSG_DONE ||
-			    nh->nlmsg_type == NLMSG_ERROR) {
-				done = 1;
-				break;
-			}
-		}
+	n = send(s, req, len, 0);
+	if (n < 0)
+		die_perror("netlink: Failed to send()");
+	else if (n < len)
+		die("netlink: Short send (%zd of %zd bytes)", n, len);
+
+	return nh->nlmsg_seq;
+}
+
+/**
+ * nl_status() - Check status given by a netlink response
+ * @nh:		Netlink response header
+ * @n:		Remaining space in response buffer from @nh
+ * @seq:	Request sequence number we expect a response to
+ *
+ * Return: 0 if @nh indicated successful completion,
+ *         < 0, negative error code if @nh indicated failure
+ *         > 0 @n if there are more responses to request @seq
+ *     terminates if sequence numbers are out of sync
+ */
+static int nl_status(const struct nlmsghdr *nh, ssize_t n, uint32_t seq)
+{
+	ASSERT(NLMSG_OK(nh, n));
+
+	if (nh->nlmsg_seq != seq)
+		die("netlink: Unexpected sequence number (%u != %u)",
+		    nh->nlmsg_seq, seq);
+
+	if (nh->nlmsg_type == NLMSG_DONE) {
+		return 0;
+	}
+	if (nh->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *errmsg = (struct nlmsgerr *)NLMSG_DATA(nh);
+		return errmsg->error;
 	}
 
-	if ((send(s, req, len, 0) < len) ||
-	    (len = recv(s, buf, NLBUFSIZ, 0)) < 0)
-		return -errno;
+	return n;
+}
 
-	return len;
+/**
+ * nl_next() - Get next netlink response message, recv()ing if necessary
+ * @s:		Netlink socket
+ * @buf:	Buffer for responses (at least NLBUFSIZ long)
+ * @nh:		Previous message, or NULL if there are none
+ * @n:		Variable with remaining unread bytes in buffer (updated)
+ *
+ * Return: pointer to next unread netlink response message (may block)
+ */
+static struct nlmsghdr *nl_next(int s, char *buf, struct nlmsghdr *nh, ssize_t *n)
+{
+	if (nh) {
+		nh = NLMSG_NEXT(nh, *n);
+		if (NLMSG_OK(nh, *n))
+			return nh;
+	}
+
+	*n = recv(s, buf, NLBUFSIZ, 0);
+	if (*n < 0)
+		die_perror("netlink: Failed to recv()");
+
+	nh = (struct nlmsghdr *)buf;
+	if (!NLMSG_OK(nh, *n))
+		die("netlink: Response datagram with no message");
+
+	return nh;
+}
+
+/**
+ * nl_foreach - 'for' type macro to step through netlink response messages
+ * nl_foreach_oftype - as above, but only messages of expected type
+ * @nh:		Steps through each response header (struct nlmsghdr *)
+ * @status:	When loop exits indicates if there was an error (ssize_t)
+ * @s:		Netlink socket
+ * @buf:	Buffer for responses (at least NLBUFSIZ long)
+ * @seq:	Sequence number of request we're getting responses for
+ * @type:	Type of netlink message to process
+ */
+#define nl_foreach(nh, status, s, buf, seq)				\
+	for ((nh) = nl_next((s), (buf), NULL, &(status));		\
+	     ((status) = nl_status((nh), (status), (seq))) > 0;		\
+	     (nh) = nl_next((s), (buf), (nh), &(status)))
+
+#define nl_foreach_oftype(nh, status, s, buf, seq, type)		\
+	nl_foreach((nh), (status), (s), (buf), (seq))			\
+		if ((nh)->nlmsg_type != (type)) {			\
+			warn("netlink: Unexpected message type");	\
+		} else
+
+/**
+ * nl_do() - Send netlink "do" request, and wait for acknowledgement
+ * @s:		Netlink socket
+ * @req:	Request (will fill netlink header)
+ * @type:	Request type
+ * @flags:	Extra request flags (NLM_F_REQUEST and NLM_F_ACK assumed)
+ * @len:	Request length
+ *
+ * Return: 0 on success, negative error code on error
+ */
+static int nl_do(int s, void *req, uint16_t type, uint16_t flags, ssize_t len)
+{
+	struct nlmsghdr *nh;
+	char buf[NLBUFSIZ];
+	ssize_t status;
+	uint32_t seq;
+
+	seq = nl_send(s, req, type, flags, len);
+	nl_foreach(nh, status, s, buf, seq)
+		warn("netlink: Unexpected response message");
+
+	return status;
 }
 
 /**
  * nl_get_ext_if() - Get interface index supporting IP version being probed
+ * @s:	Netlink socket
  * @af:	Address family (AF_INET or AF_INET6) to look for connectivity
  *      for.
  *
  * Return: interface index, 0 if not found
  */
-unsigned int nl_get_ext_if(sa_family_t af)
+unsigned int nl_get_ext_if(int s, sa_family_t af)
 {
 	struct { struct nlmsghdr nlh; struct rtmsg rtm; } req = {
-		.nlh.nlmsg_type	 = RTM_GETROUTE,
-		.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP,
-		.nlh.nlmsg_len	 = NLMSG_LENGTH(sizeof(struct rtmsg)),
-		.nlh.nlmsg_seq	 = nl_seq++,
-
 		.rtm.rtm_table	 = RT_TABLE_MAIN,
 		.rtm.rtm_scope	 = RT_SCOPE_UNIVERSE,
 		.rtm.rtm_type	 = RTN_UNICAST,
 		.rtm.rtm_family	 = af,
 	};
+	unsigned defifi = 0, anyifi = 0;
+	unsigned ndef = 0, nany = 0;
 	struct nlmsghdr *nh;
 	struct rtattr *rta;
 	char buf[NLBUFSIZ];
-	ssize_t n;
+	ssize_t status;
+	uint32_t seq;
 	size_t na;
 
-	if ((n = nl_req(0, buf, &req, sizeof(req))) < 0)
-		return 0;
-
-	nh = (struct nlmsghdr *)buf;
-
-	for ( ; NLMSG_OK(nh, n); nh = NLMSG_NEXT(nh, n)) {
+	/* Look for an interface with a default route first, failing that, look
+	 * for any interface with a route, and pick the first one, if any.
+	 */
+	seq = nl_send(s, &req, RTM_GETROUTE, NLM_F_DUMP, sizeof(req));
+	nl_foreach_oftype(nh, status, s, buf, seq, RTM_NEWROUTE) {
 		struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nh);
+		const void *dst = NULL;
+		unsigned thisifi = 0;
 
-		if (rtm->rtm_dst_len || rtm->rtm_family != af)
+		if (rtm->rtm_family != af)
 			continue;
 
 		for (rta = RTM_RTA(rtm), na = RTM_PAYLOAD(nh); RTA_OK(rta, na);
 		     rta = RTA_NEXT(rta, na)) {
-			unsigned int ifi;
+			if (rta->rta_type == RTA_OIF) {
+				thisifi = *(unsigned int *)RTA_DATA(rta);
+			} else if (rta->rta_type == RTA_MULTIPATH) {
+				const struct rtnexthop *rtnh;
 
-			if (rta->rta_type != RTA_OIF)
-				continue;
+				rtnh = (struct rtnexthop *)RTA_DATA(rta);
+				thisifi = rtnh->rtnh_ifindex;
+			} else if (rta->rta_type == RTA_DST) {
+				dst = RTA_DATA(rta);
+			}
+		}
 
-			ifi = *(unsigned int *)RTA_DATA(rta);
+		if (!thisifi)
+			continue; /* No interface for this route */
 
-			return ifi;
+		/* Skip 'lo': we should test IFF_LOOPBACK, but keep it simple */
+		if (thisifi == 1)
+			continue;
+
+		/* Skip routes to link-local addresses */
+		if (af == AF_INET && dst &&
+		    IN4_IS_PREFIX_LINKLOCAL(dst, rtm->rtm_dst_len))
+			continue;
+
+		if (af == AF_INET6 && dst &&
+		    IN6_IS_PREFIX_LINKLOCAL(dst, rtm->rtm_dst_len))
+			continue;
+
+		if (rtm->rtm_dst_len == 0) {
+			/* Default route */
+			ndef++;
+			if (!defifi)
+				defifi = thisifi;
+		} else {
+			/* Non-default route */
+			nany++;
+			if (!anyifi)
+				anyifi = thisifi;
 		}
 	}
+
+	if (status < 0)
+		warn("netlink: RTM_GETROUTE failed: %s", strerror_(-status));
+
+	if (defifi) {
+		if (ndef > 1) {
+			info("Multiple default %s routes, picked first",
+			     af_name(af));
+		}
+		return defifi;
+	}
+
+	if (anyifi) {
+		if (nany > 1) {
+			info("Multiple interfaces with %s routes, picked first",
+			     af_name(af));
+		}
+		return anyifi;
+	}
+
+	if (!nany)
+		info("No interfaces with usable %s routes", af_name(af));
 
 	return 0;
 }
 
 /**
- * nl_route() - Get/set/copy routes for given interface and address family
- * @op:		Requested operation
- * @ifi:	Interface index in outer network namespace
- * @ifi_ns:	Interface index in target namespace for NL_SET, NL_DUP
- * @af:		Address family
- * @gw:		Default gateway to fill on NL_GET, to set on NL_SET
+ * nl_route_get_def_multipath() - Get lowest-weight route from nexthop list
+ * @rta:	Routing netlink attribute with type RTA_MULTIPATH
+ * @gw:		Default gateway to fill
+ *
+ * Return: true if a gateway was found, false otherwise
  */
-void nl_route(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
-	      sa_family_t af, void *gw)
+static bool nl_route_get_def_multipath(struct rtattr *rta, void *gw)
+{
+	int nh_len = RTA_PAYLOAD(rta);
+	struct rtnexthop *rtnh;
+	bool found = false;
+	int hops = -1;
+
+	for (rtnh = (struct rtnexthop *)RTA_DATA(rta);
+	     RTNH_OK(rtnh, nh_len); rtnh = RTNH_NEXT_AND_DEC(rtnh, nh_len)) {
+		size_t len = rtnh->rtnh_len - sizeof(*rtnh);
+		struct rtattr *rta_inner;
+
+		if (rtnh->rtnh_hops < hops)
+			continue;
+
+		hops = rtnh->rtnh_hops;
+
+		for (rta_inner = RTNH_DATA(rtnh); RTA_OK(rta_inner, len);
+		     rta_inner = RTA_NEXT(rta_inner, len)) {
+
+			if (rta_inner->rta_type != RTA_GATEWAY)
+				continue;
+
+			memcpy(gw, RTA_DATA(rta_inner), RTA_PAYLOAD(rta_inner));
+			found = true;
+		}
+	}
+
+	return found;
+}
+
+/**
+ * nl_route_get_def() - Get default route for given interface and address family
+ * @s:		Netlink socket
+ * @ifi:	Interface index
+ * @af:		Address family
+ * @gw:		Default gateway to fill on NL_GET
+ *
+ * Return: error on netlink failure, or 0 (gw unset if default route not found)
+ */
+int nl_route_get_def(int s, unsigned int ifi, sa_family_t af, void *gw)
+{
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct rtmsg rtm;
+		struct rtattr rta;
+		unsigned int ifi;
+	} req = {
+		.rtm.rtm_family	  = af,
+		.rtm.rtm_table	  = RT_TABLE_MAIN,
+		.rtm.rtm_scope	  = RT_SCOPE_UNIVERSE,
+		.rtm.rtm_type	  = RTN_UNICAST,
+
+		.rta.rta_type	  = RTA_OIF,
+		.rta.rta_len	  = RTA_LENGTH(sizeof(unsigned int)),
+		.ifi		  = ifi,
+	};
+	struct nlmsghdr *nh;
+	bool found = false;
+	char buf[NLBUFSIZ];
+	ssize_t status;
+	uint32_t seq;
+
+	seq = nl_send(s, &req, RTM_GETROUTE, NLM_F_DUMP, sizeof(req));
+	nl_foreach_oftype(nh, status, s, buf, seq, RTM_NEWROUTE) {
+		struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nh);
+		struct rtattr *rta;
+		size_t na;
+
+		if (found || rtm->rtm_dst_len)
+			continue;
+
+		for (rta = RTM_RTA(rtm), na = RTM_PAYLOAD(nh); RTA_OK(rta, na);
+		     rta = RTA_NEXT(rta, na)) {
+			if (rta->rta_type == RTA_MULTIPATH)
+				found = nl_route_get_def_multipath(rta, gw);
+
+			if (rta->rta_type != RTA_GATEWAY)
+				continue;
+
+			memcpy(gw, RTA_DATA(rta), RTA_PAYLOAD(rta));
+			found = true;
+		}
+	}
+	return status;
+}
+
+/**
+ * nl_route_set_def() - Set default route for given interface and address family
+ * @s:		Netlink socket
+ * @ifi:	Interface index in target namespace
+ * @af:		Address family
+ * @gw:		Default gateway to set
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_route_set_def(int s, unsigned int ifi, sa_family_t af, const void *gw)
 {
 	struct req_t {
 		struct nlmsghdr nlh;
@@ -209,16 +467,70 @@ void nl_route(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
 			} r6;
 			struct {
 				struct rtattr rta_dst;
-				uint32_t d;
+				struct in_addr d;
 				struct rtattr rta_gw;
-				uint32_t a;
+				struct in_addr a;
 			} r4;
 		} set;
 	} req = {
-		.nlh.nlmsg_type	  = op == NL_SET ? RTM_NEWROUTE : RTM_GETROUTE,
-		.nlh.nlmsg_flags  = NLM_F_REQUEST,
-		.nlh.nlmsg_seq	  = nl_seq++,
+		.rtm.rtm_family	  = af,
+		.rtm.rtm_table	  = RT_TABLE_MAIN,
+		.rtm.rtm_scope	  = RT_SCOPE_UNIVERSE,
+		.rtm.rtm_type	  = RTN_UNICAST,
+		.rtm.rtm_protocol = RTPROT_BOOT,
 
+		.rta.rta_type	  = RTA_OIF,
+		.rta.rta_len	  = RTA_LENGTH(sizeof(unsigned int)),
+		.ifi		  = ifi,
+	};
+	ssize_t len;
+
+	if (af == AF_INET6) {
+		size_t rta_len = RTA_LENGTH(sizeof(req.set.r6.d));
+
+		len = offsetof(struct req_t, set.r6) + sizeof(req.set.r6);
+
+		req.set.r6.rta_dst.rta_type = RTA_DST;
+		req.set.r6.rta_dst.rta_len = rta_len;
+
+		memcpy(&req.set.r6.a, gw, sizeof(req.set.r6.a));
+		req.set.r6.rta_gw.rta_type = RTA_GATEWAY;
+		req.set.r6.rta_gw.rta_len = rta_len;
+	} else {
+		size_t rta_len = RTA_LENGTH(sizeof(req.set.r4.d));
+
+		len = offsetof(struct req_t, set.r4) + sizeof(req.set.r4);
+
+		req.set.r4.rta_dst.rta_type = RTA_DST;
+		req.set.r4.rta_dst.rta_len = rta_len;
+
+		memcpy(&req.set.r4.a, gw, sizeof(req.set.r4.a));
+		req.set.r4.rta_gw.rta_type = RTA_GATEWAY;
+		req.set.r4.rta_gw.rta_len = rta_len;
+	}
+
+	return nl_do(s, &req, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, len);
+}
+
+/**
+ * nl_route_dup() - Copy routes for given interface and address family
+ * @s_src:	Netlink socket in source namespace
+ * @ifi_src:	Source interface index
+ * @s_dst:	Netlink socket in destination namespace
+ * @ifi_dst:	Interface index in destination namespace
+ * @af:		Address family
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_route_dup(int s_src, unsigned int ifi_src,
+		 int s_dst, unsigned int ifi_dst, sa_family_t af)
+{
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct rtmsg rtm;
+		struct rtattr rta;
+		unsigned int ifi;
+	} req = {
 		.rtm.rtm_family	  = af,
 		.rtm.rtm_table	  = RT_TABLE_MAIN,
 		.rtm.rtm_scope	  = RT_SCOPE_UNIVERSE,
@@ -226,125 +538,327 @@ void nl_route(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
 
 		.rta.rta_type	  = RTA_OIF,
 		.rta.rta_len	  = RTA_LENGTH(sizeof(unsigned int)),
-		.ifi		  = op == NL_SET ? ifi_ns : ifi,
+		.ifi		  = ifi_src,
 	};
+	ssize_t nlmsgs_size, left, status;
 	unsigned dup_routes = 0;
-	ssize_t n, nlmsgs_size;
 	struct nlmsghdr *nh;
-	struct rtattr *rta;
 	char buf[NLBUFSIZ];
-	struct rtmsg *rtm;
-	size_t na;
+	uint32_t seq;
+	unsigned i;
 
-	if (op == NL_SET) {
-		if (af == AF_INET6) {
-			size_t rta_len = RTA_LENGTH(sizeof(req.set.r6.d));
+	seq = nl_send(s_src, &req, RTM_GETROUTE, NLM_F_DUMP, sizeof(req));
 
-			req.nlh.nlmsg_len = offsetof(struct req_t, set.r6)
-				+ sizeof(req.set.r6);
+	/* nl_foreach() will step through multiple response datagrams,
+	 * which we don't want here because we need to have all the
+	 * routes in the buffer at once.
+	 */
+	nh = nl_next(s_src, buf, NULL, &nlmsgs_size);
+	for (left = nlmsgs_size;
+	     NLMSG_OK(nh, left) && (status = nl_status(nh, left, seq)) > 0;
+	     nh = NLMSG_NEXT(nh, left)) {
+		struct rtmsg *rtm = (struct rtmsg *)NLMSG_DATA(nh);
+		bool discard = false;
+		struct rtattr *rta;
+		size_t na;
 
-			req.set.r6.rta_dst.rta_type = RTA_DST;
-			req.set.r6.rta_dst.rta_len = rta_len;
-
-			memcpy(&req.set.r6.a, gw, sizeof(req.set.r6.a));
-			req.set.r6.rta_gw.rta_type = RTA_GATEWAY;
-			req.set.r6.rta_gw.rta_len = rta_len;
-		} else {
-			size_t rta_len = RTA_LENGTH(sizeof(req.set.r4.d));
-
-			req.nlh.nlmsg_len = offsetof(struct req_t, set.r4)
-				+ sizeof(req.set.r4);
-
-			req.set.r4.rta_dst.rta_type = RTA_DST;
-			req.set.r4.rta_dst.rta_len = rta_len;
-
-			req.set.r4.a = *(uint32_t *)gw;
-			req.set.r4.rta_gw.rta_type = RTA_GATEWAY;
-			req.set.r4.rta_gw.rta_len = rta_len;
-		}
-
-		req.rtm.rtm_protocol = RTPROT_BOOT;
-		req.nlh.nlmsg_flags |= NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE;
-	} else {
-		req.nlh.nlmsg_len = offsetof(struct req_t, set.r6);
-		req.nlh.nlmsg_flags |= NLM_F_DUMP;
-	}
-
-	if ((n = nl_req(op == NL_SET, buf, &req, req.nlh.nlmsg_len)) < 0)
-		return;
-
-	if (op == NL_SET)
-		return;
-
-	nh = (struct nlmsghdr *)buf;
-	nlmsgs_size = n;
-
-	for ( ; NLMSG_OK(nh, n); nh = NLMSG_NEXT(nh, n)) {
 		if (nh->nlmsg_type != RTM_NEWROUTE)
-			goto next;
-
-		if (op == NL_DUP) {
-			nh->nlmsg_seq = nl_seq++;
-			nh->nlmsg_pid = 0;
-			nh->nlmsg_flags &= ~NLM_F_DUMP_FILTERED;
-			nh->nlmsg_flags |= NLM_F_REQUEST | NLM_F_ACK |
-					   NLM_F_CREATE;
-			dup_routes++;
-		}
-
-		rtm = (struct rtmsg *)NLMSG_DATA(nh);
-		if (op == NL_GET && rtm->rtm_dst_len)
 			continue;
 
 		for (rta = RTM_RTA(rtm), na = RTM_PAYLOAD(nh); RTA_OK(rta, na);
 		     rta = RTA_NEXT(rta, na)) {
-			if (op == NL_GET) {
-				if (rta->rta_type != RTA_GATEWAY)
-					continue;
+			/* RTA_OIF and RTA_MULTIPATH attributes carry the
+			 * identifier of a host interface. If they match the
+			 * host interface we're copying from, change them to
+			 * match the corresponding identifier in the target
+			 * namespace.
+			 *
+			 * If RTA_OIF doesn't match (NETLINK_GET_STRICT_CHK not
+			 * available), or if any interface index in nexthop
+			 * objects differ from the host interface, discard the
+			 * route altogether.
+			*/
+			if (rta->rta_type == RTA_OIF) {
+				if (*(unsigned int *)RTA_DATA(rta) != ifi_src) {
+					discard = true;
+					break;
+				}
 
-				memcpy(gw, RTA_DATA(rta), RTA_PAYLOAD(rta));
-				return;
+				*(unsigned int *)RTA_DATA(rta) = ifi_dst;
+			} else if (rta->rta_type == RTA_MULTIPATH) {
+				int nh_len = RTA_PAYLOAD(rta);
+				struct rtnexthop *rtnh;
+
+				for (rtnh = (struct rtnexthop *)RTA_DATA(rta);
+				     RTNH_OK(rtnh, nh_len);
+				     rtnh = RTNH_NEXT_AND_DEC(rtnh, nh_len)) {
+					int src = (int)ifi_src;
+
+					if (rtnh->rtnh_ifindex != src) {
+						discard = true;
+						break;
+					}
+
+					rtnh->rtnh_ifindex = ifi_dst;
+				}
+
+				if (discard)
+					break;
+			} else if (rta->rta_type == RTA_PREFSRC ||
+				   rta->rta_type == RTA_NH_ID) {
+				/* Strip RTA_PREFSRC attributes: host routes
+				 * might include a preferred source address,
+				 * which must be one of the host's addresses.
+				 * However, with -a, pasta will use a different
+				 * namespace address, making such a route
+				 * invalid in the namespace.
+				 *
+				 * Strip RTA_NH_ID attributes: host routes set
+				 * up via routing protocols (e.g. OSPF) might
+				 * contain a nexthop ID (and not nexthop
+				 * objects, which are taken care of in the
+				 * RTA_MULTIPATH case above) that's not valid
+				 * in the target namespace.
+				 */
+				rta->rta_type = RTA_UNSPEC;
 			}
-
-			if (op == NL_DUP && rta->rta_type == RTA_OIF)
-				*(unsigned int *)RTA_DATA(rta) = ifi_ns;
 		}
 
-next:
-		if (nh->nlmsg_type == NLMSG_DONE)
-			break;
+		if (discard)
+			nh->nlmsg_type = NLMSG_NOOP;
+		else
+			dup_routes++;
 	}
 
-	if (op == NL_DUP) {
-		char resp[NLBUFSIZ];
-		unsigned i;
-
-		nh = (struct nlmsghdr *)buf;
-		/* Routes might have dependencies between each other, and the
-		 * kernel processes RTM_NEWROUTE messages sequentially. For n
-		 * valid routes, we might need to send up to n requests to get
-		 * all of them inserted. Routes that have been already inserted
-		 * won't cause the whole request to fail, so we can simply
-		 * repeat the whole request. This approach avoids the need to
-		 * calculate dependencies: let the kernel do that.
+	if (!NLMSG_OK(nh, left)) {
+		/* Process any remaining datagrams in a different
+		 * buffer so we don't overwrite the first one.
 		 */
-		for (i = 0; i < dup_routes; i++)
-			nl_req(1, resp, nh, nlmsgs_size);
+		char tail[NLBUFSIZ];
+		unsigned extra = 0;
+
+		nl_foreach_oftype(nh, status, s_src, tail, seq, RTM_NEWROUTE)
+			extra++;
+
+		if (extra) {
+			err("netlink: Too many routes to duplicate");
+			return -E2BIG;
+		}
 	}
+	if (status < 0)
+		return status;
+
+	/* Routes might have dependencies between each other, and the kernel
+	 * processes RTM_NEWROUTE messages sequentially. For n routes, we might
+	 * need to send the requests up to n times to get all of them inserted.
+	 * Routes that have been already inserted will return -EEXIST, but we
+	 * can safely ignore that and repeat the requests. This avoids the need
+	 * to calculate dependencies: let the kernel do that.
+	 */
+	for (i = 0; i < dup_routes; i++) {
+		for (nh = (struct nlmsghdr *)buf, left = nlmsgs_size;
+		     NLMSG_OK(nh, left);
+		     nh = NLMSG_NEXT(nh, left)) {
+			uint16_t flags = nh->nlmsg_flags;
+			int rc;
+
+			if (nh->nlmsg_type != RTM_NEWROUTE)
+				continue;
+
+			rc = nl_do(s_dst, nh, RTM_NEWROUTE,
+				   (flags & ~NLM_F_DUMP_FILTERED) | NLM_F_CREATE,
+				   nh->nlmsg_len);
+			if (rc < 0 && rc != -EEXIST &&
+			    rc != -ENETUNREACH && rc != -EHOSTUNREACH)
+				return rc;
+		}
+	}
+
+	return 0;
 }
 
 /**
- * nl_addr() - Get/set/copy IP addresses for given interface and address family
- * @op:		Requested operation
- * @ifi:	Interface index in outer network namespace
- * @ifi_ns:	Interface index in target namespace for NL_SET, NL_DUP
- * @af:		Address family
- * @addr:	Global address to fill on NL_GET, to set on NL_SET
- * @prefix_len:	Mask or prefix length, set or fetched (for IPv4)
- * @addr_l:	Link-scoped address to fill on NL_GET
+ * nl_addr_set_ll_nodad() - Set IFA_F_NODAD on IPv6 link-local addresses
+ * @s:		Netlink socket
+ * @ifi:	Interface index in target namespace
+ *
+ * Return: 0 on success, negative error code on failure
  */
-void nl_addr(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
-	     sa_family_t af, void *addr, int *prefix_len, void *addr_l)
+int nl_addr_set_ll_nodad(int s, unsigned int ifi)
+{
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct ifaddrmsg ifa;
+	} req = {
+		.ifa.ifa_family    = AF_INET6,
+		.ifa.ifa_index     = ifi,
+	};
+	uint32_t seq, last_seq = 0;
+	ssize_t status, ret = 0;
+	struct nlmsghdr *nh;
+	char buf[NLBUFSIZ];
+
+	seq = nl_send(s, &req, RTM_GETADDR, NLM_F_DUMP, sizeof(req));
+	nl_foreach_oftype(nh, status, s, buf, seq, RTM_NEWADDR) {
+		struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
+		struct rtattr *rta;
+		size_t na;
+
+		if (ifa->ifa_index != ifi || ifa->ifa_scope != RT_SCOPE_LINK)
+			continue;
+
+		ifa->ifa_flags |= IFA_F_NODAD;
+
+		for (rta = IFA_RTA(ifa), na = IFA_PAYLOAD(nh); RTA_OK(rta, na);
+		     rta = RTA_NEXT(rta, na)) {
+			/* If 32-bit flags are used, add IFA_F_NODAD there */
+			if (rta->rta_type == IFA_FLAGS)
+				*(uint32_t *)RTA_DATA(rta) |= IFA_F_NODAD;
+		}
+
+		last_seq = nl_send(s, nh, RTM_NEWADDR, NLM_F_REPLACE,
+				   nh->nlmsg_len);
+	}
+
+	if (status < 0)
+		ret = status;
+
+	for (seq = seq + 1; seq <= last_seq; seq++) {
+		nl_foreach(nh, status, s, buf, seq)
+			warn("netlink: Unexpected response message");
+
+		if (!ret && status < 0)
+			ret = status;
+	}
+
+	return ret;
+}
+
+/**
+ * nl_addr_get() - Get most specific global address, given interface and family
+ * @s:		Netlink socket
+ * @ifi:	Interface index in outer network namespace
+ * @af:		Address family
+ * @addr:	Global address to fill
+ * @prefix_len:	Mask or prefix length, to fill (for IPv4)
+ * @addr_l:	Link-scoped address to fill (for IPv6)
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_addr_get(int s, unsigned int ifi, sa_family_t af,
+		void *addr, int *prefix_len, void *addr_l)
+{
+	uint8_t prefix_max = 0, prefix_max_ll = 0;
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct ifaddrmsg ifa;
+	} req = {
+		.ifa.ifa_family    = af,
+		.ifa.ifa_index     = ifi,
+	};
+	struct nlmsghdr *nh;
+	char buf[NLBUFSIZ];
+	ssize_t status;
+	uint32_t seq;
+
+	seq = nl_send(s, &req, RTM_GETADDR, NLM_F_DUMP, sizeof(req));
+	nl_foreach_oftype(nh, status, s, buf, seq, RTM_NEWADDR) {
+		struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
+		struct rtattr *rta;
+		size_t na;
+
+		if (ifa->ifa_index != ifi || ifa->ifa_flags & IFA_F_DEPRECATED)
+			continue;
+
+		for (rta = IFA_RTA(ifa), na = IFA_PAYLOAD(nh); RTA_OK(rta, na);
+		     rta = RTA_NEXT(rta, na)) {
+			if ((af == AF_INET  && rta->rta_type != IFA_LOCAL) ||
+			    (af == AF_INET6 && rta->rta_type != IFA_ADDRESS))
+				continue;
+
+			if (af == AF_INET && ifa->ifa_prefixlen > prefix_max) {
+				memcpy(addr, RTA_DATA(rta), RTA_PAYLOAD(rta));
+
+				prefix_max = *prefix_len = ifa->ifa_prefixlen;
+			} else if (af == AF_INET6 && addr &&
+				   ifa->ifa_scope == RT_SCOPE_UNIVERSE &&
+				   ifa->ifa_prefixlen > prefix_max) {
+				memcpy(addr, RTA_DATA(rta), RTA_PAYLOAD(rta));
+
+				prefix_max = ifa->ifa_prefixlen;
+			}
+
+			if (addr_l &&
+			    af == AF_INET6 && ifa->ifa_scope == RT_SCOPE_LINK &&
+			    ifa->ifa_prefixlen > prefix_max_ll) {
+				memcpy(addr_l, RTA_DATA(rta), RTA_PAYLOAD(rta));
+
+				prefix_max_ll = ifa->ifa_prefixlen;
+			}
+		}
+	}
+	return status;
+}
+
+/**
+ * nl_addr_get_ll() - Get first IPv6 link-local address for a given interface
+ * @s:		Netlink socket
+ * @ifi:	Interface index in outer network namespace
+ * @addr:	Link-local address to fill
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_addr_get_ll(int s, unsigned int ifi, struct in6_addr *addr)
+{
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct ifaddrmsg ifa;
+	} req = {
+		.ifa.ifa_family		= AF_INET6,
+		.ifa.ifa_index		= ifi,
+	};
+	struct nlmsghdr *nh;
+	bool found = false;
+	char buf[NLBUFSIZ];
+	ssize_t status;
+	uint32_t seq;
+
+	seq = nl_send(s, &req, RTM_GETADDR, NLM_F_DUMP, sizeof(req));
+	nl_foreach_oftype(nh, status, s, buf, seq, RTM_NEWADDR) {
+		struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
+		struct rtattr *rta;
+		size_t na;
+
+		if (ifa->ifa_index != ifi || ifa->ifa_scope != RT_SCOPE_LINK ||
+		    found)
+			continue;
+
+		for (rta = IFA_RTA(ifa), na = IFA_PAYLOAD(nh); RTA_OK(rta, na);
+		     rta = RTA_NEXT(rta, na)) {
+			if (rta->rta_type != IFA_ADDRESS)
+				continue;
+
+			if (!found) {
+				memcpy(addr, RTA_DATA(rta), RTA_PAYLOAD(rta));
+				found = true;
+			}
+		}
+	}
+	return status;
+}
+
+/**
+ * nl_addr_set() - Set IP addresses for given interface and address family
+ * @s:		Netlink socket
+ * @ifi:	Interface index
+ * @af:		Address family
+ * @addr:	Global address to set
+ * @prefix_len:	Mask or prefix length to set
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_addr_set(int s, unsigned int ifi, sa_family_t af,
+		const void *addr, int prefix_len)
 {
 	struct req_t {
 		struct nlmsghdr nlh;
@@ -352,9 +866,9 @@ void nl_addr(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
 		union {
 			struct {
 				struct rtattr rta_l;
-				uint32_t l;
+				struct in_addr l;
 				struct rtattr rta_a;
-				uint32_t a;
+				struct in_addr a;
 			} a4;
 			struct {
 				struct rtattr rta_l;
@@ -364,214 +878,224 @@ void nl_addr(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
 			} a6;
 		} set;
 	} req = {
-		.nlh.nlmsg_type    = op == NL_SET ? RTM_NEWADDR : RTM_GETADDR,
-		.nlh.nlmsg_flags   = NLM_F_REQUEST,
-		.nlh.nlmsg_len     = NLMSG_LENGTH(sizeof(struct ifaddrmsg)),
-		.nlh.nlmsg_seq     = nl_seq++,
-
 		.ifa.ifa_family    = af,
-		.ifa.ifa_index     = op == NL_SET ? ifi_ns : ifi,
-		.ifa.ifa_prefixlen = op == NL_SET ? *prefix_len : 0,
+		.ifa.ifa_index     = ifi,
+		.ifa.ifa_prefixlen = prefix_len,
+		.ifa.ifa_scope	   = RT_SCOPE_UNIVERSE,
 	};
-	ssize_t n, nlmsgs_size;
-	struct ifaddrmsg *ifa;
-	struct nlmsghdr *nh;
-	struct rtattr *rta;
-	char buf[NLBUFSIZ];
-	size_t na;
+	ssize_t len;
 
-	if (op == NL_SET) {
-		if (af == AF_INET6) {
-			size_t rta_len = RTA_LENGTH(sizeof(req.set.a6.l));
+	if (af == AF_INET6) {
+		size_t rta_len = RTA_LENGTH(sizeof(req.set.a6.l));
 
-			/* By default, strictly speaking, it's duplicated */
-			req.ifa.ifa_flags = IFA_F_NODAD;
+		/* By default, strictly speaking, it's duplicated */
+		req.ifa.ifa_flags = IFA_F_NODAD;
 
-			req.nlh.nlmsg_len = offsetof(struct req_t, set.a6)
-				+ sizeof(req.set.a6);
+		len = offsetof(struct req_t, set.a6) + sizeof(req.set.a6);
 
-			memcpy(&req.set.a6.l, addr, sizeof(req.set.a6.l));
-			req.set.a6.rta_l.rta_len = rta_len;
-			req.set.a4.rta_l.rta_type = IFA_LOCAL;
-			memcpy(&req.set.a6.a, addr, sizeof(req.set.a6.a));
-			req.set.a6.rta_a.rta_len = rta_len;
-			req.set.a6.rta_a.rta_type = IFA_ADDRESS;
-		} else {
-			size_t rta_len = RTA_LENGTH(sizeof(req.set.a4.l));
-
-			req.nlh.nlmsg_len = offsetof(struct req_t, set.a4)
-				+ sizeof(req.set.a4);
-
-			req.set.a4.l = req.set.a4.a = *(uint32_t *)addr;
-			req.set.a4.rta_l.rta_len = rta_len;
-			req.set.a4.rta_l.rta_type = IFA_LOCAL;
-			req.set.a4.rta_a.rta_len = rta_len;
-			req.set.a4.rta_a.rta_type = IFA_ADDRESS;
-		}
-
-		req.ifa.ifa_scope = RT_SCOPE_UNIVERSE;
-		req.nlh.nlmsg_flags |= NLM_F_CREATE | NLM_F_ACK | NLM_F_EXCL;
+		memcpy(&req.set.a6.l, addr, sizeof(req.set.a6.l));
+		req.set.a6.rta_l.rta_len = rta_len;
+		req.set.a4.rta_l.rta_type = IFA_LOCAL;
+		memcpy(&req.set.a6.a, addr, sizeof(req.set.a6.a));
+		req.set.a6.rta_a.rta_len = rta_len;
+		req.set.a6.rta_a.rta_type = IFA_ADDRESS;
 	} else {
-		req.nlh.nlmsg_flags |= NLM_F_DUMP;
+		size_t rta_len = RTA_LENGTH(sizeof(req.set.a4.l));
+
+		len = offsetof(struct req_t, set.a4) + sizeof(req.set.a4);
+
+		memcpy(&req.set.a4.l, addr, sizeof(req.set.a4.l));
+		req.set.a4.rta_l.rta_len = rta_len;
+		req.set.a4.rta_l.rta_type = IFA_LOCAL;
+		memcpy(&req.set.a4.a, addr, sizeof(req.set.a4.a));
+		req.set.a4.rta_a.rta_len = rta_len;
+		req.set.a4.rta_a.rta_type = IFA_ADDRESS;
 	}
 
-	if ((n = nl_req(op == NL_SET, buf, &req, req.nlh.nlmsg_len)) < 0)
-		return;
-
-	if (op == NL_SET)
-		return;
-
-	nh = (struct nlmsghdr *)buf;
-	nlmsgs_size = n;
-
-	for ( ; NLMSG_OK(nh, n); nh = NLMSG_NEXT(nh, n)) {
-		if (nh->nlmsg_type != RTM_NEWADDR)
-			goto next;
-
-		if (op == NL_DUP) {
-			nh->nlmsg_seq = nl_seq++;
-			nh->nlmsg_pid = 0;
-			nh->nlmsg_flags &= ~NLM_F_DUMP_FILTERED;
-			nh->nlmsg_flags |= NLM_F_REQUEST | NLM_F_ACK |
-					   NLM_F_CREATE;
-		}
-
-		ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
-
-		if (op == NL_DUP && (ifa->ifa_scope == RT_SCOPE_LINK ||
-				     ifa->ifa_index != ifi)) {
-			ifa->ifa_family = AF_UNSPEC;
-			goto next;
-		}
-
-		if (ifa->ifa_index != ifi)
-			goto next;
-
-		if (op == NL_DUP)
-			ifa->ifa_index = ifi_ns;
-
-		for (rta = IFA_RTA(ifa), na = RTM_PAYLOAD(nh); RTA_OK(rta, na);
-		     rta = RTA_NEXT(rta, na)) {
-			if (op == NL_DUP && rta->rta_type == IFA_LABEL)
-				rta->rta_type = IFA_UNSPEC;
-
-			if (op == NL_DUP || rta->rta_type != IFA_ADDRESS)
-				continue;
-
-			if (af == AF_INET && addr && !*(uint32_t *)addr) {
-				memcpy(addr, RTA_DATA(rta), RTA_PAYLOAD(rta));
-				*prefix_len = ifa->ifa_prefixlen;
-			} else if (af == AF_INET6 && addr &&
-				 ifa->ifa_scope == RT_SCOPE_UNIVERSE &&
-				 IN6_IS_ADDR_UNSPECIFIED(addr)) {
-				memcpy(addr, RTA_DATA(rta), RTA_PAYLOAD(rta));
-			}
-
-			if (addr_l &&
-			    af == AF_INET6 && ifa->ifa_scope == RT_SCOPE_LINK &&
-			    IN6_IS_ADDR_UNSPECIFIED(addr_l))
-				memcpy(addr_l, RTA_DATA(rta), RTA_PAYLOAD(rta));
-		}
-next:
-		if (nh->nlmsg_type == NLMSG_DONE)
-			break;
-	}
-
-	if (op == NL_DUP) {
-		char resp[NLBUFSIZ];
-
-		nh = (struct nlmsghdr *)buf;
-		nl_req(1, resp, nh, nlmsgs_size);
-	}
+	return nl_do(s, &req, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, len);
 }
 
 /**
- * nl_link() - Get/set link attributes
- * @ns:		Use netlink socket in namespace
- * @ifi:	Interface index
- * @mac:	MAC address to fill, if passed as zero, to set otherwise
- * @up:		If set, bring up the link
- * @mtu:	If non-zero, set interface MTU
+ * nl_addr_dup() - Copy IP addresses for given interface and address family
+ * @s_src:	Netlink socket in source network namespace
+ * @ifi_src:	Interface index in source network namespace
+ * @s_dst:	Netlink socket in destination network namespace
+ * @ifi_dst:	Interface index in destination namespace
+ * @af:		Address family
+ *
+ * Return: 0 on success, negative error code on failure
  */
-void nl_link(int ns, unsigned int ifi, void *mac, int up, int mtu)
+int nl_addr_dup(int s_src, unsigned int ifi_src,
+		int s_dst, unsigned int ifi_dst, sa_family_t af)
 {
-	int change = !MAC_IS_ZERO(mac) || up || mtu;
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct ifaddrmsg ifa;
+	} req = {
+		.ifa.ifa_family    = af,
+		.ifa.ifa_index     = ifi_src,
+		.ifa.ifa_prefixlen = 0,
+	};
+	char buf[NLBUFSIZ];
+	struct nlmsghdr *nh;
+	ssize_t status;
+	uint32_t seq;
+	int rc = 0;
+
+	seq = nl_send(s_src, &req, RTM_GETADDR, NLM_F_DUMP, sizeof(req));
+	nl_foreach_oftype(nh, status, s_src, buf, seq, RTM_NEWADDR) {
+		struct ifaddrmsg *ifa;
+		struct rtattr *rta;
+		size_t na;
+
+		ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
+
+		if (rc < 0 || ifa->ifa_scope == RT_SCOPE_LINK ||
+		    ifa->ifa_index != ifi_src ||
+		    ifa->ifa_flags & IFA_F_DEPRECATED)
+			continue;
+
+		ifa->ifa_index = ifi_dst;
+		/* Same as nl_addr_set(), but here it's more than a default */
+		ifa->ifa_flags |= IFA_F_NODAD;
+
+		for (rta = IFA_RTA(ifa), na = IFA_PAYLOAD(nh); RTA_OK(rta, na);
+		     rta = RTA_NEXT(rta, na)) {
+			/* Strip label and expiry (cacheinfo) information */
+			if (rta->rta_type == IFA_LABEL ||
+			    rta->rta_type == IFA_CACHEINFO)
+				rta->rta_type = IFA_UNSPEC;
+
+			/* If 32-bit flags are used, add IFA_F_NODAD there */
+			if (rta->rta_type == IFA_FLAGS)
+				*(uint32_t *)RTA_DATA(rta) |= IFA_F_NODAD;
+		}
+
+		rc = nl_do(s_dst, nh, RTM_NEWADDR,
+			   (nh->nlmsg_flags & ~NLM_F_DUMP_FILTERED) | NLM_F_CREATE,
+			   nh->nlmsg_len);
+	}
+	if (status < 0)
+		return status;
+
+	return rc;
+}
+
+/**
+ * nl_link_get_mac() - Get link MAC address
+ * @s:		Netlink socket
+ * @ifi:	Interface index
+ * @mac:	Fill with current MAC address
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_link_get_mac(int s, unsigned int ifi, void *mac)
+{
 	struct req_t {
 		struct nlmsghdr nlh;
 		struct ifinfomsg ifm;
-		struct rtattr rta;
-		union {
-			unsigned char mac[ETH_ALEN];
-			struct {
-				unsigned int mtu;
-			} mtu;
-		} set;
 	} req = {
-		.nlh.nlmsg_type   = change ? RTM_NEWLINK : RTM_GETLINK,
-		.nlh.nlmsg_len    = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
-		.nlh.nlmsg_flags  = NLM_F_REQUEST | (change ? NLM_F_ACK : 0),
-		.nlh.nlmsg_seq	  = nl_seq++,
 		.ifm.ifi_family	  = AF_UNSPEC,
 		.ifm.ifi_index	  = ifi,
-		.ifm.ifi_flags	  = up ? IFF_UP : 0,
-		.ifm.ifi_change	  = up ? IFF_UP : 0,
 	};
-	struct ifinfomsg *ifm;
 	struct nlmsghdr *nh;
-	struct rtattr *rta;
 	char buf[NLBUFSIZ];
-	ssize_t n;
-	size_t na;
+	ssize_t status;
+	uint32_t seq;
 
-	if (!MAC_IS_ZERO(mac)) {
-		req.nlh.nlmsg_len = sizeof(req);
-		memcpy(req.set.mac, mac, ETH_ALEN);
-		req.rta.rta_type = IFLA_ADDRESS;
-		req.rta.rta_len = RTA_LENGTH(ETH_ALEN);
-		if (nl_req(ns, buf, &req, req.nlh.nlmsg_len) < 0)
-			return;
+	seq = nl_send(s, &req, RTM_GETLINK, 0, sizeof(req));
+	nl_foreach_oftype(nh, status, s, buf, seq, RTM_NEWLINK) {
+		struct ifinfomsg *ifm = (struct ifinfomsg *)NLMSG_DATA(nh);
+		struct rtattr *rta;
+		size_t na;
 
-		up = 0;
-	}
-
-	if (mtu) {
-		req.nlh.nlmsg_len = offsetof(struct req_t, set.mtu)
-			+ sizeof(req.set.mtu);
-		req.set.mtu.mtu = mtu;
-		req.rta.rta_type = IFLA_MTU;
-		req.rta.rta_len = RTA_LENGTH(sizeof(unsigned int));
-		if (nl_req(ns, buf, &req, req.nlh.nlmsg_len) < 0)
-			return;
-
-		up = 0;
-	}
-
-	if (up && nl_req(ns, buf, &req, req.nlh.nlmsg_len) < 0)
-		return;
-
-	if (change)
-		return;
-
-	if ((n = nl_req(ns, buf, &req, req.nlh.nlmsg_len)) < 0)
-		return;
-
-	nh = (struct nlmsghdr *)buf;
-	for ( ; NLMSG_OK(nh, n); nh = NLMSG_NEXT(nh, n)) {
-		if (nh->nlmsg_type != RTM_NEWLINK)
-			goto next;
-
-		ifm = (struct ifinfomsg *)NLMSG_DATA(nh);
-
-		for (rta = IFLA_RTA(ifm), na = RTM_PAYLOAD(nh); RTA_OK(rta, na);
+		for (rta = IFLA_RTA(ifm), na = RTM_PAYLOAD(nh);
+		     RTA_OK(rta, na);
 		     rta = RTA_NEXT(rta, na)) {
 			if (rta->rta_type != IFLA_ADDRESS)
 				continue;
 
 			memcpy(mac, RTA_DATA(rta), ETH_ALEN);
-			break;
 		}
-next:
-		if (nh->nlmsg_type == NLMSG_DONE)
-			break;
 	}
+	return status;
+}
+
+/**
+ * nl_link_set_mac() - Set link MAC address
+ * @s:		Netlink socket
+ * @ns:		Use netlink socket in namespace
+ * @ifi:	Interface index
+ * @mac:	MAC address to set
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_link_set_mac(int s, unsigned int ifi, const void *mac)
+{
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct ifinfomsg ifm;
+		struct rtattr rta;
+		unsigned char mac[ETH_ALEN];
+	} req = {
+		.ifm.ifi_family	  = AF_UNSPEC,
+		.ifm.ifi_index	  = ifi,
+		.rta.rta_type	  = IFLA_ADDRESS,
+		.rta.rta_len	  = RTA_LENGTH(ETH_ALEN),
+	};
+
+	memcpy(req.mac, mac, ETH_ALEN);
+
+	return nl_do(s, &req, RTM_NEWLINK, 0, sizeof(req));
+}
+
+/**
+ * nl_link_set_mtu() - Set link MTU
+ * @s:		Netlink socket
+ * @ifi:	Interface index
+ * @mtu:	Interface MTU
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_link_set_mtu(int s, unsigned int ifi, int mtu)
+{
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct ifinfomsg ifm;
+		struct rtattr rta;
+		unsigned int mtu;
+	} req = {
+		.ifm.ifi_family	  = AF_UNSPEC,
+		.ifm.ifi_index	  = ifi,
+		.rta.rta_type	  = IFLA_MTU,
+		.rta.rta_len	  = RTA_LENGTH(sizeof(unsigned int)),
+		.mtu		  = mtu,
+	};
+
+	return nl_do(s, &req, RTM_NEWLINK, 0, sizeof(req));
+}
+
+/**
+ * nl_link_set_flags() - Set link flags
+ * @s:		Netlink socket
+ * @ifi:	Interface index
+ * @set:	Device flags to set
+ * @change:	Mask of device flag changes
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+int nl_link_set_flags(int s, unsigned int ifi,
+		      unsigned int set, unsigned int change)
+{
+	struct req_t {
+		struct nlmsghdr nlh;
+		struct ifinfomsg ifm;
+	} req = {
+		.ifm.ifi_family	  = AF_UNSPEC,
+		.ifm.ifi_index	  = ifi,
+		.ifm.ifi_flags	  = set,
+		.ifm.ifi_change	  = change,
+	};
+
+	return nl_do(s, &req, RTM_NEWLINK, 0, sizeof(req));
 }
