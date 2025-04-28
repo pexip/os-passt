@@ -1,19 +1,17 @@
-diff --git a/util.h b/util.h
-index 26892aa..a1c910e 100644
---- a/util.h
-+++ b/util.h
-@@ -9,6 +9,7 @@
- #include <stdlib.h>
- #include <stdarg.h>
- #include <stdbool.h>
+--- passt.orig/util.h
++++ passt/util.h
+@@ -17,6 +17,7 @@
+ #include <arpa/inet.h>
+ #include <unistd.h>
+ #include <sys/syscall.h>
 +#include <sys/wait.h>
  
  #include "log.h"
  
-@@ -127,10 +128,15 @@ int do_clone(int (*fn)(void *), char *stack_area, size_t stack_size, int flags,
- #define NS_CALL(fn, arg)						\
+@@ -186,10 +187,15 @@ int do_clone(int (*fn)(void *), char *st
  	do {								\
- 		char ns_fn_stack[NS_FN_STACK_SIZE];			\
+ 		char ns_fn_stack[NS_FN_STACK_SIZE]			\
+ 		__attribute__ ((aligned(__alignof__(max_align_t))));	\
 +		int __pid;						\
  									\
 -		do_clone((fn), ns_fn_stack, sizeof(ns_fn_stack),	\
@@ -26,4 +24,4 @@ index 26892aa..a1c910e 100644
 +		waitid(P_PID, __pid, NULL, WEXITED);			\
  	} while (0)
  
- #define L2_BUF_IP4_INIT(proto)						\
+ #define RCVBUF_BIG		(2ULL * 1024 * 1024)
