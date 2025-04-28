@@ -45,6 +45,8 @@
 
 #include "checksum.h"
 #include "util.h"
+#include "ip.h"
+#include "iov.h"
 #include "passt.h"
 #include "arp.h"
 #include "dhcp.h"
@@ -54,49 +56,79 @@
 #include "netlink.h"
 #include "pasta.h"
 #include "packet.h"
+#include "repair.h"
 #include "tap.h"
 #include "log.h"
+#include "vhost_user.h"
+#include "vu_common.h"
+
+/* Maximum allowed frame lengths (including L2 header) */
+
+/* Verify that an L2 frame length limit is large enough to contain the header,
+ * but small enough to fit in the packet pool
+ */
+#define CHECK_FRAME_LEN(len) \
+	static_assert((len) >= ETH_HLEN && (len) <= PACKET_MAX_LEN,	\
+		      #len " has bad value")
+
+CHECK_FRAME_LEN(L2_MAX_LEN_PASTA);
+CHECK_FRAME_LEN(L2_MAX_LEN_PASST);
+CHECK_FRAME_LEN(L2_MAX_LEN_VU);
 
 /* IPv4 (plus ARP) and IPv6 message batches from tap/guest to IP handlers */
 static PACKET_POOL_NOINIT(pool_tap4, TAP_MSGS, pkt_buf);
 static PACKET_POOL_NOINIT(pool_tap6, TAP_MSGS, pkt_buf);
 
 #define TAP_SEQS		128 /* Different L4 tuples in one batch */
+#define FRAGMENT_MSG_RATE	10  /* # seconds between fragment warnings */
 
 /**
- * tap_send() - Send frame, with qemu socket header if needed
+ * tap_l2_max_len() - Maximum frame size (including L2 header) for current mode
  * @c:		Execution context
- * @data:	Packet buffer
- * @len:	Total L2 packet length
- *
- * Return: return code from send() or write()
  */
-int tap_send(const struct ctx *c, const void *data, size_t len)
+unsigned long tap_l2_max_len(const struct ctx *c)
 {
-	pcap(data, len);
-
-	if (c->mode == MODE_PASST) {
-		int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
-		uint32_t vnet_len = htonl(len);
-
-		if (send(c->fd_tap, &vnet_len, 4, flags) < 0)
-			return -1;
-
-		return send(c->fd_tap, data, len, flags);
+	/* NOLINTBEGIN(bugprone-branch-clone): values can be the same */
+	switch (c->mode) {
+	case MODE_PASST:
+		return L2_MAX_LEN_PASST;
+	case MODE_PASTA:
+		return L2_MAX_LEN_PASTA;
+	case MODE_VU:
+		return L2_MAX_LEN_VU;
 	}
-
-	return write(c->fd_tap, (char *)data, len);
+	/* NOLINTEND(bugprone-branch-clone) */
+	ASSERT(0);
 }
 
 /**
- * tap_ip4_daddr() - Normal IPv4 destination address for inbound packets
+ * tap_send_single() - Send a single frame
  * @c:		Execution context
- *
- * Return: IPv4 address, network order
+ * @data:	Packet buffer
+ * @l2len:	Total L2 packet length
  */
-struct in_addr tap_ip4_daddr(const struct ctx *c)
+void tap_send_single(const struct ctx *c, const void *data, size_t l2len)
 {
-	return c->ip4.addr_seen;
+	uint32_t vnet_len = htonl(l2len);
+	struct iovec iov[2];
+	size_t iovcnt = 0;
+
+	switch (c->mode) {
+	case MODE_PASST:
+		iov[iovcnt] = IOV_OF_LVALUE(vnet_len);
+		iovcnt++;
+		/* fall through */
+	case MODE_PASTA:
+		iov[iovcnt].iov_base = (void *)data;
+		iov[iovcnt].iov_len = l2len;
+		iovcnt++;
+
+		tap_send_frames(c, iov, iovcnt, 1);
+		break;
+	case MODE_VU:
+		vu_send_single(c, data, l2len);
+		break;
+	}
 }
 
 /**
@@ -122,13 +154,13 @@ const struct in6_addr *tap_ip6_daddr(const struct ctx *c,
  *
  * Return: pointer at which to write the packet's payload
  */
-static void *tap_push_l2h(const struct ctx *c, void *buf, uint16_t proto)
+void *tap_push_l2h(const struct ctx *c, void *buf, uint16_t proto)
 {
 	struct ethhdr *eh = (struct ethhdr *)buf;
 
 	/* TODO: ARP table lookup */
-	memcpy(eh->h_dest, c->mac_guest, ETH_ALEN);
-	memcpy(eh->h_source, c->mac, ETH_ALEN);
+	memcpy(eh->h_dest, c->guest_mac, ETH_ALEN);
+	memcpy(eh->h_source, c->our_tap_mac, ETH_ALEN);
 	eh->h_proto = ntohs(proto);
 	return eh + 1;
 }
@@ -136,30 +168,60 @@ static void *tap_push_l2h(const struct ctx *c, void *buf, uint16_t proto)
 /**
  * tap_push_ip4h() - Build IPv4 header for inbound packet, with checksum
  * @c:		Execution context
- * @src:	IPv4 source address, network order
- * @dst:	IPv4 destination address, network order
- * @len:	L4 payload length
+ * @src:	IPv4 source address
+ * @dst:	IPv4 destination address
+ * @l4len:	IPv4 payload length
  * @proto:	L4 protocol number
  *
  * Return: pointer at which to write the packet's payload
  */
-static void *tap_push_ip4h(char *buf, struct in_addr src, struct in_addr dst,
-			   size_t len, uint8_t proto)
+void *tap_push_ip4h(struct iphdr *ip4h, struct in_addr src,
+		    struct in_addr dst, size_t l4len, uint8_t proto)
 {
-	struct iphdr *ip4h = (struct iphdr *)buf;
+	uint16_t l3len = l4len + sizeof(*ip4h);
 
 	ip4h->version = 4;
 	ip4h->ihl = sizeof(struct iphdr) / 4;
 	ip4h->tos = 0;
-	ip4h->tot_len = htons(len + sizeof(*ip4h));
+	ip4h->tot_len = htons(l3len);
 	ip4h->id = 0;
-	ip4h->frag_off = 0;
+	ip4h->frag_off = htons(IP_DF);
 	ip4h->ttl = 255;
 	ip4h->protocol = proto;
 	ip4h->saddr = src.s_addr;
 	ip4h->daddr = dst.s_addr;
-	csum_ip4_header(ip4h);
-	return ip4h + 1;
+	ip4h->check = csum_ip4_header(l3len, proto, src, dst);
+	return (char *)ip4h + sizeof(*ip4h);
+}
+
+/**
+ * tap_push_uh4() - Build UDPv4 header with checksum
+ * @c:		Execution context
+ * @src:	IPv4 source address
+ * @sport:	UDP source port
+ * @dst:	IPv4 destination address
+ * @dport:	UDP destination port
+ * @in:		UDP payload contents (not including UDP header)
+ * @dlen:	UDP payload length (not including UDP header)
+ *
+ * Return: pointer at which to write the packet's payload
+ */
+void *tap_push_uh4(struct udphdr *uh, struct in_addr src, in_port_t sport,
+		   struct in_addr dst, in_port_t dport,
+		   const void *in, size_t dlen)
+{
+	size_t l4len = dlen + sizeof(struct udphdr);
+	const struct iovec iov = {
+		.iov_base = (void *)in,
+		.iov_len = dlen
+	};
+	struct iov_tail payload = IOV_TAIL(&iov, 1, 0);
+
+	uh->source = htons(sport);
+	uh->dest = htons(dport);
+	uh->len = htons(l4len);
+	csum_udp4(uh, src, dst, &payload);
+	return (char *)uh + sizeof(*uh);
 }
 
 /**
@@ -169,28 +231,21 @@ static void *tap_push_ip4h(char *buf, struct in_addr src, struct in_addr dst,
  * @sport:	UDP source port
  * @dst:	IPv4 destination address
  * @dport:	UDP destination port
- * @in:		UDP payload contents (not including UDP header)
- * @len:	UDP payload length (not including UDP header)
+ * @in:	UDP payload contents (not including UDP header)
+ * @dlen:	UDP payload length (not including UDP header)
  */
 void tap_udp4_send(const struct ctx *c, struct in_addr src, in_port_t sport,
 		   struct in_addr dst, in_port_t dport,
-		   const void *in, size_t len)
+		   const void *in, size_t dlen)
 {
-	size_t udplen = len + sizeof(struct udphdr);
+	size_t l4len = dlen + sizeof(struct udphdr);
 	char buf[USHRT_MAX];
-	void *ip4h = tap_push_l2h(c, buf, ETH_P_IP);
-	void *uhp = tap_push_ip4h(ip4h, src, dst, udplen, IPPROTO_UDP);
-	struct udphdr *uh = (struct udphdr *)uhp;
-	char *data = (char *)(uh + 1);
+	struct iphdr *ip4h = tap_push_l2h(c, buf, ETH_P_IP);
+	struct udphdr *uh = tap_push_ip4h(ip4h, src, dst, l4len, IPPROTO_UDP);
+	char *data = tap_push_uh4(uh, src, sport, dst, dport, in, dlen);
 
-	uh->source = htons(sport);
-	uh->dest = htons(dport);
-	uh->len = htons(udplen);
-	csum_udp4(uh, src, dst, in, len);
-	memcpy(data, in, len);
-
-	if (tap_send(c, buf, len + (data - buf)) < 0)
-		debug("tap: failed to send %lu bytes (IPv4)", len);
+	memcpy(data, in, dlen);
+	tap_send_single(c, buf, dlen + (data - buf));
 }
 
 /**
@@ -199,21 +254,20 @@ void tap_udp4_send(const struct ctx *c, struct in_addr src, in_port_t sport,
  * @src:	IPv4 source address
  * @dst:	IPv4 destination address
  * @in:		ICMP packet, including ICMP header
- * @len:	ICMP packet length, including ICMP header
+ * @l4len:	ICMP packet length, including ICMP header
  */
 void tap_icmp4_send(const struct ctx *c, struct in_addr src, struct in_addr dst,
-		    void *in, size_t len)
+		    const void *in, size_t l4len)
 {
 	char buf[USHRT_MAX];
-	void *ip4h = tap_push_l2h(c, buf, ETH_P_IP);
-	char *data = tap_push_ip4h(ip4h, src, dst, len, IPPROTO_ICMP);
-	struct icmphdr *icmp4h = (struct icmphdr *)data;
+	struct iphdr *ip4h = tap_push_l2h(c, buf, ETH_P_IP);
+	struct icmphdr *icmp4h = tap_push_ip4h(ip4h, src, dst,
+					       l4len, IPPROTO_ICMP);
 
-	memcpy(data, in, len);
-	csum_icmp4(icmp4h, icmp4h + 1, len - sizeof(*icmp4h));
+	memcpy(icmp4h, in, l4len);
+	csum_icmp4(icmp4h, icmp4h + 1, l4len - sizeof(*icmp4h));
 
-	if (tap_send(c, buf, len + (data - buf)) < 0)
-		debug("tap: failed to send %lu bytes (IPv4)", len);
+	tap_send_single(c, buf, l4len + ((char *)icmp4h - buf));
 }
 
 /**
@@ -221,30 +275,57 @@ void tap_icmp4_send(const struct ctx *c, struct in_addr src, struct in_addr dst,
  * @c:		Execution context
  * @src:	IPv6 source address
  * @dst:	IPv6 destination address
- * @len:	L4 payload length
+ * @l4len:	L4 payload length
  * @proto:	L4 protocol number
  * @flow:	IPv6 flow identifier
  *
  * Return: pointer at which to write the packet's payload
  */
-static void *tap_push_ip6h(char *buf,
-			   const struct in6_addr *src,
-			   const struct in6_addr *dst,
-			   size_t len, uint8_t proto, uint32_t flow)
+void *tap_push_ip6h(struct ipv6hdr *ip6h,
+		    const struct in6_addr *src, const struct in6_addr *dst,
+		    size_t l4len, uint8_t proto, uint32_t flow)
 {
-	struct ipv6hdr *ip6h = (struct ipv6hdr *)buf;
-
-	ip6h->payload_len = htons(len);
+	ip6h->payload_len = htons(l4len);
 	ip6h->priority = 0;
 	ip6h->version = 6;
 	ip6h->nexthdr = proto;
 	ip6h->hop_limit = 255;
 	ip6h->saddr = *src;
 	ip6h->daddr = *dst;
-	ip6h->flow_lbl[0] = (flow >> 16) & 0xf;
-	ip6h->flow_lbl[1] = (flow >> 8) & 0xff;
-	ip6h->flow_lbl[2] = (flow >> 0) & 0xff;
-	return ip6h + 1;
+	ip6_set_flow_lbl(ip6h, flow);
+	return (char *)ip6h + sizeof(*ip6h);
+}
+
+/**
+ * tap_push_uh6() - Build UDPv6 header with checksum
+ * @c:		Execution context
+ * @src:	IPv6 source address
+ * @sport:	UDP source port
+ * @dst:	IPv6 destination address
+ * @dport:	UDP destination port
+ * @flow:	Flow label
+ * @in:		UDP payload contents (not including UDP header)
+ * @dlen:	UDP payload length (not including UDP header)
+ *
+ * Return: pointer at which to write the packet's payload
+ */
+void *tap_push_uh6(struct udphdr *uh,
+		   const struct in6_addr *src, in_port_t sport,
+		   const struct in6_addr *dst, in_port_t dport,
+		   void *in, size_t dlen)
+{
+	size_t l4len = dlen + sizeof(struct udphdr);
+	const struct iovec iov = {
+		.iov_base = in,
+		.iov_len = dlen
+	};
+	struct iov_tail payload = IOV_TAIL(&iov, 1, 0);
+
+	uh->source = htons(sport);
+	uh->dest = htons(dport);
+	uh->len = htons(l4len);
+	csum_udp6(uh, src, dst, &payload);
+	return (char *)uh + sizeof(*uh);
 }
 
 /**
@@ -255,29 +336,23 @@ static void *tap_push_ip6h(char *buf,
  * @dst:	IPv6 destination address
  * @dport:	UDP destination port
  * @flow:	Flow label
- * @in:		UDP payload contents (not including UDP header)
- * @len:	UDP payload length (not including UDP header)
+ * @in:	UDP payload contents (not including UDP header)
+ * @dlen:	UDP payload length (not including UDP header)
  */
 void tap_udp6_send(const struct ctx *c,
 		   const struct in6_addr *src, in_port_t sport,
 		   const struct in6_addr *dst, in_port_t dport,
-		   uint32_t flow, const void *in, size_t len)
+		   uint32_t flow, void *in, size_t dlen)
 {
-	size_t udplen = len + sizeof(struct udphdr);
+	size_t l4len = dlen + sizeof(struct udphdr);
 	char buf[USHRT_MAX];
-	void *ip6h = tap_push_l2h(c, buf, ETH_P_IPV6);
-	void *uhp = tap_push_ip6h(ip6h, src, dst, udplen, IPPROTO_UDP, flow);
-	struct udphdr *uh = (struct udphdr *)uhp;
-	char *data = (char *)(uh + 1);
+	struct ipv6hdr *ip6h = tap_push_l2h(c, buf, ETH_P_IPV6);
+	struct udphdr *uh = tap_push_ip6h(ip6h, src, dst,
+					  l4len, IPPROTO_UDP, flow);
+	char *data = tap_push_uh6(uh, src, sport, dst, dport, in, dlen);
 
-	uh->source = htons(sport);
-	uh->dest = htons(dport);
-	uh->len = htons(udplen);
-	csum_udp6(uh, src, dst, in, len);
-	memcpy(data, in, len);
-
-	if (tap_send(c, buf, len + (data - buf)) < 1)
-		debug("tap: failed to send %lu bytes (IPv6)", len);
+	memcpy(data, in, dlen);
+	tap_send_single(c, buf, dlen + (data - buf));
 }
 
 /**
@@ -286,42 +361,50 @@ void tap_udp6_send(const struct ctx *c,
  * @src:	IPv6 source address
  * @dst:	IPv6 destination address
  * @in:		ICMP packet, including ICMP header
- * @len:	ICMP packet length, including ICMP header
+ * @l4len:	ICMP packet length, including ICMP header
  */
 void tap_icmp6_send(const struct ctx *c,
 		    const struct in6_addr *src, const struct in6_addr *dst,
-		    void *in, size_t len)
+		    const void *in, size_t l4len)
 {
 	char buf[USHRT_MAX];
-	void *ip6h = tap_push_l2h(c, buf, ETH_P_IPV6);
-	char *data = tap_push_ip6h(ip6h, src, dst, len, IPPROTO_ICMPV6, 0);
-	struct icmp6hdr *icmp6h = (struct icmp6hdr *)data;
+	struct ipv6hdr *ip6h = tap_push_l2h(c, buf, ETH_P_IPV6);
+	struct icmp6hdr *icmp6h = tap_push_ip6h(ip6h, src, dst, l4len,
+						IPPROTO_ICMPV6, 0);
 
-	memcpy(data, in, len);
-	csum_icmp6(icmp6h, src, dst, icmp6h + 1, len - sizeof(*icmp6h));
+	memcpy(icmp6h, in, l4len);
+	csum_icmp6(icmp6h, src, dst, icmp6h + 1, l4len - sizeof(*icmp6h));
 
-	if (tap_send(c, buf, len + (data - buf)) < 1)
-		debug("tap: failed to send %lu bytes (IPv6)", len);
+	tap_send_single(c, buf, l4len + ((char *)icmp6h - buf));
 }
 
 /**
  * tap_send_frames_pasta() - Send multiple frames to the pasta tap
- * @c:		Execution context
- * @iov:	Array of buffers, each containing one frame
- * @n:		Number of buffers/frames in @iov
+ * @c:			Execution context
+ * @iov:		Array of buffers
+ * @bufs_per_frame:	Number of buffers (iovec entries) per frame
+ * @nframes:		Number of frames to send
+ *
+ * @iov must have total length @bufs_per_frame * @nframes, with each set of
+ * @bufs_per_frame contiguous buffers representing a single frame.
  *
  * Return: number of frames successfully sent
  *
  * #syscalls:pasta write
  */
-static size_t tap_send_frames_pasta(struct ctx *c,
-				    const struct iovec *iov, size_t n)
+static size_t tap_send_frames_pasta(const struct ctx *c,
+				    const struct iovec *iov,
+				    size_t bufs_per_frame, size_t nframes)
 {
+	size_t nbufs = bufs_per_frame * nframes;
 	size_t i;
 
-	for (i = 0; i < n; i++) {
-		if (write(c->fd_tap, iov[i].iov_base, iov[i].iov_len) < 0) {
-			debug("tap write: %s", strerror(errno));
+	for (i = 0; i < nbufs; i += bufs_per_frame) {
+		ssize_t rc = writev(c->fd_tap, iov + i, bufs_per_frame);
+		size_t framelen = iov_size(iov + i, bufs_per_frame);
+
+		if (rc < 0) {
+			debug_perror("tap write");
 
 			switch (errno) {
 			case EAGAIN:
@@ -329,61 +412,46 @@ static size_t tap_send_frames_pasta(struct ctx *c,
 			case EWOULDBLOCK:
 #endif
 			case EINTR:
-				i--;
-				break;
 			case ENOBUFS:
 			case ENOSPC:
+			case EIO:		/* interface down? */
 				break;
 			default:
 				die("Write error on tap device, exiting");
 			}
+		} else if ((size_t)rc < framelen) {
+			debug("short write on tuntap: %zd/%zu", rc, framelen);
+			break;
 		}
 	}
 
-	return n;
-}
-
-/**
- * tap_send_remainder() - Send remainder of a partially sent frame
- * @c:		Execution context
- * @iov:	Partially sent buffer
- * @offset:	Number of bytes already sent from @iov
- */
-static void tap_send_remainder(const struct ctx *c, const struct iovec *iov,
-			       size_t offset)
-{
-	const char *base = (char *)iov->iov_base;
-	size_t len = iov->iov_len;
-
-	while (offset < len) {
-		ssize_t sent = send(c->fd_tap, base + offset, len - offset,
-				    MSG_NOSIGNAL);
-		if (sent < 0) {
-			err("tap: partial frame send (missing %lu bytes): %s",
-			    len - offset, strerror(errno));
-			return;
-		}
-		offset += sent;
-	}
+	return i / bufs_per_frame;
 }
 
 /**
  * tap_send_frames_passt() - Send multiple frames to the passt tap
- * @c:		Execution context
- * @iov:	Array of buffers, each containing one frame
- * @n:		Number of buffers/frames in @iov
+ * @c:			Execution context
+ * @iov:		Array of buffers, each containing one frame
+ * @bufs_per_frame:	Number of buffers (iovec entries) per frame
+ * @nframes:		Number of frames to send
+ *
+ * @iov must have total length @bufs_per_frame * @nframes, with each set of
+ * @bufs_per_frame contiguous buffers representing a single frame.
  *
  * Return: number of frames successfully sent
  *
  * #syscalls:passt sendmsg
  */
 static size_t tap_send_frames_passt(const struct ctx *c,
-				    const struct iovec *iov, size_t n)
+				    const struct iovec *iov,
+				    size_t bufs_per_frame, size_t nframes)
 {
+	size_t nbufs = bufs_per_frame * nframes;
 	struct msghdr mh = {
 		.msg_iov = (void *)iov,
-		.msg_iovlen = n,
+		.msg_iovlen = nbufs,
 	};
+	size_t buf_offset;
 	unsigned int i;
 	ssize_t sent;
 
@@ -392,58 +460,78 @@ static size_t tap_send_frames_passt(const struct ctx *c,
 		return 0;
 
 	/* Check for any partial frames due to short send */
-	for (i = 0; i < n; i++) {
-		if ((size_t)sent < iov[i].iov_len)
-			break;
-		sent -= iov[i].iov_len;
+	i = iov_skip_bytes(iov, nbufs, sent, &buf_offset);
+
+	if (i < nbufs && (buf_offset || (i % bufs_per_frame))) {
+		/* Number of unsent or partially sent buffers for the frame */
+		size_t rembufs = bufs_per_frame - (i % bufs_per_frame);
+
+		if (write_remainder(c->fd_tap, &iov[i], rembufs, buf_offset) < 0) {
+			err_perror("tap: partial frame send");
+			return i;
+		}
+		i += rembufs;
 	}
 
-	if (i < n && sent) {
-		/* A partial frame was sent */
-		tap_send_remainder(c, &iov[i], sent);
-		i++;
-	}
-
-	return i;
+	return i / bufs_per_frame;
 }
 
 /**
  * tap_send_frames() - Send out multiple prepared frames
- * @c:		Execution context
- * @iov:	Array of buffers, each containing one frame (with L2 headers)
- * @n:		Number of buffers/frames in @iov
+ * @c:			Execution context
+ * @iov:		Array of buffers, each containing one frame (with L2 headers)
+ * @bufs_per_frame:	Number of buffers (iovec entries) per frame
+ * @nframes:		Number of frames to send
+ *
+ * @iov must have total length @bufs_per_frame * @nframes, with each set of
+ * @bufs_per_frame contiguous buffers representing a single frame.
+ *
+ * Return: number of frames actually sent
  */
-void tap_send_frames(struct ctx *c, const struct iovec *iov, size_t n)
+size_t tap_send_frames(const struct ctx *c, const struct iovec *iov,
+		       size_t bufs_per_frame, size_t nframes)
 {
 	size_t m;
 
-	if (!n)
-		return;
+	if (!nframes)
+		return 0;
 
-	if (c->mode == MODE_PASST)
-		m = tap_send_frames_passt(c, iov, n);
-	else
-		m = tap_send_frames_pasta(c, iov, n);
+	switch (c->mode) {
+	case MODE_PASTA:
+		m = tap_send_frames_pasta(c, iov, bufs_per_frame, nframes);
+		break;
+	case MODE_PASST:
+		m = tap_send_frames_passt(c, iov, bufs_per_frame, nframes);
+		break;
+	case MODE_VU:
+		/* fall through */
+	default:
+		ASSERT(0);
+	}
 
-	if (m < n)
-		debug("tap: dropped %lu frames of %lu due to short send", n - m, n);
+	if (m < nframes)
+		debug("tap: failed to send %zu frames of %zu",
+		      nframes - m, nframes);
 
-	pcap_multiple(iov, m, c->mode == MODE_PASST ? sizeof(uint32_t) : 0);
+	pcap_multiple(iov, bufs_per_frame, m,
+		      c->mode == MODE_PASST ? sizeof(uint32_t) : 0);
+
+	return m;
 }
 
 /**
- * tap_update_mac() - Update tap L2 header with new Ethernet addresses
- * @taph:	Tap headers to update
+ * eth_update_mac() - Update tap L2 header with new Ethernet addresses
+ * @eh:		Ethernet headers to update
  * @eth_d:	Ethernet destination address, NULL if unchanged
  * @eth_s:	Ethernet source address, NULL if unchanged
  */
-void tap_update_mac(struct tap_hdr *taph,
+void eth_update_mac(struct ethhdr *eh,
 		    const unsigned char *eth_d, const unsigned char *eth_s)
 {
 	if (eth_d)
-		memcpy(taph->eh.h_dest, eth_d, sizeof(taph->eh.h_dest));
+		memcpy(eh->h_dest, eth_d, sizeof(eh->h_dest));
 	if (eth_s)
-		memcpy(taph->eh.h_source, eth_s, sizeof(taph->eh.h_source));
+		memcpy(eh->h_source, eth_s, sizeof(eh->h_source));
 }
 
 PACKET_POOL_DECL(pool_l4, UIO_MAXIOV, pkt_buf);
@@ -474,6 +562,7 @@ static struct tap4_l4_t {
  * struct l4_seq6_t - Message sequence for one protocol handler call, IPv6
  * @msgs:	Count of messages in sequence
  * @protocol:	Protocol number
+ * @flow_lbl:	IPv6 flow label
  * @source:	Source port
  * @dest:	Destination port
  * @saddr:	Source address
@@ -482,6 +571,7 @@ static struct tap4_l4_t {
  */
 static struct tap6_l4_t {
 	uint8_t protocol;
+	uint32_t flow_lbl :20;
 
 	uint16_t source;
 	uint16_t dest;
@@ -544,6 +634,33 @@ static void tap_packet_debug(const struct iphdr *iph,
 }
 
 /**
+ * tap4_is_fragment() - Determine if a packet is an IP fragment
+ * @iph:	IPv4 header (length already validated)
+ * @now:	Current timestamp
+ *
+ * Return: true if iph is an IP fragment, false otherwise
+ */
+static bool tap4_is_fragment(const struct iphdr *iph,
+			     const struct timespec *now)
+{
+	if (ntohs(iph->frag_off) & ~IP_DF) {
+		/* Ratelimit messages */
+		static time_t last_message;
+		static unsigned num_dropped;
+
+		num_dropped++;
+		if (now->tv_sec - last_message > FRAGMENT_MSG_RATE) {
+			warn("Can't process IPv4 fragments (%u dropped)",
+			     num_dropped);
+			last_message = now->tv_sec;
+			num_dropped = 0;
+		}
+		return true;
+	}
+	return false;
+}
+
+/**
  * tap4_handler() - IPv4 and ARP packet handler for tap file descriptor
  * @c:		Execution context
  * @in:		Ingress packet pool, packets with Ethernet headers
@@ -563,21 +680,21 @@ static int tap4_handler(struct ctx *c, const struct pool *in,
 	i = 0;
 resume:
 	for (seq_count = 0, seq = NULL; i < in->count; i++) {
-		size_t l2_len, l3_len, hlen, l4_len;
-		struct ethhdr *eh;
+		size_t l2len, l3len, hlen, l4len;
+		const struct ethhdr *eh;
+		const struct udphdr *uh;
 		struct iphdr *iph;
-		struct udphdr *uh;
-		char *l4h;
+		const char *l4h;
 
-		packet_get(in, i, 0, 0, &l2_len);
+		packet_get(in, i, 0, 0, &l2len);
 
-		eh = packet_get(in, i, 0, sizeof(*eh), &l3_len);
+		eh = packet_get(in, i, 0, sizeof(*eh), &l3len);
 		if (!eh)
 			continue;
 		if (ntohs(eh->h_proto) == ETH_P_ARP) {
-			PACKET_POOL_P(pkt, 1, in->buf, sizeof(pkt_buf));
+			PACKET_POOL_P(pkt, 1, in->buf, in->buf_size);
 
-			packet_add(pkt, l2_len, (char *)eh);
+			packet_add(pkt, l2len, (char *)eh);
 			arp(c, pkt);
 			continue;
 		}
@@ -587,31 +704,45 @@ resume:
 			continue;
 
 		hlen = iph->ihl * 4UL;
-		if (hlen < sizeof(*iph) || htons(iph->tot_len) != l3_len ||
-		    hlen > l3_len)
+		if (hlen < sizeof(*iph) || htons(iph->tot_len) > l3len ||
+		    hlen > l3len)
 			continue;
 
-		l4_len = l3_len - hlen;
+		/* We don't handle IP fragments, drop them */
+		if (tap4_is_fragment(iph, now))
+			continue;
 
-		if (iph->saddr && c->ip4.addr_seen.s_addr != iph->saddr) {
-			c->ip4.addr_seen.s_addr = iph->saddr;
-			proto_update_l2_buf(NULL, NULL, &c->ip4.addr_seen);
+		l4len = htons(iph->tot_len) - hlen;
+
+		if (IN4_IS_ADDR_LOOPBACK(&iph->saddr) ||
+		    IN4_IS_ADDR_LOOPBACK(&iph->daddr)) {
+			char sstr[INET_ADDRSTRLEN], dstr[INET_ADDRSTRLEN];
+
+			debug("Loopback address on tap interface: %s -> %s",
+			      inet_ntop(AF_INET, &iph->saddr, sstr, sizeof(sstr)),
+			      inet_ntop(AF_INET, &iph->daddr, dstr, sizeof(dstr)));
+			continue;
 		}
 
-		l4h = packet_get(in, i, sizeof(*eh) + hlen, l4_len, NULL);
+		if (iph->saddr && c->ip4.addr_seen.s_addr != iph->saddr)
+			c->ip4.addr_seen.s_addr = iph->saddr;
+
+		l4h = packet_get(in, i, sizeof(*eh) + hlen, l4len, NULL);
 		if (!l4h)
 			continue;
 
 		if (iph->protocol == IPPROTO_ICMP) {
-			PACKET_POOL_P(pkt, 1, in->buf, sizeof(pkt_buf));
+			PACKET_POOL_P(pkt, 1, in->buf, in->buf_size);
 
 			if (c->no_icmp)
 				continue;
 
 			tap_packet_debug(iph, NULL, NULL, 0, NULL, 1);
 
-			packet_add(pkt, l4_len, l4h);
-			icmp_tap_handler(c, AF_INET, &iph->daddr, pkt, now);
+			packet_add(pkt, l4len, l4h);
+			icmp_tap_handler(c, PIF_TAP, AF_INET,
+					 &iph->saddr, &iph->daddr,
+					 pkt, now);
 			continue;
 		}
 
@@ -620,9 +751,9 @@ resume:
 			continue;
 
 		if (iph->protocol == IPPROTO_UDP) {
-			PACKET_POOL_P(pkt, 1, in->buf, sizeof(pkt_buf));
+			PACKET_POOL_P(pkt, 1, in->buf, in->buf_size);
 
-			packet_add(pkt, l2_len, (char *)eh);
+			packet_add(pkt, l2len, (char *)eh);
 			if (dhcp(c, pkt))
 				continue;
 		}
@@ -633,21 +764,21 @@ resume:
 			continue;
 		}
 
-#define L4_MATCH(iph, uh, seq)						\
-	(seq->protocol == iph->protocol &&				\
-	 seq->source   == uh->source    && seq->dest  == uh->dest &&	\
-	 seq->saddr.s_addr == iph->saddr && seq->daddr.s_addr == iph->daddr)
+#define L4_MATCH(iph, uh, seq)							\
+	((seq)->protocol == (iph)->protocol &&					\
+	 (seq)->source   == (uh)->source    && (seq)->dest  == (uh)->dest &&	\
+	 (seq)->saddr.s_addr == (iph)->saddr && (seq)->daddr.s_addr == (iph)->daddr)
 
 #define L4_SET(iph, uh, seq)						\
 	do {								\
-		seq->protocol		= iph->protocol;		\
-		seq->source		= uh->source;			\
-		seq->dest		= uh->dest;			\
-		seq->saddr.s_addr	= iph->saddr;			\
-		seq->daddr.s_addr	= iph->daddr;			\
+		(seq)->protocol		= (iph)->protocol;		\
+		(seq)->source		= (uh)->source;			\
+		(seq)->dest		= (uh)->dest;			\
+		(seq)->saddr.s_addr	= (iph)->saddr;			\
+		(seq)->daddr.s_addr	= (iph)->daddr;			\
 	} while (0)
 
-		if (seq && L4_MATCH(iph, uh, seq) && seq->p.count < TAP_SEQS)
+		if (seq && L4_MATCH(iph, uh, seq) && seq->p.count < UIO_MAXIOV)
 			goto append;
 
 		if (seq_count == TAP_SEQS)
@@ -655,7 +786,7 @@ resume:
 
 		for (seq = tap4_l4 + seq_count - 1; seq >= tap4_l4; seq--) {
 			if (L4_MATCH(iph, uh, seq)) {
-				if (seq->p.count >= TAP_SEQS)
+				if (seq->p.count >= UIO_MAXIOV)
 					seq = NULL;
 				break;
 			}
@@ -671,24 +802,29 @@ resume:
 #undef L4_SET
 
 append:
-		packet_add((struct pool *)&seq->p, l4_len, l4h);
+		packet_add((struct pool *)&seq->p, l4len, l4h);
 	}
 
 	for (j = 0, seq = tap4_l4; j < seq_count; j++, seq++) {
-		struct pool *p = (struct pool *)&seq->p;
-		struct in_addr *da = &seq->daddr;
-		size_t n = p->count;
+		const struct pool *p = (const struct pool *)&seq->p;
+		size_t k;
 
-		tap_packet_debug(NULL, NULL, seq, 0, NULL, n);
+		tap_packet_debug(NULL, NULL, seq, 0, NULL, p->count);
 
 		if (seq->protocol == IPPROTO_TCP) {
 			if (c->no_tcp)
 				continue;
-			while ((n -= tcp_tap_handler(c, AF_INET, da, p, now)));
+			for (k = 0; k < p->count; )
+				k += tcp_tap_handler(c, PIF_TAP, AF_INET,
+						     &seq->saddr, &seq->daddr,
+						     0, p, k, now);
 		} else if (seq->protocol == IPPROTO_UDP) {
 			if (c->no_udp)
 				continue;
-			while ((n -= udp_tap_handler(c, AF_INET, da, p, now)));
+			for (k = 0; k < p->count; )
+				k += udp_tap_handler(c, PIF_TAP, AF_INET,
+						     &seq->saddr, &seq->daddr,
+						     p, k, now);
 		}
 	}
 
@@ -718,11 +854,11 @@ static int tap6_handler(struct ctx *c, const struct pool *in,
 	i = 0;
 resume:
 	for (seq_count = 0, seq = NULL; i < in->count; i++) {
-		size_t l4_len, plen, check;
+		size_t l4len, plen, check;
 		struct in6_addr *saddr, *daddr;
+		const struct ethhdr *eh;
+		const struct udphdr *uh;
 		struct ipv6hdr *ip6h;
-		struct ethhdr *eh;
-		struct udphdr *uh;
 		uint8_t proto;
 		char *l4h;
 
@@ -741,8 +877,17 @@ resume:
 		if (plen != check)
 			continue;
 
-		if (!(l4h = ipv6_l4hdr(in, i, sizeof(*eh), &proto, &l4_len)))
+		if (!(l4h = ipv6_l4hdr(in, i, sizeof(*eh), &proto, &l4len)))
 			continue;
+
+		if (IN6_IS_ADDR_LOOPBACK(saddr) || IN6_IS_ADDR_LOOPBACK(daddr)) {
+			char sstr[INET6_ADDRSTRLEN], dstr[INET6_ADDRSTRLEN];
+
+			debug("Loopback address on tap interface: %s -> %s",
+			      inet_ntop(AF_INET6, saddr, sstr, sizeof(sstr)),
+			      inet_ntop(AF_INET6, daddr, dstr, sizeof(dstr)));
+			continue;
+		}
 
 		if (IN6_IS_ADDR_LINKLOCAL(saddr)) {
 			c->ip6.addr_ll_seen = *saddr;
@@ -750,43 +895,46 @@ resume:
 			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_seen)) {
 				c->ip6.addr_seen = *saddr;
 			}
+
+			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr))
+				c->ip6.addr = *saddr;
 		} else if (!IN6_IS_ADDR_UNSPECIFIED(saddr)){
 			c->ip6.addr_seen = *saddr;
 		}
 
 		if (proto == IPPROTO_ICMPV6) {
-			PACKET_POOL_P(pkt, 1, in->buf, sizeof(pkt_buf));
+			PACKET_POOL_P(pkt, 1, in->buf, in->buf_size);
 
 			if (c->no_icmp)
 				continue;
 
-			if (l4_len < sizeof(struct icmp6hdr))
+			if (l4len < sizeof(struct icmp6hdr))
 				continue;
 
-			if (ndp(c, (struct icmp6hdr *)l4h, saddr))
+			packet_add(pkt, l4len, l4h);
+
+			if (ndp(c, (struct icmp6hdr *)l4h, saddr, pkt))
 				continue;
 
 			tap_packet_debug(NULL, ip6h, NULL, proto, NULL, 1);
 
-			packet_add(pkt, l4_len, l4h);
-			icmp_tap_handler(c, AF_INET6, daddr, pkt, now);
+			icmp_tap_handler(c, PIF_TAP, AF_INET6,
+					 saddr, daddr, pkt, now);
 			continue;
 		}
 
-		if (l4_len < sizeof(*uh))
+		if (l4len < sizeof(*uh))
 			continue;
 		uh = (struct udphdr *)l4h;
 
 		if (proto == IPPROTO_UDP) {
-			PACKET_POOL_P(pkt, 1, in->buf, sizeof(pkt_buf));
+			PACKET_POOL_P(pkt, 1, in->buf, in->buf_size);
 
-			packet_add(pkt, l4_len, l4h);
+			packet_add(pkt, l4len, l4h);
 
 			if (dhcpv6(c, pkt, saddr, daddr))
 				continue;
 		}
-
-		*saddr = c->ip6.addr;
 
 		if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) {
 			tap_packet_debug(NULL, ip6h, NULL, proto, NULL, 1);
@@ -794,22 +942,25 @@ resume:
 		}
 
 #define L4_MATCH(ip6h, proto, uh, seq)					\
-	(seq->protocol == proto         &&				\
-	 seq->source   == uh->source    && seq->dest  == uh->dest &&	\
-	 IN6_ARE_ADDR_EQUAL(&seq->saddr, saddr)			  &&	\
-	 IN6_ARE_ADDR_EQUAL(&seq->daddr, daddr))
+		((seq)->protocol == (proto)                &&		\
+		 (seq)->source   == (uh)->source           &&		\
+		 (seq)->dest == (uh)->dest                 &&		\
+		 (seq)->flow_lbl == ip6_get_flow_lbl(ip6h) &&		\
+		 IN6_ARE_ADDR_EQUAL(&(seq)->saddr, saddr)  &&		\
+		 IN6_ARE_ADDR_EQUAL(&(seq)->daddr, daddr))
 
 #define L4_SET(ip6h, proto, uh, seq)					\
 	do {								\
-		seq->protocol	= proto;				\
-		seq->source	= uh->source;				\
-		seq->dest	= uh->dest;				\
-		seq->saddr	= *saddr;				\
-		seq->daddr	= *daddr;				\
+		(seq)->protocol	= (proto);				\
+		(seq)->source	= (uh)->source;				\
+		(seq)->dest	= (uh)->dest;				\
+		(seq)->flow_lbl	= ip6_get_flow_lbl(ip6h);		\
+		(seq)->saddr	= *saddr;				\
+		(seq)->daddr	= *daddr;				\
 	} while (0)
 
 		if (seq && L4_MATCH(ip6h, proto, uh, seq) &&
-		    seq->p.count < TAP_SEQS)
+		    seq->p.count < UIO_MAXIOV)
 			goto append;
 
 		if (seq_count == TAP_SEQS)
@@ -817,7 +968,7 @@ resume:
 
 		for (seq = tap6_l4 + seq_count - 1; seq >= tap6_l4; seq--) {
 			if (L4_MATCH(ip6h, proto, uh, seq)) {
-				if (seq->p.count >= TAP_SEQS)
+				if (seq->p.count >= UIO_MAXIOV)
 					seq = NULL;
 				break;
 			}
@@ -833,24 +984,30 @@ resume:
 #undef L4_SET
 
 append:
-		packet_add((struct pool *)&seq->p, l4_len, l4h);
+		packet_add((struct pool *)&seq->p, l4len, l4h);
 	}
 
 	for (j = 0, seq = tap6_l4; j < seq_count; j++, seq++) {
-		struct pool *p = (struct pool *)&seq->p;
-		struct in6_addr *da = &seq->daddr;
-		size_t n = p->count;
+		const struct pool *p = (const struct pool *)&seq->p;
+		size_t k;
 
-		tap_packet_debug(NULL, NULL, NULL, seq->protocol, seq, n);
+		tap_packet_debug(NULL, NULL, NULL, seq->protocol, seq,
+				 p->count);
 
 		if (seq->protocol == IPPROTO_TCP) {
 			if (c->no_tcp)
 				continue;
-			while ((n -= tcp_tap_handler(c, AF_INET6, da, p, now)));
+			for (k = 0; k < p->count; )
+				k += tcp_tap_handler(c, PIF_TAP, AF_INET6,
+						     &seq->saddr, &seq->daddr,
+						     seq->flow_lbl, p, k, now);
 		} else if (seq->protocol == IPPROTO_UDP) {
 			if (c->no_udp)
 				continue;
-			while ((n -= udp_tap_handler(c, AF_INET6, da, p, now)));
+			for (k = 0; k < p->count; )
+				k += udp_tap_handler(c, PIF_TAP, AF_INET6,
+						     &seq->saddr, &seq->daddr,
+						     p, k, now);
 		}
 	}
 
@@ -861,242 +1018,299 @@ append:
 }
 
 /**
- * tap_handler_passt() - Packet handler for AF_UNIX file descriptor
- * @c:		Execution context
- * @now:	Current timestamp
- *
- * Return: -ECONNRESET on receive error, 0 otherwise
+ * tap_flush_pools() - Flush both IPv4 and IPv6 packet pools
  */
-static int tap_handler_passt(struct ctx *c, const struct timespec *now)
+void tap_flush_pools(void)
 {
-	struct ethhdr *eh;
-	ssize_t n, rem;
-	char *p;
-
-redo:
-	p = pkt_buf;
-	rem = 0;
-
 	pool_flush(pool_tap4);
 	pool_flush(pool_tap6);
+}
 
-	n = recv(c->fd_tap, p, TAP_BUF_FILL, MSG_DONTWAIT);
-	if (n < 0) {
-		if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-			return 0;
+/**
+ * tap_handler() - IPv4/IPv6 and ARP packet handler for tap file descriptor
+ * @c:		Execution context
+ * @now:	Current timestamp
+ */
+void tap_handler(struct ctx *c, const struct timespec *now)
+{
+	tap4_handler(c, pool_tap4, now);
+	tap6_handler(c, pool_tap6, now);
+}
 
-		epoll_ctl(c->epollfd, EPOLL_CTL_DEL, c->fd_tap, NULL);
-		close(c->fd_tap);
+/**
+ * tap_add_packet() - Queue/capture packet, update notion of guest MAC address
+ * @c:		Execution context
+ * @l2len:	Total L2 packet length
+ * @p:		Packet buffer
+ */
+void tap_add_packet(struct ctx *c, ssize_t l2len, char *p)
+{
+	const struct ethhdr *eh;
 
-		return -ECONNRESET;
+	pcap(p, l2len);
+
+	eh = (struct ethhdr *)p;
+
+	if (memcmp(c->guest_mac, eh->h_source, ETH_ALEN)) {
+		memcpy(c->guest_mac, eh->h_source, ETH_ALEN);
+		proto_update_l2_buf(c->guest_mac, NULL);
 	}
 
-	while (n > (ssize_t)sizeof(uint32_t)) {
-		ssize_t len = ntohl(*(uint32_t *)p);
+	switch (ntohs(eh->h_proto)) {
+	case ETH_P_ARP:
+	case ETH_P_IP:
+		packet_add(pool_tap4, l2len, p);
+		break;
+	case ETH_P_IPV6:
+		packet_add(pool_tap6, l2len, p);
+		break;
+	default:
+		break;
+	}
+}
+
+/**
+ * tap_sock_reset() - Handle closing or failure of connect AF_UNIX socket
+ * @c:		Execution context
+ */
+void tap_sock_reset(struct ctx *c)
+{
+	info("Client connection closed%s", c->one_off ? ", exiting" : "");
+
+	if (c->one_off)
+		_exit(EXIT_SUCCESS);
+
+	/* Close the connected socket, wait for a new connection */
+	epoll_del(c, c->fd_tap);
+	close(c->fd_tap);
+	c->fd_tap = -1;
+	if (c->mode == MODE_VU)
+		vu_cleanup(c->vdev);
+}
+
+/**
+ * tap_passt_input() - Handler for new data on the socket to qemu
+ * @c:		Execution context
+ * @now:	Current timestamp
+ */
+static void tap_passt_input(struct ctx *c, const struct timespec *now)
+{
+	static const char *partial_frame;
+	static ssize_t partial_len = 0;
+	ssize_t n;
+	char *p;
+
+	tap_flush_pools();
+
+	if (partial_len) {
+		/* We have a partial frame from an earlier pass.  Move it to the
+		 * start of the buffer, top up with new data, then process all
+		 * of it.
+		 */
+		memmove(pkt_buf, partial_frame, partial_len);
+	}
+
+	do {
+		n = recv(c->fd_tap, pkt_buf + partial_len,
+			 sizeof(pkt_buf) - partial_len, MSG_DONTWAIT);
+	} while ((n < 0) && errno == EINTR);
+
+	if (n < 0) {
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			err_perror("Receive error on guest connection, reset");
+			tap_sock_reset(c);
+		}
+		return;
+	}
+
+	p = pkt_buf;
+	n += partial_len;
+
+	while (n >= (ssize_t)sizeof(uint32_t)) {
+		uint32_t l2len = ntohl_unaligned(p);
+
+		if (l2len < sizeof(struct ethhdr) || l2len > L2_MAX_LEN_PASST) {
+			err("Bad frame size from guest, resetting connection");
+			tap_sock_reset(c);
+			return;
+		}
+
+		if (l2len + sizeof(uint32_t) > (size_t)n)
+			/* Leave this incomplete frame for later */
+			break;
 
 		p += sizeof(uint32_t);
 		n -= sizeof(uint32_t);
 
-		/* At most one packet might not fit in a single read, and this
-		 * needs to be blocking.
-		 */
-		if (len > n) {
-			rem = recv(c->fd_tap, p + n, len - n, 0);
-			if ((n += rem) != len)
-				return 0;
-		}
+		tap_add_packet(c, l2len, p);
 
-		/* Complete the partial read above before discarding a malformed
-		 * frame, otherwise the stream will be inconsistent.
-		 */
-		if (len < (ssize_t)sizeof(*eh) || len > (ssize_t)ETH_MAX_MTU)
-			goto next;
-
-		pcap(p, len);
-
-		eh = (struct ethhdr *)p;
-
-		if (memcmp(c->mac_guest, eh->h_source, ETH_ALEN)) {
-			memcpy(c->mac_guest, eh->h_source, ETH_ALEN);
-			proto_update_l2_buf(c->mac_guest, NULL, NULL);
-		}
-
-		switch (ntohs(eh->h_proto)) {
-		case ETH_P_ARP:
-		case ETH_P_IP:
-			packet_add(pool_tap4, len, p);
-			break;
-		case ETH_P_IPV6:
-			packet_add(pool_tap6, len, p);
-			break;
-		default:
-			break;
-		}
-
-next:
-		p += len;
-		n -= len;
+		p += l2len;
+		n -= l2len;
 	}
 
-	tap4_handler(c, pool_tap4, now);
-	tap6_handler(c, pool_tap6, now);
+	partial_len = n;
+	partial_frame = p;
 
-	/* We can't use EPOLLET otherwise. */
-	if (rem)
-		goto redo;
-
-	return 0;
+	tap_handler(c, now);
 }
 
 /**
- * tap_handler_pasta() - Packet handler for tuntap file descriptor
+ * tap_handler_passt() - Event handler for AF_UNIX file descriptor
+ * @c:		Execution context
+ * @events:	epoll events
+ * @now:	Current timestamp
+ */
+void tap_handler_passt(struct ctx *c, uint32_t events,
+		       const struct timespec *now)
+{
+	if (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+		tap_sock_reset(c);
+		return;
+	}
+
+	if (events & EPOLLIN)
+		tap_passt_input(c, now);
+}
+
+/**
+ * tap_pasta_input() - Handler for new data on the socket to hypervisor
  * @c:		Execution context
  * @now:	Current timestamp
- *
- * Return: -ECONNRESET on receive error, 0 otherwise
  */
-static int tap_handler_pasta(struct ctx *c, const struct timespec *now)
+static void tap_pasta_input(struct ctx *c, const struct timespec *now)
 {
 	ssize_t n, len;
-	int ret;
 
-redo:
-	n = 0;
+	tap_flush_pools();
 
-	pool_flush(pool_tap4);
-	pool_flush(pool_tap6);
-restart:
-	while ((len = read(c->fd_tap, pkt_buf + n, TAP_BUF_BYTES - n)) > 0) {
-		struct ethhdr *eh = (struct ethhdr *)(pkt_buf + n);
+	for (n = 0;
+	     n <= (ssize_t)(sizeof(pkt_buf) - L2_MAX_LEN_PASTA);
+	     n += len) {
+		len = read(c->fd_tap, pkt_buf + n, L2_MAX_LEN_PASTA);
 
-		if (len < (ssize_t)sizeof(*eh) || len > (ssize_t)ETH_MAX_MTU) {
-			n += len;
+		if (len == 0) {
+			die("EOF on tap device, exiting");
+		} else if (len < 0) {
+			if (errno == EINTR) {
+				len = 0;
+				continue;
+			}
+
+			if (errno == EAGAIN && errno == EWOULDBLOCK)
+				break; /* all done for now */
+
+			die("Error on tap device, exiting");
+		}
+
+		/* Ignore frames of bad length */
+		if (len < (ssize_t)sizeof(struct ethhdr) ||
+		    len > (ssize_t)L2_MAX_LEN_PASTA)
 			continue;
-		}
 
-		pcap(pkt_buf + n, len);
-
-		if (memcmp(c->mac_guest, eh->h_source, ETH_ALEN)) {
-			memcpy(c->mac_guest, eh->h_source, ETH_ALEN);
-			proto_update_l2_buf(c->mac_guest, NULL, NULL);
-		}
-
-		switch (ntohs(eh->h_proto)) {
-		case ETH_P_ARP:
-		case ETH_P_IP:
-			packet_add(pool_tap4, len, pkt_buf + n);
-			break;
-		case ETH_P_IPV6:
-			packet_add(pool_tap6, len, pkt_buf + n);
-			break;
-		default:
-			break;
-		}
-
-		if ((n += len) == TAP_BUF_BYTES)
-			break;
+		tap_add_packet(c, len, pkt_buf + n);
 	}
 
-	if (len < 0 && errno == EINTR)
-		goto restart;
-
-	ret = errno;
-
-	tap4_handler(c, pool_tap4, now);
-	tap6_handler(c, pool_tap6, now);
-
-	if (len > 0 || ret == EAGAIN)
-		return 0;
-
-	if (n == TAP_BUF_BYTES)
-		goto redo;
-
-	epoll_ctl(c->epollfd, EPOLL_CTL_DEL, c->fd_tap, NULL);
-	close(c->fd_tap);
-
-	return -ECONNRESET;
+	tap_handler(c, now);
 }
 
 /**
- * tap_sock_unix_init() - Create and bind AF_UNIX socket, listen for connection
+ * tap_handler_pasta() - Packet handler for /dev/net/tun file descriptor
+ * @c:		Execution context
+ * @events:	epoll events
+ * @now:	Current timestamp
+ */
+void tap_handler_pasta(struct ctx *c, uint32_t events,
+		       const struct timespec *now)
+{
+	if (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+		die("Disconnect event on /dev/net/tun device, exiting");
+
+	if (events & EPOLLIN)
+		tap_pasta_input(c, now);
+}
+
+/**
+ * tap_backend_show_hints() - Give help information to start QEMU
  * @c:		Execution context
  */
-static void tap_sock_unix_init(struct ctx *c)
+static void tap_backend_show_hints(struct ctx *c)
 {
-	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	struct epoll_event ev = { 0 };
-	struct sockaddr_un addr = {
-		.sun_family = AF_UNIX,
-	};
-	int i;
-
-	if (fd < 0)
-		die("UNIX socket: %s", strerror(errno));
-
-	/* In passt mode, we don't know the guest's MAC until it sends
-	 * us packets.  Use the broadcast address so our first packets
-	 * will reach it.
-	 */
-	memset(&c->mac_guest, 0xff, sizeof(c->mac_guest));
-
-	for (i = 1; i < UNIX_SOCK_MAX; i++) {
-		char *path = addr.sun_path;
-		int ex, ret;
-
-		if (*c->sock_path)
-			memcpy(path, c->sock_path, UNIX_PATH_MAX);
-		else
-			snprintf(path, UNIX_PATH_MAX - 1, UNIX_SOCK_PATH, i);
-
-		ex = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
-		if (ex < 0)
-			die("UNIX domain socket check: %s", strerror(errno));
-
-		ret = connect(ex, (const struct sockaddr *)&addr, sizeof(addr));
-		if (!ret || (errno != ENOENT && errno != ECONNREFUSED &&
-			     errno != EACCES)) {
-			if (*c->sock_path)
-				die("Socket path %s already in use", path);
-
-			close(ex);
-			continue;
-		}
-		close(ex);
-
-		unlink(path);
-		if (!bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) ||
-		    *c->sock_path)
-			break;
+	switch (c->mode) {
+	case MODE_PASTA:
+		/* No hints */
+		break;
+	case MODE_PASST:
+		info("\nYou can now start qemu (>= 7.2, with commit 13c6be96618c):");
+		info("    kvm ... -device virtio-net-pci,netdev=s -netdev stream,id=s,server=off,addr.type=unix,addr.path=%s",
+		     c->sock_path);
+		info("or qrap, for earlier qemu versions:");
+		info("    ./qrap 5 kvm ... -net socket,fd=5 -net nic,model=virtio");
+		break;
+	case MODE_VU:
+		info("You can start qemu with:");
+		info("    kvm ... -chardev socket,id=chr0,path=%s -netdev vhost-user,id=netdev0,chardev=chr0 -device virtio-net,netdev=netdev0 -object memory-backend-memfd,id=memfd0,share=on,size=$RAMSIZE -numa node,memdev=memfd0\n",
+		     c->sock_path);
+		break;
 	}
+}
 
-	if (i == UNIX_SOCK_MAX)
-		die("UNIX socket bind: %s", strerror(errno));
+/**
+ * tap_sock_unix_init() - Start listening for connections on AF_UNIX socket
+ * @c:		Execution context
+ */
+static void tap_sock_unix_init(const struct ctx *c)
+{
+	union epoll_ref ref = { .type = EPOLL_TYPE_TAP_LISTEN };
+	struct epoll_event ev = { 0 };
 
-	info("UNIX domain socket bound at %s\n", addr.sun_path);
+	listen(c->fd_tap_listen, 0);
 
-	listen(fd, 0);
-
-	ev.data.fd = c->fd_tap_listen = fd;
-	ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+	ref.fd = c->fd_tap_listen;
+	ev.events = EPOLLIN | EPOLLET;
+	ev.data.u64 = ref.u64;
 	epoll_ctl(c->epollfd, EPOLL_CTL_ADD, c->fd_tap_listen, &ev);
-
-	info("You can now start qemu (>= 7.2, with commit 13c6be96618c):");
-	info("    kvm ... -device virtio-net-pci,netdev=s -netdev stream,id=s,server=off,addr.type=unix,addr.path=%s",
-	     addr.sun_path);
-	info("or qrap, for earlier qemu versions:");
-	info("    ./qrap 5 kvm ... -net socket,fd=5 -net nic,model=virtio");
 }
 
 /**
- * tap_sock_unix_new() - Handle new connection on listening socket
+ * tap_start_connection() - start a new connection
  * @c:		Execution context
  */
-static void tap_sock_unix_new(struct ctx *c)
+static void tap_start_connection(const struct ctx *c)
 {
 	struct epoll_event ev = { 0 };
+	union epoll_ref ref = { 0 };
+
+	ref.fd = c->fd_tap;
+	switch (c->mode) {
+	case MODE_PASST:
+		ref.type = EPOLL_TYPE_TAP_PASST;
+		break;
+	case MODE_PASTA:
+		ref.type = EPOLL_TYPE_TAP_PASTA;
+		break;
+	case MODE_VU:
+		ref.type = EPOLL_TYPE_VHOST_CMD;
+		break;
+	}
+
+	ev.events = EPOLLIN | EPOLLRDHUP;
+	ev.data.u64 = ref.u64;
+	epoll_ctl(c->epollfd, EPOLL_CTL_ADD, c->fd_tap, &ev);
+}
+
+/**
+ * tap_listen_handler() - Handle new connection on listening socket
+ * @c:		Execution context
+ * @events:	epoll events
+ */
+void tap_listen_handler(struct ctx *c, uint32_t events)
+{
 	int v = INT_MAX / 2;
 	struct ucred ucred;
 	socklen_t len;
+
+	if (events != EPOLLIN)
+		die("Error on listening Unix socket, exiting");
 
 	len = sizeof(ucred);
 
@@ -1129,18 +1343,14 @@ static void tap_sock_unix_new(struct ctx *c)
 	    setsockopt(c->fd_tap, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v)))
 		trace("tap: failed to set SO_SNDBUF to %i", v);
 
-	ev.data.fd = c->fd_tap;
-	ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-	epoll_ctl(c->epollfd, EPOLL_CTL_ADD, c->fd_tap, &ev);
+	tap_start_connection(c);
 }
-
-static int tun_ns_fd = -1;
 
 /**
  * tap_ns_tun() - Get tuntap fd in namespace
  * @c:		Execution context
  *
- * Return: 0
+ * Return: 0 on success, exits on failure
  *
  * #syscalls:pasta ioctl openat
  */
@@ -1149,108 +1359,98 @@ static int tap_ns_tun(void *arg)
 	struct ifreq ifr = { .ifr_flags = IFF_TAP | IFF_NO_PI };
 	int flags = O_RDWR | O_NONBLOCK | O_CLOEXEC;
 	struct ctx *c = (struct ctx *)arg;
+	int fd, rc;
 
+	c->fd_tap = -1;
 	memcpy(ifr.ifr_name, c->pasta_ifn, IFNAMSIZ);
+	ns_enter(c);
 
-	if (ns_enter(c) ||
-	    (tun_ns_fd = open("/dev/net/tun", flags)) < 0 ||
-	    ioctl(tun_ns_fd, TUNSETIFF, &ifr) ||
-	    !(c->pasta_ifi = if_nametoindex(c->pasta_ifn))) {
-		if (tun_ns_fd != -1)
-			close(tun_ns_fd);
-		tun_ns_fd = -1;
-	}
+	fd = open("/dev/net/tun", flags);
+	if (fd < 0)
+		die_perror("Failed to open() /dev/net/tun");
+
+	rc = ioctl(fd, (int)TUNSETIFF, &ifr);
+	if (rc < 0)
+		die_perror("TUNSETIFF ioctl on /dev/net/tun failed");
+
+	if (!(c->pasta_ifi = if_nametoindex(c->pasta_ifn)))
+		die("Tap device opened but no network interface found");
+
+	c->fd_tap = fd;
 
 	return 0;
 }
 
 /**
- * tap_sock_init_tun() - Set up tuntap file descriptor
+ * tap_sock_tun_init() - Set up /dev/net/tun file descriptor
  * @c:		Execution context
  */
 static void tap_sock_tun_init(struct ctx *c)
 {
-	struct epoll_event ev = { 0 };
-
 	NS_CALL(tap_ns_tun, c);
-	if (tun_ns_fd == -1)
-		die("Failed to open tun socket in namespace");
+	if (c->fd_tap == -1)
+		die("Failed to set up tap device in namespace");
 
 	pasta_ns_conf(c);
 
-	c->fd_tap = tun_ns_fd;
-
-	ev.data.fd = c->fd_tap;
-	ev.events = EPOLLIN | EPOLLRDHUP;
-	epoll_ctl(c->epollfd, EPOLL_CTL_ADD, c->fd_tap, &ev);
+	tap_start_connection(c);
 }
 
 /**
- * tap_sock_init() - Create and set up AF_UNIX socket or tuntap file descriptor
- * @c:		Execution context
+ * tap_sock_update_pool() - Set the buffer base and size for the pool of packets
+ * @base:	Buffer base
+ * @size	Buffer size
  */
-void tap_sock_init(struct ctx *c)
+void tap_sock_update_pool(void *base, size_t size)
 {
-	size_t sz = sizeof(pkt_buf);
 	int i;
 
-	pool_tap4_storage = PACKET_INIT(pool_tap4, TAP_MSGS, pkt_buf, sz);
-	pool_tap6_storage = PACKET_INIT(pool_tap6, TAP_MSGS, pkt_buf, sz);
+	pool_tap4_storage = PACKET_INIT(pool_tap4, TAP_MSGS, base, size);
+	pool_tap6_storage = PACKET_INIT(pool_tap6, TAP_MSGS, base, size);
 
 	for (i = 0; i < TAP_SEQS; i++) {
-		tap4_l4[i].p = PACKET_INIT(pool_l4, TAP_SEQS, pkt_buf, sz);
-		tap6_l4[i].p = PACKET_INIT(pool_l4, TAP_SEQS, pkt_buf, sz);
-	}
-
-	if (c->fd_tap != -1) {
-		if (c->one_off) {	/* Passed as --fd */
-			struct epoll_event ev = { 0 };
-
-			ev.data.fd = c->fd_tap;
-			ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-			epoll_ctl(c->epollfd, EPOLL_CTL_ADD, c->fd_tap, &ev);
-			return;
-		}
-
-		epoll_ctl(c->epollfd, EPOLL_CTL_DEL, c->fd_tap, NULL);
-		close(c->fd_tap);
-		c->fd_tap = -1;
-	}
-
-	if (c->mode == MODE_PASST) {
-		if (c->fd_tap_listen == -1)
-			tap_sock_unix_init(c);
-	} else {
-		tap_sock_tun_init(c);
+		tap4_l4[i].p = PACKET_INIT(pool_l4, UIO_MAXIOV, base, size);
+		tap6_l4[i].p = PACKET_INIT(pool_l4, UIO_MAXIOV, base, size);
 	}
 }
 
 /**
- * tap_handler() - Packet handler for AF_UNIX or tuntap file descriptor
+ * tap_backend_init() - Create and set up AF_UNIX socket or
+ *			tuntap file descriptor
  * @c:		Execution context
- * @fd:		File descriptor where event occurred
- * @events:	epoll events
- * @now:	Current timestamp, can be NULL on EPOLLERR
  */
-void tap_handler(struct ctx *c, int fd, uint32_t events,
-		 const struct timespec *now)
+void tap_backend_init(struct ctx *c)
 {
-	if (fd == c->fd_tap_listen && events == EPOLLIN) {
-		tap_sock_unix_new(c);
+	if (c->mode == MODE_VU) {
+		tap_sock_update_pool(NULL, 0);
+		vu_init(c);
+	} else {
+		tap_sock_update_pool(pkt_buf, sizeof(pkt_buf));
+	}
+
+	if (c->fd_tap != -1) { /* Passed as --fd */
+		ASSERT(c->one_off);
+		tap_start_connection(c);
 		return;
 	}
 
-	if ((c->mode == MODE_PASST && tap_handler_passt(c, now)) ||
-	    (c->mode == MODE_PASTA && tap_handler_pasta(c, now)) ||
-	    (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))) {
-		if (c->one_off) {
-			info("Client closed connection, exiting");
-			exit(EXIT_SUCCESS);
-		}
+	switch (c->mode) {
+	case MODE_PASTA:
+		tap_sock_tun_init(c);
+		break;
+	case MODE_VU:
+		repair_sock_init(c);
+		/* fall through */
+	case MODE_PASST:
+		tap_sock_unix_init(c);
 
-		if (c->mode == MODE_PASTA)
-			die("Error on tap device, exiting");
-
-		tap_sock_init(c);
+		/* In passt mode, we don't know the guest's MAC address until it
+		 * sends us packets.  Use the broadcast address so that our
+		 * first packets will reach it.
+		 */
+		memset(&c->guest_mac, 0xff, sizeof(c->guest_mac));
+		break;
 	}
+
+	tap_backend_show_hints(c);
 }

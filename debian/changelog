@@ -1,8 +1,279 @@
+passt (0.0~git20250320.32f6212-1) unstable; urgency=medium
+
+  * debian/rules: Install passt-repair profile using dh_apparmor
+  * control: Update standards version to 4.7.2
+  * New upstream version 0.0~git20250320.32f6212:
+    - Fix possible transfer loop in short TCP exchange,
+      https://bugs.passt.top/show_bug.cgi?id=114
+    - Several fixes for passt-repair and guest migration,
+      including https://bugs.passt.top/show_bug.cgi?id=115
+    - build and send ICMP and ICMPv6 messages to guest for a number
+      of error conditions
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Thu, 20 Mar 2025 13:14:03 +0100
+
+passt (0.0~git20250217.a1e48a0-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20250217.a1e48a0:
+    - AppArmor workaround to allow libvirt to use passt
+    - Option --host-ns-to-lo is not deprecated anymore:
+      https://github.com/rootless-containers/rootlesskit/pull/482
+    - Added support for --hostname and --fqdn (DHCP/DHCPv6) options
+    - Fix wakeup loop in pasta's loopback path when receiver is full:
+      https://github.com/containers/podman/issues/23686#issuecomment-2661036584
+    - Add migration support via vhost-user, TCP connections preserved
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Mon, 17 Feb 2025 09:21:39 +0100
+
+passt (0.0~git20250121.4f2c8e7-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20250121.4f2c8e7:
+    - Don't block UDP multicast and broadcast messages:
+      https://github.com/containers/podman/issues/24871
+    - Disable Nagle's algorithm on all TCP paths
+    - Fix ASSERT() on vhost-user multi-buffer messages
+    - Fix EPOLLIN event storm with repeated EAGAIN from socket
+    - Add prototype for vhost-user-based migration
+    - Set PSH flag at end of TCP batches:
+      https://bugs.passt.top/show_bug.cgi?id=107
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 21 Jan 2025 16:39:46 +0100
+
+passt (0.0~git20241211.09478d5-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20241211.09478d5:
+    - Add vhost-user support in passt (--vhost-user)
+    - Add --no-splice switch to forcibly disable tap bypass path
+    - Fix assertion on ping with ID 0:
+      https://bugs.passt.top/show_bug.cgi?id=105
+    - Avoid dynamic memory allocation (and seccomp terminating us)
+      from strerror() in glibc > 2.40:
+      https://github.com/containers/podman/issues/24804
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Thu, 12 Dec 2024 09:22:07 +0100
+
+passt (0.0~git20241127.c0fbc7e-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20241127.c0fbc7e:
+    - Introduce "local mode" for disconnected setups:
+      https://github.com/containers/podman/issues/24614
+    - Add support for DHCP option 80 (Rapid Commit) and honour DHCP
+      "broadcast" flag
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 27 Nov 2024 12:36:44 +0100
+
+passt (0.0~git20241121.238c69f-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20241121.238c69f:
+    - Send periodic unsolicited router advertisements to avoid losing
+      SLAAC routes after ~18 hours:
+      https://github.com/kubevirt/kubevirt/issues/13191
+    - Properly handle TCP keep-alive segments:
+      https://github.com/containers/podman/discussions/24572
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Thu, 21 Nov 2024 08:37:29 +0100
+
+passt (0.0~git20241030.ee7d0b6-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20241030.ee7d0b6:
+    - Fix occasional hang on TCP loopback path after the receiving
+      buffer fills up:
+        https://github.com/containers/podman/issues/24219
+    - By default, don't expose loopback-only services in container:
+        https://github.com/containers/podman/issues/24045
+    - Add --dns-host option to configure host side nameserver:
+        https://bugs.passt.top/show_bug.cgi?id=102
+    - Add --frebind option to enable IP_FREEBIND on sockets:
+        https://bugs.passt.top/show_bug.cgi?id=101
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 30 Oct 2024 13:29:54 +0100
+
+passt (0.0~git20240906.6b38f07-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240906.6b38f07:
+    - Fix possible EPOLLRDHUP event storms with half-closed TCP
+      connections, leading to periods of high CPU load:
+        https://github.com/containers/podman/issues/23686
+        https://bugs.passt.top/show_bug.cgi?id=94
+    - Fix possible EPOLLERR event storms with UDP flows:
+        https://bugs.passt.top/show_bug.cgi?id=95
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 06 Sep 2024 16:09:07 +0200
+
+passt (0.0~git20240821.1d6142f-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240821.1d6142f:
+    - Allow currently needed set of system calls for i386 and armhf in
+      seccomp profiles (Closes: #1078981)
+    - Introduce --map-host-loopback and --map-guest-addr options to
+      reach the host using arbitrary addresses, using either loopback
+      or the guest/container address as source
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 21 Aug 2024 14:33:46 +0200
+
+passt (0.0~git20240814.61c0b0d-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240814.61c0b0d:
+    - Avoid triggering an ASSERT() checking that the port isn't zero
+      when the container sends a TCP packet to port zero
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 14 Aug 2024 13:54:49 +0200
+
+passt (0.0~git20240806.ee36266-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240806.ee36266:
+    - Fix possible TCP transfer hang on local pasta(1) connections:
+      https://github.com/containers/podman/issues/23517
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 06 Aug 2024 15:46:13 +0200
+
+passt (0.0~git20240726.57a21d2-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240726.57a21d2:
+    - Unified flow table for all flow types (TCP, UDP, ICMP), with the side
+      effect of fixing possible inconsistencies in UDP source port tracking
+    - Forwarding for DNS queries over TCP and DNS over TLS (dot) now supported
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 26 Jul 2024 15:54:22 +0200
+
+passt (0.0~git20240624.1ee2eca-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240624.1ee2eca:
+    - Outbound connections now work when ip_non_local_bind sysctls are set:
+      https://github.com/containers/podman/issues/23003
+    - Start even if we have multiple interfaces but no default routes:
+      https://bugzilla.redhat.com/show_bug.cgi?id=2277954
+    - Fix duplicating routes to containers with 'noprefixroute' addresses:
+      https://github.com/containers/podman/issues/22824
+    - Don't fail to duplicate routes originated from OSPF daemons:
+      https://github.com/containers/podman/issues/22960
+    - Always log to standard error during initialisation, and if in foreground
+    - Fix UDP port forwarding with different original and target ports:
+      https://bugs.passt.top/show_bug.cgi?id=80 was reintroduced and has been
+      fixed again
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Mon, 24 Jun 2024 18:03:28 +0200
+
+passt (0.0~git20240607.8a83b53-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240607.8a83b53, most notable fix:
+    avoid triggering an assertion if container or guest try to access
+    an unreachable port using the address of the default gateway
+    (https://github.com/containers/podman/issues/22925)
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 07 Jun 2024 20:52:50 +0200
+
+passt (0.0~git20240523.765eb0b-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240523.765eb0b
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Thu, 23 May 2024 19:48:09 +0200
+
+passt (0.0~git20240426.d03c4e2-1) unstable; urgency=medium
+
+  * Actually install pasta's AppArmor profile from passt.install
+  * debian/control: Bump standards version from 4.6.2 to 4.7.0
+  * New upstream version 0.0~git20240426.d03c4e2
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 26 Apr 2024 08:39:30 +0200
+
+passt (0.0~git20240326.4988e2b-1) unstable; urgency=medium
+
+  * debian/rules: Include pkg-info.mk
+  * New upstream version 0.0~git20240326.4988e2b: never send TCP
+    segments with none of ACK, SYN or RST flags to avoid unexpected
+    connection resets (https://github.com/containers/podman/issues/22146)
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 26 Mar 2024 10:28:50 +0100
+
+passt (0.0~git20240320.71dd405-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240320.71dd405, most notable fix:
+    pasta(1) hang on start-up with Linux kernel versions 6.9 and later
+  * debian/rules: It's DEB_VERSION_UPSTREAM, not DEB_UPSTREAM_VERSION
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 20 Mar 2024 12:14:37 +0100
+
+passt (0.0~git20240220.1e6f92b-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240220.1e6f92b:
+    - pasta(1) now quits as expected once the container goes away when
+      used as network back-end for buildah(1)
+    - fix possible mix-up of ports for UDP outbound flows originating
+      from -U outbound forwarding option
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 20 Feb 2024 11:05:49 +0100
+
+passt (0.0~git20240216.08344da-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20240216.08344da:
+    - default gateway can now be sourced from host multipath routes as
+      well
+    - on failure of the inotify watch used by pasta to exit when a
+      nsfs-bound namespace, fall back to a simple timed check
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 16 Feb 2024 11:02:16 +0100
+
 passt (0.0~git20230627.289301b-1+pexip24u5) pexip; urgency=medium
 
   * Rebuild for move to main
 
  -- Mark Hymers <mark.hymers@pexip.com>  Tue, 18 Jun 2024 11:55:15 +0100
+
+passt (0.0~git20231230.f091893-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20231230.f091893:
+    - increase lifetime for router and prefix validity in router
+      advertisements to maximum allowed values
+    - pick most specific IPv6 global unicast address (via netlink) for
+      guest configuration, if multiple addresses are available
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 02 Jan 2024 17:07:41 +0100
+
+passt (0.0~git20231204.b86afe3-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20231204.b86afe3
+  * Fixes build warnings on 32-bit architectures due to mismatching
+    format specifiers
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Mon, 04 Dec 2023 11:14:52 +0100
+
+passt (0.0~git20231107.74e6f48-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20231107.74e6f48
+  * Most notable fixed issue: DNS resolution stopped working after a
+    relatively long time, https://bugs.passt.top/show_bug.cgi?id=57
+  * debian/rules: 'host' is the machine we're building for, not 'build'
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 07 Nov 2023 14:10:52 +0100
+
+passt (0.0~git20231004.f851084-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20231004.f851084
+  * Most notable fix: workaround to trigger TCP window update in kernel
+    after it was reported empty, on socket side, very visible with
+    default values for rmem_max and wmem_max
+    (https://bugs.passt.top/show_bug.cgi?id=74)
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 10 Oct 2023 00:13:04 +0200
+
+passt (0.0~git20230908.05627dc-1) unstable; urgency=medium
+
+  * debian/rules: Pass DEB_BUILD_GNU_CPU to Makefile, not DEB_BUILD_ARCH
+  * debian/rules: Override pasta symbolic links with hard links
+  * debian/rules: Install new pasta profile using dh_apparmor
+  * New upstream version 0.0~git20230908.05627dc
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Fri, 08 Sep 2023 17:39:07 +0200
+
+passt (0.0~git20230823.a7e4bfb-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20230823.a7e4bfb
+  * Several fixes for pasta --config-net operation, most importantly:
+    don't copy lifetime information of addresses from host, avoid
+    unexpected expiration of IPv4 addresses
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 23 Aug 2023 23:10:18 +0200
 
 passt (0.0~git20230627.289301b-1+pexip24u4) pexip-bookworm; urgency=medium
 
@@ -36,7 +307,7 @@ passt (0.0~git20230627.289301b-1) unstable; urgency=medium
   * Fix cross-build in Debian package itself by overriding TARGET via
     dh_auto_install with target architecture
 
- -- Stefano Brivio <sbrivio@redhat.com>  Thu, 27 Mar 2023 19:31:18 +0200
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 27 Jun 2023 19:31:18 +0200
 
 passt (0.0~git20230309.7c7625d-1pexip1) pexip; urgency=medium
 

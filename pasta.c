@@ -12,8 +12,8 @@
  * Author: Stefano Brivio <sbrivio@redhat.com>
  *
  * #syscalls:pasta clone waitid exit exit_group rt_sigprocmask
- * #syscalls:pasta rt_sigreturn|sigreturn armv6l:sigreturn armv7l:sigreturn
- * #syscalls:pasta ppc64:sigreturn s390x:sigreturn
+ * #syscalls:pasta rt_sigreturn|sigreturn
+ * #syscalls:pasta arm:sigreturn ppc64:sigreturn s390x:sigreturn i686:sigreturn
  */
 
 #include <sched.h>
@@ -30,8 +30,10 @@
 #include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <sys/mount.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -40,12 +42,15 @@
 #include <netinet/in.h>
 #include <net/ethernet.h>
 #include <sys/syscall.h>
+#include <linux/magic.h>
 
 #include "util.h"
 #include "passt.h"
 #include "isolation.h"
 #include "netlink.h"
 #include "log.h"
+
+#define HOSTNAME_PREFIX		"pasta-"
 
 /* PID of child, in case we created a namespace */
 int pasta_child_pid;
@@ -56,6 +61,7 @@ int pasta_child_pid;
  */
 void pasta_child_handler(int signal)
 {
+	int errno_save = errno;
 	siginfo_t infop;
 
 	(void)signal;
@@ -67,12 +73,12 @@ void pasta_child_handler(int signal)
 	    !waitid(P_PID, pasta_child_pid, &infop, WEXITED | WNOHANG)) {
 		if (infop.si_pid == pasta_child_pid) {
 			if (infop.si_code == CLD_EXITED)
-				exit(infop.si_status);
+				_exit(infop.si_status);
 
 			/* If killed by a signal, si_status is the number.
 			 * Follow common shell convention of returning it + 128.
 			 */
-			exit(infop.si_status + 128);
+			_exit(infop.si_status + 128);
 
 			/* Nothing to do, detached PID namespace going away */
 		}
@@ -80,6 +86,8 @@ void pasta_child_handler(int signal)
 
 	waitid(P_ALL, 0, NULL, WEXITED | WNOHANG);
 	waitid(P_ALL, 0, NULL, WEXITED | WNOHANG);
+
+	errno = errno_save;
 }
 
 /**
@@ -94,7 +102,9 @@ static int pasta_wait_for_ns(void *arg)
 	int flags = O_RDONLY | O_CLOEXEC;
 	char ns[PATH_MAX];
 
-	snprintf(ns, PATH_MAX, "/proc/%i/ns/net", pasta_child_pid);
+	if (snprintf_check(ns, PATH_MAX, "/proc/%i/ns/net", pasta_child_pid))
+		die_perror("Can't build netns path");
+
 	do {
 		while ((c->pasta_netns_fd = open(ns, flags)) < 0) {
 			if (errno != ENOENT)
@@ -135,17 +145,15 @@ void pasta_open_ns(struct ctx *c, const char *netns)
 	int nfd = -1;
 
 	nfd = open(netns, O_RDONLY | O_CLOEXEC);
-	if (nfd < 0) {
-		die("Couldn't open network namespace %s: %s",
-		    netns, strerror(errno));
-	}
+	if (nfd < 0)
+		die_perror("Couldn't open network namespace %s", netns);
 
 	c->pasta_netns_fd = nfd;
 
 	NS_CALL(ns_check, c);
 
 	if (c->pasta_netns_fd < 0)
-		die("Couldn't switch to pasta namespaces: %s", strerror(errno));
+		die_perror("Couldn't switch to pasta namespaces");
 
 	if (!c->no_netns_quit) {
 		char buf[PATH_MAX] = { 0 };
@@ -161,10 +169,12 @@ void pasta_open_ns(struct ctx *c, const char *netns)
  * struct pasta_spawn_cmd_arg - Argument for pasta_spawn_cmd()
  * @exe:	Executable to run
  * @argv:	Command and arguments to run
+ * @ctx:	Context to read config from
  */
 struct pasta_spawn_cmd_arg {
 	const char *exe;
 	char *const *argv;
+	struct ctx *c;
 };
 
 /**
@@ -173,28 +183,43 @@ struct pasta_spawn_cmd_arg {
  *
  * Return: this function never returns
  */
+/* cppcheck-suppress [constParameterCallback, unmatchedSuppression] */
 static int pasta_spawn_cmd(void *arg)
 {
+	char hostname[HOST_NAME_MAX + 1] = HOSTNAME_PREFIX;
 	const struct pasta_spawn_cmd_arg *a;
+	size_t conf_hostname_len;
 	sigset_t set;
 
 	/* We run in a detached PID and mount namespace: mount /proc over */
 	if (mount("", "/proc", "proc", 0, NULL))
-		warn("Couldn't mount /proc: %s", strerror(errno));
+		warn_perror("Couldn't mount /proc");
 
 	if (write_file("/proc/sys/net/ipv4/ping_group_range", "0 0"))
 		warn("Cannot set ping_group_range, ICMP requests might fail");
+
+	a = (const struct pasta_spawn_cmd_arg *)arg;
+
+	conf_hostname_len = strlen(a->c->hostname);
+	if (conf_hostname_len > 0) {
+		if (sethostname(a->c->hostname, conf_hostname_len))
+			warn("Unable to set configured hostname");
+	} else if (!gethostname(hostname + sizeof(HOSTNAME_PREFIX) - 1,
+				HOST_NAME_MAX + 1 - sizeof(HOSTNAME_PREFIX)) ||
+		   errno == ENAMETOOLONG) {
+		hostname[HOST_NAME_MAX] = '\0';
+		if (sethostname(hostname, strlen(hostname)))
+			warn("Unable to set pasta-prefixed hostname");
+	}
 
 	/* Wait for the parent to be ready: see main() */
 	sigemptyset(&set);
 	sigaddset(&set, SIGUSR1);
 	sigwaitinfo(&set, NULL);
 
-	a = (const struct pasta_spawn_cmd_arg *)arg;
 	execvp(a->exe, a->argv);
 
-	perror("execvp");
-	exit(EXIT_FAILURE);
+	die_perror("Failed to start command or shell");
 }
 
 /**
@@ -208,12 +233,14 @@ static int pasta_spawn_cmd(void *arg)
 void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
 		    int argc, char *argv[])
 {
+	char ns_fn_stack[NS_FN_STACK_SIZE]
+	__attribute__ ((aligned(__alignof__(max_align_t))));
 	struct pasta_spawn_cmd_arg arg = {
 		.exe = argv[0],
 		.argv = argv,
+		.c = c,
 	};
 	char uidmap[BUFSIZ], gidmap[BUFSIZ];
-	char ns_fn_stack[NS_FN_STACK_SIZE];
 	char *sh_argv[] = { NULL, NULL };
 	char sh_arg0[PATH_MAX + 1];
 	sigset_t set;
@@ -223,8 +250,11 @@ void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
 		c->quiet = 1;
 
 	/* Configure user and group mappings */
-	snprintf(uidmap, BUFSIZ, "0 %u 1", uid);
-	snprintf(gidmap, BUFSIZ, "0 %u 1", gid);
+	if (snprintf_check(uidmap, BUFSIZ, "0 %u 1", uid))
+		die_perror("Can't build uidmap");
+
+	if (snprintf_check(gidmap, BUFSIZ, "0 %u 1", gid))
+		die_perror("Can't build gidmap");
 
 	if (write_file("/proc/self/uid_map", uidmap) ||
 	    write_file("/proc/self/setgroups", "deny") ||
@@ -239,7 +269,7 @@ void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
 
 		if ((size_t)snprintf(sh_arg0, sizeof(sh_arg0),
 				     "-%s", arg.exe) >= sizeof(sh_arg0))
-			die("$SHELL is too long (%u bytes)", strlen(arg.exe));
+			die("$SHELL is too long (%zu bytes)", strlen(arg.exe));
 
 		sh_argv[0] = sh_arg0;
 		arg.argv = sh_argv;
@@ -256,14 +286,12 @@ void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
 				   CLONE_NEWUTS | CLONE_NEWNS  | SIGCHLD,
 				   (void *)&arg);
 
-	if (pasta_child_pid == -1) {
-		perror("clone");
-		exit(EXIT_FAILURE);
-	}
+	if (pasta_child_pid == -1)
+		die_perror("Failed to clone process with detached namespaces");
 
 	NS_CALL(pasta_wait_for_ns, c);
 	if (c->pasta_netns_fd < 0)
-		die("Failed to join network namespace: %s", strerror(errno));
+		die_perror("Failed to join network namespace");
 }
 
 /**
@@ -272,75 +300,206 @@ void pasta_start_ns(struct ctx *c, uid_t uid, gid_t gid,
  */
 void pasta_ns_conf(struct ctx *c)
 {
-	nl_link(1, 1 /* lo */, MAC_ZERO, 1, 0);
+	int rc = 0;
+
+	rc = nl_link_set_flags(nl_sock_ns, 1 /* lo */, IFF_UP, IFF_UP);
+	if (rc < 0)
+		die("Couldn't bring up loopback interface in namespace: %s",
+		    strerror_(-rc));
+
+	/* Get or set MAC in target namespace */
+	if (MAC_IS_ZERO(c->guest_mac))
+		nl_link_get_mac(nl_sock_ns, c->pasta_ifi, c->guest_mac);
+	else
+		rc = nl_link_set_mac(nl_sock_ns, c->pasta_ifi, c->guest_mac);
+	if (rc < 0)
+		die("Couldn't set MAC address in namespace: %s",
+		    strerror_(-rc));
 
 	if (c->pasta_conf_ns) {
-		enum nl_op op_routes = c->no_copy_routes ? NL_SET : NL_DUP;
-		enum nl_op op_addrs =  c->no_copy_addrs  ? NL_SET : NL_DUP;
+		unsigned int flags = IFF_UP;
 
-		nl_link(1, c->pasta_ifi, c->mac_guest, 1, c->mtu);
+		if (c->mtu)
+			nl_link_set_mtu(nl_sock_ns, c->pasta_ifi, c->mtu);
+
+		if (c->ifi6) /* Avoid duplicate address detection on link up */
+			flags |= IFF_NOARP;
+
+		nl_link_set_flags(nl_sock_ns, c->pasta_ifi, flags, flags);
 
 		if (c->ifi4) {
-			nl_addr(op_addrs, c->ifi4, c->pasta_ifi, AF_INET,
-				&c->ip4.addr, &c->ip4.prefix_len, NULL);
-			nl_route(op_routes, c->ifi4, c->pasta_ifi, AF_INET,
-				 &c->ip4.gw);
+			if (c->ip4.no_copy_addrs) {
+				rc = nl_addr_set(nl_sock_ns, c->pasta_ifi,
+						 AF_INET,
+						 &c->ip4.addr,
+						 c->ip4.prefix_len);
+			} else {
+				rc = nl_addr_dup(nl_sock, c->ifi4,
+						 nl_sock_ns, c->pasta_ifi,
+						 AF_INET);
+			}
+
+			if (rc < 0) {
+				die("Couldn't set IPv4 address(es) in namespace: %s",
+				    strerror_(-rc));
+			}
+
+			if (c->ip4.no_copy_routes) {
+				rc = nl_route_set_def(nl_sock_ns, c->pasta_ifi,
+						      AF_INET,
+						      &c->ip4.guest_gw);
+			} else {
+				rc = nl_route_dup(nl_sock, c->ifi4, nl_sock_ns,
+						  c->pasta_ifi, AF_INET);
+			}
+
+			if (rc < 0) {
+				die("Couldn't set IPv4 route(s) in guest: %s",
+				    strerror_(-rc));
+			}
 		}
 
 		if (c->ifi6) {
-			int prefix_len = 64;
-			nl_addr(op_addrs, c->ifi6, c->pasta_ifi, AF_INET6,
-				&c->ip6.addr, &prefix_len, NULL);
-			nl_route(op_routes, c->ifi6, c->pasta_ifi, AF_INET6,
-				 &c->ip6.gw);
+			rc = nl_addr_get_ll(nl_sock_ns, c->pasta_ifi,
+					    &c->ip6.addr_ll_seen);
+			if (rc < 0) {
+				warn("Can't get LL address from namespace: %s",
+				    strerror_(-rc));
+			}
+
+			rc = nl_addr_set_ll_nodad(nl_sock_ns, c->pasta_ifi);
+			if (rc < 0) {
+				warn("Can't set nodad for LL in namespace: %s",
+				    strerror_(-rc));
+			}
+
+			/* We dodged DAD: re-enable neighbour solicitations */
+			nl_link_set_flags(nl_sock_ns, c->pasta_ifi,
+					  0, IFF_NOARP);
+
+			if (c->ip6.no_copy_addrs) {
+				if (!IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr)) {
+					rc = nl_addr_set(nl_sock_ns,
+							 c->pasta_ifi, AF_INET6,
+							 &c->ip6.addr, 64);
+				}
+			} else {
+				rc = nl_addr_dup(nl_sock, c->ifi6,
+						 nl_sock_ns, c->pasta_ifi,
+						 AF_INET6);
+			}
+
+			if (rc < 0) {
+				die("Couldn't set IPv6 address(es) in namespace: %s",
+				    strerror_(-rc));
+			}
+
+			if (c->ip6.no_copy_routes) {
+				rc = nl_route_set_def(nl_sock_ns, c->pasta_ifi,
+						      AF_INET6,
+						      &c->ip6.guest_gw);
+			} else {
+				rc = nl_route_dup(nl_sock, c->ifi6,
+						  nl_sock_ns, c->pasta_ifi,
+						  AF_INET6);
+			}
+
+			if (rc < 0) {
+				die("Couldn't set IPv6 route(s) in guest: %s",
+				    strerror_(-rc));
+			}
 		}
-	} else {
-		nl_link(1, c->pasta_ifi, c->mac_guest, 0, 0);
 	}
 
-	proto_update_l2_buf(c->mac_guest, NULL, NULL);
+	proto_update_l2_buf(c->guest_mac, NULL);
+}
+
+/**
+ * pasta_netns_quit_timer() - Set up fallback timer to monitor namespace
+ *
+ * Return: timerfd file descriptor, negative error code on failure
+ */
+static int pasta_netns_quit_timer(void)
+{
+	int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+	struct itimerspec it = { { 1, 0 }, { 1, 0 } }; /* one-second interval */
+
+	if (fd == -1) {
+		err_perror("Failed to create timerfd for quit timer");
+		return -errno;
+	}
+
+	if (timerfd_settime(fd, 0, &it, NULL) < 0) {
+		err_perror("Failed to set interval for quit timer");
+		close(fd);
+		return -errno;
+	}
+
+	return fd;
 }
 
 /**
  * pasta_netns_quit_init() - Watch network namespace to quit once it's gone
  * @c:		Execution context
- *
- * Return: inotify file descriptor, -1 on failure or if not needed/applicable
  */
-int pasta_netns_quit_init(struct ctx *c)
+void pasta_netns_quit_init(const struct ctx *c)
 {
-	int flags = O_NONBLOCK | O_CLOEXEC;
 	struct epoll_event ev = { .events = EPOLLIN };
-	int inotify_fd;
+	int flags = O_NONBLOCK | O_CLOEXEC;
+	struct statfs s = { 0 };
+	bool try_inotify = true;
+	int fd = -1, dir_fd;
+	union epoll_ref ref;
 
 	if (c->mode != MODE_PASTA || c->no_netns_quit || !*c->netns_base)
-		return -1;
+		return;
 
-	if ((inotify_fd = inotify_init1(flags)) < 0) {
-		perror("inotify_init(): won't quit once netns is gone");
-		return -1;
+	if ((dir_fd = open(c->netns_dir, O_CLOEXEC | O_RDONLY)) < 0)
+		die("netns dir open: %s, exiting", strerror_(errno));
+
+	if (fstatfs(dir_fd, &s)          || s.f_type == DEVPTS_SUPER_MAGIC ||
+	    s.f_type == PROC_SUPER_MAGIC || s.f_type == SYSFS_MAGIC)
+		try_inotify = false;
+
+	if (try_inotify && (fd = inotify_init1(flags)) < 0)
+		warn("inotify_init1(): %s, use a timer", strerror_(errno));
+
+	if (fd >= 0 && inotify_add_watch(fd, c->netns_dir, IN_DELETE) < 0) {
+		warn("inotify_add_watch(): %s, use a timer",
+		     strerror_(errno));
+		close(fd);
+		fd = -1;
 	}
 
-	if (inotify_add_watch(inotify_fd, c->netns_dir, IN_DELETE) < 0) {
-		perror("inotify_add_watch(): won't quit once netns is gone");
-		return -1;
+	if (fd < 0) {
+		if ((fd = pasta_netns_quit_timer()) < 0)
+			die("Failed to set up fallback netns timer, exiting");
+
+		ref.nsdir_fd = dir_fd;
+
+		ref.type = EPOLL_TYPE_NSQUIT_TIMER;
+	} else {
+		close(dir_fd);
+		ref.type = EPOLL_TYPE_NSQUIT_INOTIFY;
 	}
 
-	ev.data.fd = inotify_fd;
-	epoll_ctl(c->epollfd, EPOLL_CTL_ADD, inotify_fd, &ev);
+	if (fd > FD_REF_MAX)
+		die("netns monitor file number %i too big, exiting", fd);
 
-	return inotify_fd;
+	ref.fd = fd;
+	ev.data.u64 = ref.u64;
+	epoll_ctl(c->epollfd, EPOLL_CTL_ADD, fd, &ev);
 }
 
 /**
- * pasta_netns_quit_handler() - Handle ns directory events, exit if ns is gone
+ * pasta_netns_quit_inotify_handler() - Handle inotify watch, exit if ns is gone
  * @c:		Execution context
  * @inotify_fd:	inotify file descriptor with watch on namespace directory
  */
-void pasta_netns_quit_handler(struct ctx *c, int inotify_fd)
+void pasta_netns_quit_inotify_handler(struct ctx *c, int inotify_fd)
 {
 	char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
-	struct inotify_event *in_ev = (struct inotify_event *)buf;
+	const struct inotify_event *in_ev = (struct inotify_event *)buf;
 
 	if (read(inotify_fd, buf, sizeof(buf)) < (ssize_t)sizeof(*in_ev))
 		return;
@@ -349,5 +508,34 @@ void pasta_netns_quit_handler(struct ctx *c, int inotify_fd)
 		return;
 
 	info("Namespace %s is gone, exiting", c->netns_base);
-	exit(EXIT_SUCCESS);
+	_exit(EXIT_SUCCESS);
+}
+
+/**
+ * pasta_netns_quit_timer_handler() - Handle timer, exit if ns is gone
+ * @c:		Execution context
+ * @ref:	epoll reference for timer descriptor
+ */
+void pasta_netns_quit_timer_handler(struct ctx *c, union epoll_ref ref)
+{
+	uint64_t expirations;
+	ssize_t n;
+	int fd;
+
+	n = read(ref.fd, &expirations, sizeof(expirations));
+	if (n < 0)
+		die_perror("Namespace watch timer read() error");
+	if ((size_t)n < sizeof(expirations))
+		warn("Namespace watch timer: short read(): %zi", n);
+
+	fd = openat(ref.nsdir_fd, c->netns_base, O_PATH | O_CLOEXEC);
+	if (fd < 0) {
+		if (errno == EACCES)	/* Expected for existing procfs entry */
+			return;
+
+		info("Namespace %s is gone, exiting", c->netns_base);
+		_exit(EXIT_SUCCESS);
+	}
+
+	close(fd);
 }

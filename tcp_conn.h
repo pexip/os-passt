@@ -10,34 +10,20 @@
 #define TCP_CONN_H
 
 /**
- * struct tcp_conn_common - Common fields for spliced and non-spliced
- * @spliced:		Is this a spliced connection?
- * @in_epoll:		Is the connection in the epoll set?
- */
-struct tcp_conn_common {
-	bool spliced	:1;
-	bool in_epoll	:1;
-};
-
-extern const char *tcp_common_flag_str[];
-
-/**
  * struct tcp_tap_conn - Descriptor for a TCP connection (not spliced)
- * @c:			Fields common with tcp_splice_conn
- * @next_index:		Connection index of next item in hash chain, -1 for none
- * @tap_mss:		MSS advertised by tap/guest, rounded to 2 ^ TCP_MSS_BITS
- * @sock:		Socket descriptor number
- * @events:		Connection events, implying connection states
- * @timer:		timerfd descriptor for timeout events
- * @flags:		Connection flags representing internal attributes
+ * @f:			Generic flow information
+ * @in_epoll:		Is the connection in the epoll set?
  * @retrans:		Number of retransmissions occurred due to ACK_TIMEOUT
  * @ws_from_tap:	Window scaling factor advertised from tap/guest
  * @ws_to_tap:		Window scaling factor advertised to tap/guest
+ * @tap_mss:		MSS advertised by tap/guest, rounded to 2 ^ TCP_MSS_BITS
+ * @sock:		Socket descriptor number
+ * @events:		Connection events, implying connection states
+ * @listening_sock:	Listening socket this socket was accept()ed from, or -1
+ * @timer:		timerfd descriptor for timeout events
+ * @flags:		Connection flags representing internal attributes
  * @sndbuf:		Sending buffer in kernel, rounded to 2 ^ SNDBUF_BITS
  * @seq_dup_ack_approx:	Last duplicate ACK number sent to tap
- * @addr:		Remote address (IPv4 or IPv6)
- * @tap_port:		Guest-facing tap port
- * @sock_port:		Remote, socket-facing port
  * @wnd_from_tap:	Last window size from tap, unscaled (as received)
  * @wnd_to_tap:		Sending window advertised to tap, unscaled (as sent)
  * @seq_to_tap:		Next sequence for packets to tap
@@ -47,10 +33,10 @@ extern const char *tcp_common_flag_str[];
  * @seq_init_from_tap:	Initial sequence number from tap
  */
 struct tcp_tap_conn {
-	/* Must be first element to match tcp_splice_conn */
-	struct tcp_conn_common c;
+	/* Must be first element */
+	struct flow_common f;
 
-	int	 	next_index	:TCP_CONN_INDEX_BITS + 2;
+	bool		in_epoll	:1;
 
 #define TCP_RETRANS_BITS		3
 	unsigned int	retrans		:TCP_RETRANS_BITS;
@@ -61,8 +47,12 @@ struct tcp_tap_conn {
 	unsigned int	ws_from_tap	:TCP_WS_BITS;
 	unsigned int	ws_to_tap	:TCP_WS_BITS;
 
+#define TCP_MSS_BITS			14
+	unsigned int	tap_mss		:TCP_MSS_BITS;
+#define MSS_SET(conn, mss)	(conn->tap_mss = (mss >> (16 - TCP_MSS_BITS)))
+#define MSS_GET(conn)		(conn->tap_mss << (16 - TCP_MSS_BITS))
 
-	int		sock		:SOCKET_REF_BITS;
+	int		sock		:FD_REF_BITS;
 
 	uint8_t		events;
 #define CLOSED			0
@@ -79,23 +69,17 @@ struct tcp_tap_conn {
 #define	CONN_STATE_BITS		/* Setting these clears other flags */	\
 	(SOCK_ACCEPTED | TAP_SYN_RCVD | ESTABLISHED)
 
+	int		listening_sock;
 
-	int		timer		:SOCKET_REF_BITS;
+	int		timer		:FD_REF_BITS;
 
 	uint8_t		flags;
 #define STALLED			BIT(0)
 #define LOCAL			BIT(1)
-#define WND_CLAMPED		BIT(2)
-#define ACTIVE_CLOSE		BIT(3)
-#define ACK_TO_TAP_DUE		BIT(4)
-#define ACK_FROM_TAP_DUE	BIT(5)
-
-
-#define TCP_MSS_BITS			14
-	unsigned int	tap_mss		:TCP_MSS_BITS;
-#define MSS_SET(conn, mss)	(conn->tap_mss = (mss >> (16 - TCP_MSS_BITS)))
-#define MSS_GET(conn)		(conn->tap_mss << (16 - TCP_MSS_BITS))
-
+#define ACTIVE_CLOSE		BIT(2)
+#define ACK_TO_TAP_DUE		BIT(3)
+#define ACK_FROM_TAP_DUE	BIT(4)
+#define ACK_FROM_TAP_BLOCKS	BIT(5)
 
 #define SNDBUF_BITS		24
 	unsigned int	sndbuf		:SNDBUF_BITS;
@@ -103,11 +87,6 @@ struct tcp_tap_conn {
 #define SNDBUF_GET(conn)	(conn->sndbuf << (32 - SNDBUF_BITS))
 
 	uint8_t		seq_dup_ack_approx;
-
-
-	union inany_addr addr;
-	in_port_t	tap_port;
-	in_port_t	sock_port;
 
 	uint16_t	wnd_from_tap;
 	uint16_t	wnd_to_tap;
@@ -120,67 +99,130 @@ struct tcp_tap_conn {
 };
 
 /**
+ * struct tcp_tap_transfer - Migrated TCP data, flow table part, network order
+ * @pif:		Interfaces for each side of the flow
+ * @side:		Addresses and ports for each side of the flow
+ * @retrans:		Number of retransmissions occurred due to ACK_TIMEOUT
+ * @ws_from_tap:	Window scaling factor advertised from tap/guest
+ * @ws_to_tap:		Window scaling factor advertised to tap/guest
+ * @events:		Connection events, implying connection states
+ * @tap_mss:		MSS advertised by tap/guest, rounded to 2 ^ TCP_MSS_BITS
+ * @sndbuf:		Sending buffer in kernel, rounded to 2 ^ SNDBUF_BITS
+ * @flags:		Connection flags representing internal attributes
+ * @seq_dup_ack_approx:	Last duplicate ACK number sent to tap
+ * @wnd_from_tap:	Last window size from tap, unscaled (as received)
+ * @wnd_to_tap:		Sending window advertised to tap, unscaled (as sent)
+ * @seq_to_tap:		Next sequence for packets to tap
+ * @seq_ack_from_tap:	Last ACK number received from tap
+ * @seq_from_tap:	Next sequence for packets from tap (not actually sent)
+ * @seq_ack_to_tap:	Last ACK number sent to tap
+ * @seq_init_from_tap:	Initial sequence number from tap
+*/
+struct tcp_tap_transfer {
+	uint8_t		pif[SIDES];
+	struct flowside	side[SIDES];
+
+	uint8_t		retrans;
+	uint8_t		ws_from_tap;
+	uint8_t		ws_to_tap;
+	uint8_t		events;
+
+	uint32_t	tap_mss;
+
+	uint32_t	sndbuf;
+
+	uint8_t		flags;
+	uint8_t		seq_dup_ack_approx;
+
+	uint16_t	wnd_from_tap;
+	uint16_t	wnd_to_tap;
+
+	uint32_t	seq_to_tap;
+	uint32_t	seq_ack_from_tap;
+	uint32_t	seq_from_tap;
+	uint32_t	seq_ack_to_tap;
+	uint32_t	seq_init_from_tap;
+} __attribute__((packed, aligned(__alignof__(uint32_t))));
+
+/**
+ * struct tcp_tap_transfer_ext - Migrated TCP data, outside flow, network order
+ * @seq_snd:		Socket-side send sequence
+ * @seq_rcv:		Socket-side receive sequence
+ * @sndq:		Length of pending send queue (unacknowledged / not sent)
+ * @notsent:		Part of pending send queue that wasn't sent out yet
+ * @rcvq:		Length of pending receive queue
+ * @mss:		Socket-side MSS clamp
+ * @timestamp:		RFC 7323 timestamp
+ * @snd_wl1:		Next sequence used in window probe (next sequence - 1)
+ * @snd_wnd:		Socket-side sending window
+ * @max_window:		Window clamp
+ * @rcv_wnd:		Socket-side receive window
+ * @rcv_wup:		rcv_nxt on last window update sent
+ * @snd_ws:		Window scaling factor, send
+ * @rcv_ws:		Window scaling factor, receive
+ * @tcpi_state:		Connection state in TCP_INFO style (enum, tcp_states.h)
+ * @tcpi_options:	TCPI_OPT_* constants (timestamps, selective ACK)
+ */
+struct tcp_tap_transfer_ext {
+	uint32_t	seq_snd;
+	uint32_t	seq_rcv;
+
+	uint32_t	sndq;
+	uint32_t	notsent;
+	uint32_t	rcvq;
+
+	uint32_t	mss;
+	uint32_t	timestamp;
+
+	/* We can't just use struct tcp_repair_window: we need network order */
+	uint32_t	snd_wl1;
+	uint32_t	snd_wnd;
+	uint32_t	max_window;
+	uint32_t	rcv_wnd;
+	uint32_t	rcv_wup;
+
+	uint8_t		snd_ws;
+	uint8_t		rcv_ws;
+	uint8_t		tcpi_state;
+	uint8_t		tcpi_options;
+} __attribute__((packed, aligned(__alignof__(uint32_t))));
+
+/**
  * struct tcp_splice_conn - Descriptor for a spliced TCP connection
- * @c:			Fields common with tcp_tap_conn
- * @a:			File descriptor number of socket for accepted connection
- * @pipe_a_b:		Pipe ends for splice() from @a to @b
- * @b:			File descriptor number of peer connected socket
- * @pipe_b_a:		Pipe ends for splice() from @b to @a
+ * @f:			Generic flow information
+ * @s:			File descriptor for sockets
+ * @pipe:		File descriptors for pipes
+ * @read:		Bytes read (not fully written to other side in one shot)
+ * @written:		Bytes written (not fully written from one other side read)
  * @events:		Events observed/actions performed on connection
  * @flags:		Connection flags (attributes, not events)
- * @a_read:		Bytes read from @a (not fully written to @b in one shot)
- * @a_written:		Bytes written to @a (not fully written from one @b read)
- * @b_read:		Bytes read from @b (not fully written to @a in one shot)
- * @b_written:		Bytes written to @b (not fully written from one @a read)
-*/
+ * @in_epoll:		Is the connection in the epoll set?
+ */
 struct tcp_splice_conn {
-	/* Must be first element to match tcp_tap_conn */
-	struct tcp_conn_common c;
+	/* Must be first element */
+	struct flow_common f;
 
-	int a;
-	int pipe_a_b[2];
-	int b;
-	int pipe_b_a[2];
+	int s[SIDES];
+	int pipe[SIDES][2];
+
+	uint32_t read[SIDES];
+	uint32_t written[SIDES];
 
 	uint8_t events;
 #define SPLICE_CLOSED			0
 #define SPLICE_CONNECT			BIT(0)
 #define SPLICE_ESTABLISHED		BIT(1)
-#define A_OUT_WAIT			BIT(2)
-#define B_OUT_WAIT			BIT(3)
-#define A_FIN_RCVD			BIT(4)
-#define B_FIN_RCVD			BIT(5)
-#define A_FIN_SENT			BIT(6)
-#define B_FIN_SENT			BIT(7)
+#define OUT_WAIT(sidei_)		((sidei_) ? BIT(3) : BIT(2))
+#define FIN_RCVD(sidei_)		((sidei_) ? BIT(5) : BIT(4))
+#define FIN_SENT(sidei_)		((sidei_) ? BIT(7) : BIT(6))
 
 	uint8_t flags;
-#define SPLICE_V6			BIT(0)
-#define RCVLOWAT_SET_A			BIT(1)
-#define RCVLOWAT_SET_B			BIT(2)
-#define RCVLOWAT_ACT_A			BIT(3)
-#define RCVLOWAT_ACT_B			BIT(4)
-#define CLOSING				BIT(5)
+#define RCVLOWAT_SET(sidei_)		((sidei_) ? BIT(1) : BIT(0))
+#define RCVLOWAT_ACT(sidei_)		((sidei_) ? BIT(3) : BIT(2))
+#define CLOSING				BIT(4)
 
-	uint32_t a_read;
-	uint32_t a_written;
-	uint32_t b_read;
-	uint32_t b_written;
+	bool in_epoll	:1;
 };
-
-/**
- * union tcp_conn - Descriptor for a TCP connection (spliced or non-spliced)
- * @c:			Fields common between all variants
- * @tap:		Fields specific to non-spliced connections
- * @splice:		Fields specific to spliced connections
-*/
-union tcp_conn {
-	struct tcp_conn_common c;
-	struct tcp_tap_conn tap;
-	struct tcp_splice_conn splice;
-};
-
-/* TCP connections */
-extern union tcp_conn tc[];
 
 /* Socket pools */
 #define TCP_SOCK_POOL_SIZE		32
@@ -188,13 +230,24 @@ extern union tcp_conn tc[];
 extern int init_sock_pool4	[TCP_SOCK_POOL_SIZE];
 extern int init_sock_pool6	[TCP_SOCK_POOL_SIZE];
 
-void tcp_splice_conn_update(struct ctx *c, struct tcp_splice_conn *new);
-void tcp_table_compact(struct ctx *c, union tcp_conn *hole);
-void tcp_splice_destroy(struct ctx *c, union tcp_conn *conn_union);
-void tcp_splice_timer(struct ctx *c, union tcp_conn *conn_union);
+bool tcp_flow_defer(const struct tcp_tap_conn *conn);
+
+int tcp_flow_repair_on(struct ctx *c, const struct tcp_tap_conn *conn);
+int tcp_flow_repair_off(struct ctx *c, const struct tcp_tap_conn *conn);
+
+int tcp_flow_migrate_source(int fd, struct tcp_tap_conn *conn);
+int tcp_flow_migrate_source_ext(int fd, const struct tcp_tap_conn *conn);
+
+int tcp_flow_migrate_target(struct ctx *c, int fd);
+int tcp_flow_migrate_target_ext(struct ctx *c, struct tcp_tap_conn *conn, int fd);
+
+bool tcp_flow_is_established(const struct tcp_tap_conn *conn);
+
+bool tcp_splice_flow_defer(struct tcp_splice_conn *conn);
+void tcp_splice_timer(const struct ctx *c, struct tcp_splice_conn *conn);
 int tcp_conn_pool_sock(int pool[]);
-int tcp_conn_new_sock(const struct ctx *c, sa_family_t af);
-void tcp_sock_refill_pool(const struct ctx *c, int pool[], int af);
+int tcp_conn_sock(sa_family_t af);
+int tcp_sock_refill_pool(int pool[], sa_family_t af);
 void tcp_splice_refill(const struct ctx *c);
 
 #endif /* TCP_CONN_H */

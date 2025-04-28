@@ -43,8 +43,7 @@ int arp(const struct ctx *c, const struct pool *p)
 	struct ethhdr *eh;
 	struct arphdr *ah;
 	struct arpmsg *am;
-	size_t len;
-	int ret;
+	size_t l2len;
 
 	eh = packet_get(p, 0, 0,			 sizeof(*eh), NULL);
 	ah = packet_get(p, 0, sizeof(*eh),		 sizeof(*ah), NULL);
@@ -60,31 +59,28 @@ int arp(const struct ctx *c, const struct pool *p)
 	    ah->ar_op  != htons(ARPOP_REQUEST))
 		return 1;
 
-	/* Discard announcements (but not 0.0.0.0 "probes"): we might have the
-	 * same IP address, hide that.
-	 */
-	if (memcmp(am->sip, (unsigned char[4]){ 0 }, sizeof(am->tip)) &&
+	/* Discard announcements, but not 0.0.0.0 "probes" */
+	if (memcmp(am->sip, &in4addr_any, sizeof(am->sip)) &&
 	    !memcmp(am->sip, am->tip, sizeof(am->sip)))
 		return 1;
 
-	/* Don't resolve our own address, either. */
+	/* Don't resolve the guest's assigned address, either. */
 	if (!memcmp(am->tip, &c->ip4.addr, sizeof(am->tip)))
 		return 1;
 
 	ah->ar_op = htons(ARPOP_REPLY);
 	memcpy(am->tha,		am->sha,	sizeof(am->tha));
-	memcpy(am->sha,		c->mac,		sizeof(am->sha));
+	memcpy(am->sha,		c->our_tap_mac,	sizeof(am->sha));
 
 	memcpy(swap,		am->tip,	sizeof(am->tip));
 	memcpy(am->tip,		am->sip,	sizeof(am->tip));
 	memcpy(am->sip,		swap,		sizeof(am->sip));
 
-	len = sizeof(*eh) + sizeof(*ah) + sizeof(*am);
+	l2len = sizeof(*eh) + sizeof(*ah) + sizeof(*am);
 	memcpy(eh->h_dest,	eh->h_source,	sizeof(eh->h_dest));
-	memcpy(eh->h_source,	c->mac,		sizeof(eh->h_source));
+	memcpy(eh->h_source,	c->our_tap_mac,	sizeof(eh->h_source));
 
-	if ((ret = tap_send(c, eh, len)) < 0)
-		warn("ARP: send: %s", strerror(ret));
+	tap_send_single(c, eh, l2len);
 
 	return 1;
 }

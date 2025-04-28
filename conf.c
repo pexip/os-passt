@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <libgen.h>
 #include <string.h>
 #include <sched.h>
 #include <sys/types.h>
@@ -35,79 +36,33 @@
 #include <netinet/if_ether.h>
 
 #include "util.h"
+#include "ip.h"
 #include "passt.h"
 #include "netlink.h"
+#include "tap.h"
 #include "udp.h"
 #include "tcp.h"
 #include "pasta.h"
 #include "lineread.h"
 #include "isolation.h"
 #include "log.h"
+#include "vhost_user.h"
 
-/**
- * get_bound_ports() - Get maps of ports with bound sockets
- * @c:		Execution context
- * @ns:		If set, set bitmaps for ports to tap/ns -- to init otherwise
- * @proto:	Protocol number (IPPROTO_TCP or IPPROTO_UDP)
- */
-void get_bound_ports(struct ctx *c, int ns, uint8_t proto)
-{
-	uint8_t *udp_map, *udp_excl, *tcp_map, *tcp_excl;
+#define NETNS_RUN_DIR	"/run/netns"
 
-	if (ns) {
-		udp_map = c->udp.fwd_in.f.map;
-		udp_excl = c->udp.fwd_out.f.map;
-		tcp_map = c->tcp.fwd_in.map;
-		tcp_excl = c->tcp.fwd_out.map;
-	} else {
-		udp_map = c->udp.fwd_out.f.map;
-		udp_excl = c->udp.fwd_in.f.map;
-		tcp_map = c->tcp.fwd_out.map;
-		tcp_excl = c->tcp.fwd_in.map;
-	}
+#define IP4_LL_GUEST_ADDR	(struct in_addr){ htonl_constant(0xa9fe0201) }
+				/* 169.254.2.1, libslirp default: 10.0.2.1 */
 
-	if (proto == IPPROTO_UDP) {
-		memset(udp_map, 0, PORT_BITMAP_SIZE);
-		procfs_scan_listen(c, IPPROTO_UDP, V4, ns, udp_map, udp_excl);
-		procfs_scan_listen(c, IPPROTO_UDP, V6, ns, udp_map, udp_excl);
+#define IP4_LL_GUEST_GW		(struct in_addr){ htonl_constant(0xa9fe0202) }
+				/* 169.254.2.2, libslirp default: 10.0.2.2 */
 
-		procfs_scan_listen(c, IPPROTO_TCP, V4, ns, udp_map, udp_excl);
-		procfs_scan_listen(c, IPPROTO_TCP, V6, ns, udp_map, udp_excl);
-	} else if (proto == IPPROTO_TCP) {
-		memset(tcp_map, 0, PORT_BITMAP_SIZE);
-		procfs_scan_listen(c, IPPROTO_TCP, V4, ns, tcp_map, tcp_excl);
-		procfs_scan_listen(c, IPPROTO_TCP, V6, ns, tcp_map, tcp_excl);
-	}
-}
+#define IP4_LL_PREFIX_LEN	16
 
-/**
- * struct get_bound_ports_ns_arg - Arguments for get_bound_ports_ns()
- * @c:		Execution context
- * @proto:	Protocol number (IPPROTO_TCP or IPPROTO_UDP)
- */
-struct get_bound_ports_ns_arg {
-	struct ctx *c;
-	uint8_t proto;
-};
+#define IP6_LL_GUEST_GW		(struct in6_addr)			\
+				{{{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0,	\
+				       0, 0, 0, 0, 0, 0, 0, 0x01 }}}
 
-/**
- * get_bound_ports_ns() - Get maps of ports in namespace with bound sockets
- * @arg:	See struct get_bound_ports_ns_arg
- *
- * Return: 0
- */
-static int get_bound_ports_ns(void *arg)
-{
-	struct get_bound_ports_ns_arg *a = (struct get_bound_ports_ns_arg *)arg;
-	struct ctx *c = a->c;
-
-	if (!c->pasta_netns_fd || ns_enter(c))
-		return 0;
-
-	get_bound_ports(c, 1, a->proto);
-
-	return 0;
-}
+const char *pasta_default_ifn = "tap0";
 
 /**
  * next_chunk - Return the next piece of a string delimited by a character
@@ -170,21 +125,89 @@ static int parse_port_range(const char *s, char **endptr,
 }
 
 /**
+ * conf_ports_range_except() - Set up forwarding for a range of ports minus a
+ *                             bitmap of exclusions
+ * @c:		Execution context
+ * @optname:	Short option name, t, T, u, or U
+ * @optarg:	Option argument (port specification)
+ * @fwd:	Pointer to @fwd_ports to be updated
+ * @addr:	Listening address
+ * @ifname:	Listening interface
+ * @first:	First port to forward
+ * @last:	Last port to forward
+ * @exclude:	Bitmap of ports to exclude
+ * @to:		Port to translate @first to when forwarding
+ * @weak:	Ignore errors, as long as at least one port is mapped
+ */
+static void conf_ports_range_except(const struct ctx *c, char optname,
+				    const char *optarg, struct fwd_ports *fwd,
+				    const union inany_addr *addr,
+				    const char *ifname,
+				    uint16_t first, uint16_t last,
+				    const uint8_t *exclude, uint16_t to,
+				    bool weak)
+{
+	bool bound_one = false;
+	unsigned i;
+	int ret;
+
+	if (first == 0) {
+		die("Can't forward port 0 for option '-%c %s'",
+		    optname, optarg);
+	}
+
+	for (i = first; i <= last; i++) {
+		if (bitmap_isset(exclude, i))
+			continue;
+
+		if (bitmap_isset(fwd->map, i)) {
+			warn(
+"Altering mapping of already mapped port number: %s", optarg);
+		}
+
+		bitmap_set(fwd->map, i);
+		fwd->delta[i] = to - first;
+
+		if (optname == 't')
+			ret = tcp_sock_init(c, addr, ifname, i);
+		else if (optname == 'u')
+			ret = udp_sock_init(c, 0, addr, ifname, i);
+		else
+			/* No way to check in advance for -T and -U */
+			ret = 0;
+
+		if (ret == -ENFILE || ret == -EMFILE) {
+			die("Can't open enough sockets for port specifier: %s",
+			    optarg);
+		}
+
+		if (!ret) {
+			bound_one = true;
+		} else if (!weak) {
+			die("Failed to bind port %u (%s) for option '-%c %s'",
+			    i, strerror_(-ret), optname, optarg);
+		}
+	}
+
+	if (!bound_one)
+		die("Failed to bind any port for '-%c %s'", optname, optarg);
+}
+
+/**
  * conf_ports() - Parse port configuration options, initialise UDP/TCP sockets
  * @c:		Execution context
  * @optname:	Short option name, t, T, u, or U
  * @optarg:	Option argument (port specification)
- * @fwd:	Pointer to @port_fwd to be updated
+ * @fwd:	Pointer to @fwd_ports to be updated
  */
 static void conf_ports(const struct ctx *c, char optname, const char *optarg,
-		       struct port_fwd *fwd)
+		       struct fwd_ports *fwd)
 {
-	char addr_buf[sizeof(struct in6_addr)] = { 0 }, *addr = addr_buf;
+	union inany_addr addr_buf = inany_any6, *addr = &addr_buf;
 	char buf[BUFSIZ], *spec, *ifname = NULL, *p;
-	bool exclude_only = true, bound_one = false;
 	uint8_t exclude[PORT_BITMAP_SIZE] = { 0 };
-	sa_family_t af = AF_UNSPEC;
-	int ret;
+	bool exclude_only = true;
+	unsigned i;
 
 	if (!strcmp(optarg, "none")) {
 		if (fwd->mode)
@@ -193,6 +216,11 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 		fwd->mode = FWD_NONE;
 		return;
 	}
+
+	if ((optname == 't' || optname == 'T') && c->no_tcp)
+		die("TCP port forwarding requested but TCP is disabled");
+	if ((optname == 'u' || optname == 'U') && c->no_udp)
+		die("UDP port forwarding requested but UDP is disabled");
 
 	if (!strcmp(optarg, "auto")) {
 		if (fwd->mode)
@@ -206,38 +234,23 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 	}
 
 	if (!strcmp(optarg, "all")) {
-		unsigned i;
-
 		if (fwd->mode)
 			goto mode_conflict;
 
-		if (c->mode != MODE_PASST)
+		if (c->mode == MODE_PASTA)
 			die("'all' port forwarding is only allowed for passt");
 
 		fwd->mode = FWD_ALL;
-		memset(fwd->map, 0xff, PORT_EPHEMERAL_MIN / 8);
 
-		for (i = 0; i < PORT_EPHEMERAL_MIN; i++) {
-			if (optname == 't') {
-				ret = tcp_sock_init(c, AF_UNSPEC, NULL, NULL,
-						    i);
-				if (ret == -ENFILE || ret == -EMFILE)
-					goto enfile;
-				if (!ret)
-					bound_one = true;
-			} else if (optname == 'u') {
-				ret = udp_sock_init(c, 0, AF_UNSPEC, NULL, NULL,
-						    i);
-				if (ret == -ENFILE || ret == -EMFILE)
-					goto enfile;
-				if (!ret)
-					bound_one = true;
-			}
-		}
+		/* Exclude ephemeral ports */
+		for (i = 0; i < NUM_PORTS; i++)
+			if (fwd_port_is_ephemeral(i))
+				bitmap_set(exclude, i);
 
-		if (!bound_one)
-			goto bind_fail;
-
+		conf_ports_range_except(c, optname, optarg, fwd,
+					NULL, NULL,
+					1, NUM_PORTS - 1, exclude,
+					1, true);
 		return;
 	}
 
@@ -256,21 +269,32 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 			goto bad;
 
 		if ((ifname = strchr(buf, '%'))) {
-			if (spec - ifname >= IFNAMSIZ - 1)
-				goto bad;
-
 			*ifname = 0;
 			ifname++;
+
+			/* spec is already advanced one past the '/',
+			 * so the length of the given ifname is:
+			 * (spec - ifname - 1)
+			 */
+			if (spec - ifname - 1 >= IFNAMSIZ)
+				goto bad;
+
 		}
 
-		if (ifname == buf + 1)		/* Interface without address */
+		if (ifname == buf + 1) {	/* Interface without address */
 			addr = NULL;
-		else if (inet_pton(AF_INET, buf, addr))
-			af = AF_INET;
-		else if (inet_pton(AF_INET6, buf, addr))
-			af = AF_INET6;
-		else
-			goto bad;
+		} else {
+			p = buf;
+
+			/* Allow square brackets for IPv4 too for convenience */
+			if (*p == '[' && p[strlen(p) - 1] == ']') {
+				p[strlen(p) - 1] = '\0';
+				p++;
+			}
+
+			if (!inany_pton(p, addr))
+				goto bad;
+		}
 	} else {
 		spec = buf;
 
@@ -281,7 +305,6 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 	p = spec;
 	do {
 		struct port_range xrange;
-		unsigned i;
 
 		if (*p != '~') {
 			/* Not an exclude range, parse later */
@@ -297,42 +320,22 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 
 		for (i = xrange.first; i <= xrange.last; i++) {
 			if (bitmap_isset(exclude, i))
-				goto overlap;
+				die("Overlapping excluded ranges %s", optarg);
 
 			bitmap_set(exclude, i);
 		}
 	} while ((p = next_chunk(p, ',')));
 
 	if (exclude_only) {
-		unsigned i;
+		/* Exclude ephemeral ports */
+		for (i = 0; i < NUM_PORTS; i++)
+			if (fwd_port_is_ephemeral(i))
+				bitmap_set(exclude, i);
 
-		for (i = 0; i < PORT_EPHEMERAL_MIN; i++) {
-			if (bitmap_isset(exclude, i))
-				continue;
-
-			bitmap_set(fwd->map, i);
-
-			if (optname == 't') {
-				ret = tcp_sock_init(c, af, addr, ifname, i);
-				if (ret == -ENFILE || ret == -EMFILE)
-					goto enfile;
-				if (!ret)
-					bound_one = true;
-			} else if (optname == 'u') {
-				ret = udp_sock_init(c, 0, af, addr, ifname, i);
-				if (ret == -ENFILE || ret == -EMFILE)
-					goto enfile;
-				if (!ret)
-					bound_one = true;
-			} else {
-				/* No way to check in advance for -T and -U */
-				bound_one = true;
-			}
-		}
-
-		if (!bound_one)
-			goto bind_fail;
-
+		conf_ports_range_except(c, optname, optarg, fwd,
+					addr, ifname,
+					1, NUM_PORTS - 1, exclude,
+					1, true);
 		return;
 	}
 
@@ -340,7 +343,6 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 	p = spec;
 	do {
 		struct port_range orig_range, mapped_range;
-		unsigned i;
 
 		if (*p == '~')
 			/* Exclude range, already parsed */
@@ -362,103 +364,114 @@ static void conf_ports(const struct ctx *c, char optname, const char *optarg,
 		if ((*p != '\0')  && (*p != ',')) /* Garbage after the ranges */
 			goto bad;
 
-		for (i = orig_range.first; i <= orig_range.last; i++) {
-			if (bitmap_isset(fwd->map, i))
-				goto overlap;
-
-			if (bitmap_isset(exclude, i))
-				continue;
-
-			bitmap_set(fwd->map, i);
-
-			fwd->delta[i] = mapped_range.first - orig_range.first;
-
-			if (optname == 't') {
-				ret = tcp_sock_init(c, af, addr, ifname, i);
-				if (ret == -ENFILE || ret == -EMFILE)
-					goto enfile;
-				if (!ret)
-					bound_one = true;
-			} else if (optname == 'u') {
-				ret = udp_sock_init(c, 0, af, addr, ifname, i);
-				if (ret == -ENFILE || ret == -EMFILE)
-					goto enfile;
-				if (!ret)
-					bound_one = true;
-			} else {
-				/* No way to check in advance for -T and -U */
-				bound_one = true;
-			}
-		}
+		conf_ports_range_except(c, optname, optarg, fwd,
+					addr, ifname,
+					orig_range.first, orig_range.last,
+					exclude,
+					mapped_range.first, false);
 	} while ((p = next_chunk(p, ',')));
 
-	if (!bound_one)
-		goto bind_fail;
-
 	return;
-enfile:
-	die("Can't open enough sockets for port specifier: %s", optarg);
 bad:
 	die("Invalid port specifier %s", optarg);
-overlap:
-	die("Overlapping port specifier %s", optarg);
 mode_conflict:
 	die("Port forwarding mode '%s' conflicts with previous mode", optarg);
-bind_fail:
-	die("Failed to bind any port for '-%c %s', exiting", optname, optarg);
 }
 
 /**
  * add_dns4() - Possibly add the IPv4 address of a DNS resolver to configuration
  * @c:		Execution context
- * @addr:	Address found in /etc/resolv.conf
- * @conf:	Pointer to reference of current entry in array of IPv4 resolvers
+ * @addr:	Guest nameserver IPv4 address
+ * @idx:	Index of free entry in array of IPv4 resolvers
+ *
+ * Return: Number of entries added (0 or 1)
  */
-static void add_dns4(struct ctx *c, struct in_addr *addr, struct in_addr **conf)
+static unsigned add_dns4(struct ctx *c, const struct in_addr *addr,
+			 unsigned idx)
 {
-	/* Guest or container can only access local addresses via redirect */
-	if (IN4_IS_ADDR_LOOPBACK(addr)) {
-		if (!c->no_map_gw) {
-			**conf = c->ip4.gw;
-			(*conf)++;
+	if (idx >= ARRAY_SIZE(c->ip4.dns))
+		return 0;
 
-			if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_match))
-				c->ip4.dns_match = c->ip4.gw;
-		}
-	} else {
-		**conf = *addr;
-		(*conf)++;
-	}
-
-	if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_host))
-		c->ip4.dns_host = *addr;
+	c->ip4.dns[idx] = *addr;
+	return 1;
 }
 
 /**
  * add_dns6() - Possibly add the IPv6 address of a DNS resolver to configuration
  * @c:		Execution context
- * @addr:	Address found in /etc/resolv.conf
- * @conf:	Pointer to reference of current entry in array of IPv6 resolvers
+ * @addr:	Guest nameserver IPv6 address
+ * @idx:	Index of free entry in array of IPv6 resolvers
+ *
+ * Return: Number of entries added (0 or 1)
  */
-static void add_dns6(struct ctx *c,
-		     struct in6_addr *addr, struct in6_addr **conf)
+static unsigned add_dns6(struct ctx *c, const struct in6_addr *addr,
+			 unsigned idx)
 {
-	/* Guest or container can only access local addresses via redirect */
-	if (IN6_IS_ADDR_LOOPBACK(addr)) {
-		if (!c->no_map_gw) {
-			memcpy(*conf, &c->ip6.gw, sizeof(**conf));
-			(*conf)++;
+	if (idx >= ARRAY_SIZE(c->ip6.dns))
+		return 0;
 
-			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_match))
-				memcpy(&c->ip6.dns_match, addr, sizeof(*addr));
+	c->ip6.dns[idx] = *addr;
+	return 1;
+}
+
+/**
+ * add_dns_resolv() - Possibly add ns from host resolv.conf to configuration
+ * @c:		Execution context
+ * @nameserver:	Nameserver address string from /etc/resolv.conf
+ * @idx4:	Pointer to index of current entry in array of IPv4 resolvers
+ * @idx6:	Pointer to index of current entry in array of IPv6 resolvers
+ *
+ * @idx4 or @idx6 may be NULL, in which case resolvers of the corresponding type
+ * are ignored.
+ */
+static void add_dns_resolv(struct ctx *c, const char *nameserver,
+			   unsigned *idx4, unsigned *idx6)
+{
+	struct in6_addr ns6;
+	struct in_addr ns4;
+
+	if (idx4 && inet_pton(AF_INET, nameserver, &ns4)) {
+		if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_host))
+			c->ip4.dns_host = ns4;
+
+		/* Special handling if guest or container can only access local
+		 * addresses via redirect, or if the host gateway is also a
+		 * resolver and we shadow its address
+		 */
+		if (IN4_IS_ADDR_LOOPBACK(&ns4) ||
+		    IN4_ARE_ADDR_EQUAL(&ns4, &c->ip4.map_host_loopback)) {
+			if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.map_host_loopback))
+				return;
+
+			ns4 = c->ip4.map_host_loopback;
+			if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_match))
+				c->ip4.dns_match = c->ip4.map_host_loopback;
 		}
-	} else {
-		memcpy(*conf, addr, sizeof(**conf));
-		(*conf)++;
+
+		*idx4 += add_dns4(c, &ns4, *idx4);
 	}
 
-	if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_host))
-		c->ip6.dns_host = *addr;
+	if (idx6 && inet_pton(AF_INET6, nameserver, &ns6)) {
+		if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_host))
+			c->ip6.dns_host = ns6;
+
+		/* Special handling if guest or container can only access local
+		 * addresses via redirect, or if the host gateway is also a
+		 * resolver and we shadow its address
+		 */
+		if (IN6_IS_ADDR_LOOPBACK(&ns6) ||
+		    IN6_ARE_ADDR_EQUAL(&ns6, &c->ip6.map_host_loopback)) {
+			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.map_host_loopback))
+				return;
+
+			ns6 = c->ip6.map_host_loopback;
+
+			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_match))
+				c->ip6.dns_match = c->ip6.map_host_loopback;
+		}
+
+		*idx6 += add_dns6(c, &ns6, *idx6);
+	}
 }
 
 /**
@@ -467,16 +480,16 @@ static void add_dns6(struct ctx *c,
  */
 static void get_dns(struct ctx *c)
 {
-	struct in6_addr *dns6 = &c->ip6.dns[0], dns6_tmp;
-	struct in_addr *dns4 = &c->ip4.dns[0], dns4_tmp;
 	int dns4_set, dns6_set, dnss_set, dns_set, fd;
+	unsigned dns4_idx = 0, dns6_idx = 0;
 	struct fqdn *s = c->dns_search;
 	struct lineread resolvconf;
-	int line_len;
-	char *line, *p, *end;
+	ssize_t line_len;
+	char *line, *end;
+	const char *p;
 
-	dns4_set = !c->ifi4 || !IN4_IS_ADDR_UNSPECIFIED(dns4);
-	dns6_set = !c->ifi6 || !IN6_IS_ADDR_UNSPECIFIED(dns6);
+	dns4_set = !c->ifi4 || !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns[0]);
+	dns6_set = !c->ifi6 || !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns[0]);
 	dnss_set = !!*s->n || c->no_dns_search;
 	dns_set = (dns4_set && dns6_set) || c->no_dns;
 
@@ -497,15 +510,9 @@ static void get_dns(struct ctx *c)
 			if (end)
 				*end = 0;
 
-			if (!dns4_set &&
-			    dns4 - &c->ip4.dns[0] < ARRAY_SIZE(c->ip4.dns) - 1
-			    && inet_pton(AF_INET, p + 1, &dns4_tmp))
-				add_dns4(c, &dns4_tmp, &dns4);
-
-			if (!dns6_set &&
-			    dns6 - &c->ip6.dns[0] < ARRAY_SIZE(c->ip6.dns) - 1
-			    && inet_pton(AF_INET6, p + 1, &dns6_tmp))
-				add_dns6(c, &dns6_tmp, &dns6);
+			add_dns_resolv(c, p + 1,
+				       dns4_set ? NULL : &dns4_idx,
+				       dns6_set ? NULL : &dns6_idx);
 		} else if (!dnss_set && strstr(line, "search ") == line &&
 			   s == c->dns_search) {
 			end = strpbrk(line, "\n");
@@ -519,7 +526,7 @@ static void get_dns(struct ctx *c)
 			while (s - c->dns_search < ARRAY_SIZE(c->dns_search) - 1
 			       /* cppcheck-suppress strtokCalled */
 			       && (p = strtok(NULL, " \t"))) {
-				strncpy(s->n, p, sizeof(c->dns_search[0]));
+				strncpy(s->n, p, sizeof(c->dns_search[0]) - 1);
 				s++;
 				*s->n = 0;
 			}
@@ -527,12 +534,25 @@ static void get_dns(struct ctx *c)
 	}
 
 	if (line_len < 0)
-		warn("Error reading /etc/resolv.conf: %s", strerror(errno));
+		warn_perror("Error reading /etc/resolv.conf");
 	close(fd);
 
 out:
-	if (!dns_set && dns4 == c->ip4.dns && dns6 == c->ip6.dns)
-		warn("Couldn't get any nameserver address");
+	if (!dns_set) {
+		if (!(dns4_idx + dns6_idx))
+			warn("Couldn't get any nameserver address");
+
+		if (c->no_dhcp_dns)
+			return;
+
+		if (c->ifi4 && !c->no_dhcp &&
+		    IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns[0]))
+			warn("No IPv4 nameserver available for DHCP");
+
+		if (c->ifi6 && ((!c->no_ndp && !c->no_ra) || !c->no_dhcpv6) &&
+		    IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns[0]))
+			warn("No IPv6 nameserver available for NDP/DHCPv6");
+	}
 }
 
 /**
@@ -553,7 +573,7 @@ static void conf_netns_opt(char *netns, const char *arg)
 	}
 
 	if (ret <= 0 || ret > PATH_MAX)
-		die("Network namespace name/path %s too long");
+		die("Network namespace name/path %s too long", arg);
 }
 
 /**
@@ -570,9 +590,6 @@ static void conf_netns_opt(char *netns, const char *arg)
 static void conf_pasta_ns(int *netns_only, char *userns, char *netns,
 			  int optind, int argc, char *argv[])
 {
-	if (*netns_only && *userns)
-		die("Both --userns and --netns-only given");
-
 	if (*netns && optind != argc)
 		die("Both --netns and PID or command given");
 
@@ -586,10 +603,15 @@ static void conf_pasta_ns(int *netns_only, char *userns, char *netns,
 			if (pidval < 0 || pidval > INT_MAX)
 				die("Invalid PID %s", argv[optind]);
 
-			snprintf(netns, PATH_MAX, "/proc/%ld/ns/net", pidval);
-			if (!*userns)
-				snprintf(userns, PATH_MAX, "/proc/%ld/ns/user",
-					 pidval);
+			if (snprintf_check(netns, PATH_MAX,
+					   "/proc/%ld/ns/net", pidval))
+				die_perror("Can't build netns path");
+
+			if (!*userns) {
+				if (snprintf_check(userns, PATH_MAX,
+						   "/proc/%ld/ns/user", pidval))
+					die_perror("Can't build userns path");
+			}
 		}
 	}
 
@@ -627,27 +649,37 @@ static int conf_ip4_prefix(const char *arg)
  * conf_ip4() - Verify or detect IPv4 support, get relevant addresses
  * @ifi:	Host interface to attempt (0 to determine one)
  * @ip4:	IPv4 context (will be written)
- * @mac:	MAC address to use (written if unset)
  *
  * Return:	Interface index for IPv4, or 0 on failure.
  */
-static unsigned int conf_ip4(unsigned int ifi,
-			     struct ip4_ctx *ip4, unsigned char *mac)
+static unsigned int conf_ip4(unsigned int ifi, struct ip4_ctx *ip4)
 {
 	if (!ifi)
-		ifi = nl_get_ext_if(AF_INET);
+		ifi = nl_get_ext_if(nl_sock, AF_INET);
 
 	if (!ifi) {
-		warn("No external routable interface for IPv4");
+		debug("Failed to detect external interface for IPv4");
 		return 0;
 	}
 
-	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->gw))
-		nl_route(NL_GET, ifi, 0, AF_INET, &ip4->gw);
+	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->guest_gw)) {
+		int rc = nl_route_get_def(nl_sock, ifi, AF_INET,
+					  &ip4->guest_gw);
+		if (rc < 0) {
+			debug("Couldn't discover IPv4 gateway address: %s",
+			      strerror_(-rc));
+			return 0;
+		}
+	}
 
 	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->addr)) {
-		nl_addr(NL_GET, ifi, 0, AF_INET,
-			&ip4->addr, &ip4->prefix_len, NULL);
+		int rc = nl_addr_get(nl_sock, ifi, AF_INET,
+				     &ip4->addr, &ip4->prefix_len, NULL);
+		if (rc < 0) {
+			debug("Couldn't discover IPv4 address: %s",
+			      strerror_(-rc));
+			return 0;
+		}
 	}
 
 	if (!ip4->prefix_len) {
@@ -662,261 +694,348 @@ static unsigned int conf_ip4(unsigned int ifi,
 			ip4->prefix_len = 32;
 	}
 
-	memcpy(&ip4->addr_seen, &ip4->addr, sizeof(ip4->addr_seen));
+	ip4->addr_seen = ip4->addr;
 
-	if (MAC_IS_ZERO(mac))
-		nl_link(0, ifi, mac, 0, 0);
+	ip4->our_tap_addr = ip4->guest_gw;
 
-	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->addr) ||
-	    MAC_IS_ZERO(mac))
+	if (IN4_IS_ADDR_UNSPECIFIED(&ip4->addr))
 		return 0;
 
 	return ifi;
+}
+
+/**
+ * conf_ip4_local() - Configure IPv4 addresses and attributes for local mode
+ * @ip4:	IPv4 context (will be written)
+ */
+static void conf_ip4_local(struct ip4_ctx *ip4)
+{
+	ip4->addr_seen = ip4->addr = IP4_LL_GUEST_ADDR;
+	ip4->our_tap_addr = ip4->guest_gw = IP4_LL_GUEST_GW;
+	ip4->prefix_len = IP4_LL_PREFIX_LEN;
+
+	ip4->no_copy_addrs = ip4->no_copy_routes = true;
 }
 
 /**
  * conf_ip6() - Verify or detect IPv6 support, get relevant addresses
  * @ifi:	Host interface to attempt (0 to determine one)
  * @ip6:	IPv6 context (will be written)
- * @mac:	MAC address to use (written if unset)
  *
  * Return:	Interface index for IPv6, or 0 on failure.
  */
-static unsigned int conf_ip6(unsigned int ifi,
-			     struct ip6_ctx *ip6, unsigned char *mac)
+static unsigned int conf_ip6(unsigned int ifi, struct ip6_ctx *ip6)
 {
 	int prefix_len = 0;
+	int rc;
 
 	if (!ifi)
-		ifi = nl_get_ext_if(AF_INET6);
+		ifi = nl_get_ext_if(nl_sock, AF_INET6);
 
 	if (!ifi) {
-		warn("No external routable interface for IPv6");
+		debug("Failed to detect external interface for IPv6");
 		return 0;
 	}
 
-	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->gw))
-		nl_route(NL_GET, ifi, 0, AF_INET6, &ip6->gw);
+	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->guest_gw)) {
+		rc = nl_route_get_def(nl_sock, ifi, AF_INET6, &ip6->guest_gw);
+		if (rc < 0) {
+			debug("Couldn't discover IPv6 gateway address: %s",
+			      strerror_(-rc));
+			return 0;
+		}
+	}
 
-	nl_addr(NL_GET, ifi, 0, AF_INET6,
-		IN6_IS_ADDR_UNSPECIFIED(&ip6->addr) ? &ip6->addr : NULL,
-		&prefix_len, &ip6->addr_ll);
+	rc = nl_addr_get(nl_sock, ifi, AF_INET6,
+			 IN6_IS_ADDR_UNSPECIFIED(&ip6->addr) ? &ip6->addr : NULL,
+			 &prefix_len, &ip6->our_tap_ll);
+	if (rc < 0) {
+		debug("Couldn't discover IPv6 address: %s", strerror_(-rc));
+		return 0;
+	}
 
-	memcpy(&ip6->addr_seen, &ip6->addr, sizeof(ip6->addr));
-	memcpy(&ip6->addr_ll_seen, &ip6->addr_ll, sizeof(ip6->addr_ll));
+	ip6->addr_seen = ip6->addr;
 
-	if (MAC_IS_ZERO(mac))
-		nl_link(0, ifi, mac, 0, 0);
+	if (IN6_IS_ADDR_LINKLOCAL(&ip6->guest_gw))
+		ip6->our_tap_ll = ip6->guest_gw;
 
 	if (IN6_IS_ADDR_UNSPECIFIED(&ip6->addr) ||
-	    IN6_IS_ADDR_UNSPECIFIED(&ip6->addr_ll) ||
-	    MAC_IS_ZERO(mac))
+	    IN6_IS_ADDR_UNSPECIFIED(&ip6->our_tap_ll))
 		return 0;
 
 	return ifi;
 }
 
 /**
- * print_usage() - Print usage, exit with given status code
- * @name:	Executable name
- * @status:	Status code for exit()
+ * conf_ip6_local() - Configure IPv6 addresses and attributes for local mode
+ * @ip6:	IPv6 context (will be written)
  */
-static void print_usage(const char *name, int status)
+static void conf_ip6_local(struct ip6_ctx *ip6)
+{
+	ip6->our_tap_ll = ip6->guest_gw = IP6_LL_GUEST_GW;
+
+	ip6->no_copy_addrs = ip6->no_copy_routes = true;
+}
+
+/**
+ * usage() - Print usage, exit with given status code
+ * @name:	Executable name
+ * @f:		Stream to print usage info to
+ * @status:	Status code for _exit()
+ */
+static void usage(const char *name, FILE *f, int status)
 {
 	if (strstr(name, "pasta")) {
-		info("Usage: %s [OPTION]... [COMMAND] [ARGS]...", name);
-		info("       %s [OPTION]... PID", name);
-		info("       %s [OPTION]... --netns [PATH|NAME]", name);
-		info("");
-		info("Without PID or --netns, run the given command or a");
-		info("default shell in a new network and user namespace, and");
-		info("connect it via pasta.");
+		FPRINTF(f, "Usage: %s [OPTION]... [COMMAND] [ARGS]...\n", name);
+		FPRINTF(f, "       %s [OPTION]... PID\n", name);
+		FPRINTF(f, "       %s [OPTION]... --netns [PATH|NAME]\n", name);
+		FPRINTF(f,
+			"\n"
+			"Without PID or --netns, run the given command or a\n"
+			"default shell in a new network and user namespace, and\n"
+			"connect it via pasta.\n");
 	} else {
-		info("Usage: %s [OPTION]...", name);
+		FPRINTF(f, "Usage: %s [OPTION]...\n", name);
 	}
-	info("");
 
-
-	info(   "  -d, --debug		Be verbose");
-	info(   "      --trace		Be extra verbose, implies --debug");
-	info(   "  -q, --quiet		Don't print informational messages");
-	info(   "  -f, --foreground	Don't run in background");
-	info(   "    default: run in background if started from a TTY");
-	info(   "  -e, --stderr		Log to stderr too");
-	info(   "    default: log to system logger only if started from a TTY");
-	info(   "  -l, --log-file PATH	Log (only) to given file");
-	info(   "  --log-size BYTES	Maximum size of log file");
-	info(   "    default: 1 MiB");
-	info(   "  --runas UID|UID:GID 	Run as given UID, GID, which can be");
-	info(   "    numeric, or login and group names");
-	info(   "    default: drop to user \"nobody\"");
-	info(   "  -h, --help		Display this help message and exit");
-	info(   "  --version		Show version and exit");
+	FPRINTF(f,
+		"\n"
+		"  -d, --debug		Be verbose\n"
+		"      --trace		Be extra verbose, implies --debug\n"
+		"  -q, --quiet		Don't print informational messages\n"
+		"  -f, --foreground	Don't run in background\n"
+		"    default: run in background\n"
+		"  -l, --log-file PATH	Log (only) to given file\n"
+		"  --log-size BYTES	Maximum size of log file\n"
+		"    default: 1 MiB\n"
+		"  --runas UID|UID:GID 	Run as given UID, GID, which can be\n"
+		"    numeric, or login and group names\n"
+		"    default: drop to user \"nobody\"\n"
+		"  -h, --help		Display this help message and exit\n"
+		"  --version		Show version and exit\n");
 
 	if (strstr(name, "pasta")) {
-		info(   "  -I, --ns-ifname NAME	namespace interface name");
-		info(   "    default: same interface name as external one");
+		FPRINTF(f,
+			"  -I, --ns-ifname NAME	namespace interface name\n"
+			"    default: same interface name as external one\n");
 	} else {
-		info(   "  -s, --socket PATH	UNIX domain socket path");
-		info(   "    default: probe free path starting from "
-		     UNIX_SOCK_PATH, 1);
+		FPRINTF(f,
+			"  -s, --socket, --socket-path PATH	UNIX domain socket path\n"
+			"    default: probe free path starting from "
+			UNIX_SOCK_PATH "\n", 1);
+		FPRINTF(f,
+			"  --vhost-user		Enable vhost-user mode\n"
+			"    UNIX domain socket is provided by -s option\n"
+			"  --print-capabilities	print back-end capabilities in JSON format,\n"
+			"    only meaningful for vhost-user mode\n");
+		FPRINTF(f,
+			"  --repair-path PATH	path for passt-repair(1)\n"
+			"    default: append '.repair' to UNIX domain path\n");
 	}
 
-	info(   "  -F, --fd FD		Use FD as pre-opened connected socket");
-	info(   "  -p, --pcap FILE	Log tap-facing traffic to pcap file");
-	info(   "  -P, --pid FILE	Write own PID to the given file");
-	info(   "  -m, --mtu MTU	Assign MTU via DHCP/NDP");
-	info(   "    a zero value disables assignment");
-	info(   "    default: 65520: maximum 802.3 MTU minus 802.3 header");
-	info(   "                    length, rounded to 32 bits (IPv4 words)");
-	info(   "  -a, --address ADDR	Assign IPv4 or IPv6 address ADDR");
-	info(   "    can be specified zero to two times (for IPv4 and IPv6)");
-	info(   "    default: use addresses from interface with default route");
-	info(   "  -n, --netmask MASK	Assign IPv4 MASK, dot-decimal or bits");
-	info(   "    default: netmask from matching address on the host");
-	info(   "  -M, --mac-addr ADDR	Use source MAC address ADDR");
-	info(   "    default: MAC address from interface with default route");
-	info(   "  -g, --gateway ADDR	Pass IPv4 or IPv6 address as gateway");
-	info(   "    default: gateway from interface with default route");
-	info(   "  -i, --interface NAME	Interface for addresses and routes");
-	info(   "    default: from --outbound-if4 and --outbound-if6, if any");
-	info(   "             otherwise interface with first default route");
-	info(   "  -o, --outbound ADDR	Bind to address as outbound source");
-	info(   "    can be specified zero to two times (for IPv4 and IPv6)");
-	info(   "    default: use source address from routing tables");
-	info(   "  --outbound-if4 NAME	Bind to outbound interface for IPv4");
-	info(   "    default: use interface from default route");
-	info(   "  --outbound-if6 NAME	Bind to outbound interface for IPv6");
-	info(   "    default: use interface from default route");
-	info(   "  -D, --dns ADDR	Use IPv4 or IPv6 address as DNS");
-	info(   "    can be specified multiple times");
-	info(   "    a single, empty option disables DNS information");
+	FPRINTF(f,
+		"  -F, --fd FD		Use FD as pre-opened connected socket\n"
+		"  -p, --pcap FILE	Log tap-facing traffic to pcap file\n"
+		"  -P, --pid FILE	Write own PID to the given file\n"
+		"  -m, --mtu MTU	Assign MTU via DHCP/NDP\n"
+		"    a zero value disables assignment\n"
+		"    default: 65520: maximum 802.3 MTU minus 802.3 header\n"
+		"                    length, rounded to 32 bits (IPv4 words)\n"
+		"  -a, --address ADDR	Assign IPv4 or IPv6 address ADDR\n"
+		"    can be specified zero to two times (for IPv4 and IPv6)\n"
+		"    default: use addresses from interface with default route\n"
+		"  -n, --netmask MASK	Assign IPv4 MASK, dot-decimal or bits\n"
+		"    default: netmask from matching address on the host\n"
+		"  -M, --mac-addr ADDR	Use source MAC address ADDR\n"
+		"    default: 9a:55:9a:55:9a:55 (locally administered)\n"
+		"  -g, --gateway ADDR	Pass IPv4 or IPv6 address as gateway\n"
+		"    default: gateway from interface with default route\n"
+		"  -i, --interface NAME	Interface for addresses and routes\n"
+		"    default: from --outbound-if4 and --outbound-if6, if any\n"
+		"             otherwise interface with first default route\n"
+		"  -o, --outbound ADDR	Bind to address as outbound source\n"
+		"    can be specified zero to two times (for IPv4 and IPv6)\n"
+		"    default: use source address from routing tables\n"
+		"  --outbound-if4 NAME	Bind to outbound interface for IPv4\n"
+		"    default: use interface from default route\n"
+		"  --outbound-if6 NAME	Bind to outbound interface for IPv6\n"
+		"    default: use interface from default route\n"
+		"  -D, --dns ADDR	Use IPv4 or IPv6 address as DNS\n"
+		"    can be specified multiple times\n"
+		"    a single, empty option disables DNS information\n");
 	if (strstr(name, "pasta"))
-		info(   "    default: don't use any addresses");
+		FPRINTF(f, "    default: don't use any addresses\n");
 	else
-		info(   "    default: use addresses from /etc/resolv.conf");
-
-	info(   "  -S, --search LIST	Space-separated list, search domains");
-	info(   "    a single, empty option disables the DNS search list");
+		FPRINTF(f, "    default: use addresses from /etc/resolv.conf\n");
+	FPRINTF(f,
+		"  -S, --search LIST	Space-separated list, search domains\n"
+		"    a single, empty option disables the DNS search list\n"
+		"  -H, --hostname NAME 	Hostname to configure client with\n"
+		"  --fqdn NAME		FQDN to configure client with\n");
 	if (strstr(name, "pasta"))
-		info(   "    default: don't use any search list");
+		FPRINTF(f, "    default: don't use any search list\n");
 	else
-		info(   "    default: use search list from /etc/resolv.conf");
-
-	if (strstr(name, "pasta"))
-		info("  --dhcp-dns	\tPass DNS list via DHCP/DHCPv6/NDP");
-	else
-		info("  --no-dhcp-dns	No DNS list in DHCP/DHCPv6/NDP");
+		FPRINTF(f, "    default: use search list from /etc/resolv.conf\n");
 
 	if (strstr(name, "pasta"))
-		info("  --dhcp-search	Pass list via DHCP/DHCPv6/NDP");
+		FPRINTF(f, "  --dhcp-dns	\tPass DNS list via DHCP/DHCPv6/NDP\n");
 	else
-		info("  --no-dhcp-search	No list in DHCP/DHCPv6/NDP");
+		FPRINTF(f, "  --no-dhcp-dns	No DNS list in DHCP/DHCPv6/NDP\n");
 
-	info(   "  --dns-forward ADDR	Forward DNS queries sent to ADDR");
-	info(   "    can be specified zero to two times (for IPv4 and IPv6)");
-	info(   "    default: don't forward DNS queries");
+	if (strstr(name, "pasta"))
+		FPRINTF(f, "  --dhcp-search	Pass list via DHCP/DHCPv6/NDP\n");
+	else
+		FPRINTF(f, "  --no-dhcp-search	No list in DHCP/DHCPv6/NDP\n");
 
-	info(   "  --no-tcp		Disable TCP protocol handler");
-	info(   "  --no-udp		Disable UDP protocol handler");
-	info(   "  --no-icmp		Disable ICMP/ICMPv6 protocol handler");
-	info(   "  --no-dhcp		Disable DHCP server");
-	info(   "  --no-ndp		Disable NDP responses");
-	info(   "  --no-dhcpv6		Disable DHCPv6 server");
-	info(   "  --no-ra		Disable router advertisements");
-	info(   "  --no-map-gw		Don't map gateway address to host");
-	info(   "  -4, --ipv4-only	Enable IPv4 operation only");
-	info(   "  -6, --ipv6-only	Enable IPv6 operation only");
+	FPRINTF(f,
+		"  --map-host-loopback ADDR	Translate ADDR to refer to host\n"
+	        "    can be specified zero to two times (for IPv4 and IPv6)\n"
+		"    default: gateway address\n"
+		"  --map-guest-addr ADDR	Translate ADDR to guest's address\n"
+	        "    can be specified zero to two times (for IPv4 and IPv6)\n"
+		"    default: none\n"
+		"  --dns-forward ADDR	Forward DNS queries sent to ADDR\n"
+		"    can be specified zero to two times (for IPv4 and IPv6)\n"
+		"    default: don't forward DNS queries\n"
+		"  --dns-host ADDR	Host nameserver to direct queries to\n"
+		"    can be specified zero to two times (for IPv4 and IPv6)\n"
+		"    default: first nameserver from host's /etc/resolv.conf\n"
+		"  --no-tcp		Disable TCP protocol handler\n"
+		"  --no-udp		Disable UDP protocol handler\n"
+		"  --no-icmp		Disable ICMP/ICMPv6 protocol handler\n"
+		"  --no-dhcp		Disable DHCP server\n"
+		"  --no-ndp		Disable NDP responses\n"
+		"  --no-dhcpv6		Disable DHCPv6 server\n"
+		"  --no-ra		Disable router advertisements\n"
+		"  --freebind		Bind to any address for forwarding\n"
+		"  --no-map-gw		Don't map gateway address to host\n"
+		"  -4, --ipv4-only	Enable IPv4 operation only\n"
+		"  -6, --ipv6-only	Enable IPv6 operation only\n");
 
 	if (strstr(name, "pasta"))
 		goto pasta_opts;
 
-	info(   "  -1, --one-off	Quit after handling one single client");
-	info(   "  -t, --tcp-ports SPEC	TCP port forwarding to guest");
-	info(   "    can be specified multiple times");
-	info(   "    SPEC can be:");
-	info(   "      'none': don't forward any ports");
-	info(   "      'all': forward all unbound, non-ephemeral ports");
-	info(   "      a comma-separated list, optionally ranged with '-'");
-	info(   "        and optional target ports after ':', with optional");
-	info(   "        address specification suffixed by '/' and optional");
-	info(   "        interface prefixed by '%%'. Ranges can be reduced by");
-	info(   "        excluding ports or ranges prefixed by '~'");
-	info(   "        Examples:");
-	info(   "        -t 22		Forward local port 22 to 22 on guest");
-	info(   "        -t 22:23	Forward local port 22 to 23 on guest");
-	info(   "        -t 22,25	Forward ports 22, 25 to ports 22, 25");
-	info(   "        -t 22-80  	Forward ports 22 to 80");
-	info(   "        -t 22-80:32-90	Forward ports 22 to 80 to");
-	info(   "			corresponding port numbers plus 10");
-	info(   "        -t 192.0.2.1/5	Bind port 5 of 192.0.2.1 to guest");
-	info(   "        -t 5-25,~10-20	Forward ports 5 to 9, and 21 to 25");
-	info(   "        -t ~25		Forward all ports except for 25");
-	info(   "    default: none");
-	info(   "  -u, --udp-ports SPEC	UDP port forwarding to guest");
-	info(   "    SPEC is as described for TCP above");
-	info(   "    default: none");
+	FPRINTF(f,
+		"  -1, --one-off	Quit after handling one single client\n"
+		"  -t, --tcp-ports SPEC	TCP port forwarding to guest\n"
+		"    can be specified multiple times\n"
+		"    SPEC can be:\n"
+		"      'none': don't forward any ports\n"
+		"      'all': forward all unbound, non-ephemeral ports\n"
+		"      a comma-separated list, optionally ranged with '-'\n"
+		"        and optional target ports after ':', with optional\n"
+		"        address specification suffixed by '/' and optional\n"
+		"        interface prefixed by '%%'. Ranges can be reduced by\n"
+		"        excluding ports or ranges prefixed by '~'\n"
+		"        Examples:\n"
+		"        -t 22		Forward local port 22 to 22 on guest\n"
+		"        -t 22:23	Forward local port 22 to 23 on guest\n"
+		"        -t 22,25	Forward ports 22, 25 to ports 22, 25\n"
+		"        -t 22-80  	Forward ports 22 to 80\n"
+		"        -t 22-80:32-90	Forward ports 22 to 80 to\n"
+		"			corresponding port numbers plus 10\n"
+		"        -t 192.0.2.1/5	Bind port 5 of 192.0.2.1 to guest\n"
+		"        -t 5-25,~10-20	Forward ports 5 to 9, and 21 to 25\n"
+		"        -t ~25		Forward all ports except for 25\n"
+		"    default: none\n"
+		"  -u, --udp-ports SPEC	UDP port forwarding to guest\n"
+		"    SPEC is as described for TCP above\n"
+		"    default: none\n");
 
-	exit(status);
+	_exit(status);
 
 pasta_opts:
 
-	info(   "  -t, --tcp-ports SPEC	TCP port forwarding to namespace");
-	info(   "    can be specified multiple times"); 
-	info(   "    SPEC can be:");
-	info(   "      'none': don't forward any ports");
-	info(   "      'auto': forward all ports currently bound in namespace");
-	info(   "      a comma-separated list, optionally ranged with '-'");
-	info(   "        and optional target ports after ':', with optional");
-	info(   "        address specification suffixed by '/' and optional");
-	info(   "        interface prefixed by '%%'. Examples:");
-	info(   "        -t 22	Forward local port 22 to port 22 in netns");
-	info(   "        -t 22:23	Forward local port 22 to port 23");
-	info(   "        -t 22,25	Forward ports 22, 25 to ports 22, 25");
-	info(   "        -t 22-80	Forward ports 22 to 80");
-	info(   "        -t 22-80:32-90	Forward ports 22 to 80 to");
-	info(   "			corresponding port numbers plus 10");
-	info(   "        -t 192.0.2.1/5	Bind port 5 of 192.0.2.1 to namespace");
-	info(   "        -t 5-25,~10-20	Forward ports 5 to 9, and 21 to 25");
-	info(   "        -t ~25		Forward all bound ports except for 25");
-	info(   "    default: auto");
-	info(   "    IPv6 bound ports are also forwarded for IPv4");
-	info(   "  -u, --udp-ports SPEC	UDP port forwarding to namespace");
-	info(   "    SPEC is as described for TCP above");
-	info(   "    default: auto");
-	info(   "    IPv6 bound ports are also forwarded for IPv4");
-	info(   "    unless specified, with '-t auto', UDP ports with numbers");
-	info(   "    corresponding to forwarded TCP port numbers are");
-	info(   "    forwarded too");
-	info(   "  -T, --tcp-ns SPEC	TCP port forwarding to init namespace");
-	info(   "    SPEC is as described above");
-	info(   "    default: auto");
-	info(   "  -U, --udp-ns SPEC	UDP port forwarding to init namespace");
-	info(   "    SPEC is as described above");
-	info(   "    default: auto");
-	info(   "  --userns NSPATH 	Target user namespace to join");
-	info(   "  --netns PATH|NAME	Target network namespace to join");
-	info(   "  --netns-only		Don't join existing user namespace");
-	info(   "    implied if PATH or NAME are given without --userns");
-	info(   "  --no-netns-quit	Don't quit if filesystem-bound target");
-	info(   "  			network namespace is deleted");
-	info(   "  --config-net		Configure tap interface in namespace");
-	info(   "  --no-copy-routes	DEPRECATED:");
-	info(   "			Don't copy all routes to namespace");
-	info(   "  --no-copy-addrs	DEPRECATED:");
-	info(   "			Don't copy all addresses to namespace");
-	info(   "  --ns-mac-addr ADDR	Set MAC address on tap interface");
+	FPRINTF(f,
+		"  -t, --tcp-ports SPEC	TCP port forwarding to namespace\n"
+		"    can be specified multiple times\n"
+		"    SPEC can be:\n"
+		"      'none': don't forward any ports\n"
+		"      'auto': forward all ports currently bound in namespace\n"
+		"      a comma-separated list, optionally ranged with '-'\n"
+		"        and optional target ports after ':', with optional\n"
+		"        address specification suffixed by '/' and optional\n"
+		"        interface prefixed by '%%'. Examples:\n"
+		"        -t 22	Forward local port 22 to port 22 in netns\n"
+		"        -t 22:23	Forward local port 22 to port 23\n"
+		"        -t 22,25	Forward ports 22, 25 to ports 22, 25\n"
+		"        -t 22-80	Forward ports 22 to 80\n"
+		"        -t 22-80:32-90	Forward ports 22 to 80 to\n"
+		"			corresponding port numbers plus 10\n"
+		"        -t 192.0.2.1/5	Bind port 5 of 192.0.2.1 to namespace\n"
+		"        -t 5-25,~10-20	Forward ports 5 to 9, and 21 to 25\n"
+		"        -t ~25		Forward all bound ports except for 25\n"
+		"    default: auto\n"
+		"    IPv6 bound ports are also forwarded for IPv4\n"
+		"  -u, --udp-ports SPEC	UDP port forwarding to namespace\n"
+		"    SPEC is as described for TCP above\n"
+		"    default: auto\n"
+		"    IPv6 bound ports are also forwarded for IPv4\n"
+		"    unless specified, with '-t auto', UDP ports with numbers\n"
+		"    corresponding to forwarded TCP port numbers are\n"
+		"    forwarded too\n"
+		"  -T, --tcp-ns SPEC	TCP port forwarding to init namespace\n"
+		"    SPEC is as described above\n"
+		"    default: auto\n"
+		"  -U, --udp-ns SPEC	UDP port forwarding to init namespace\n"
+		"    SPEC is as described above\n"
+		"    default: auto\n"
+		"  --host-lo-to-ns-lo	Translate host-loopback forwards to\n"
+		"			namespace loopback\n"
+		"  --userns NSPATH 	Target user namespace to join\n"
+		"  --netns PATH|NAME	Target network namespace to join\n"
+		"  --netns-only		Don't join existing user namespace\n"
+		"    implied if PATH or NAME are given without --userns\n"
+		"  --no-netns-quit	Don't quit if filesystem-bound target\n"
+		"  			network namespace is deleted\n"
+		"  --config-net		Configure tap interface in namespace\n"
+		"  --no-copy-routes	DEPRECATED:\n"
+		"			Don't copy all routes to namespace\n"
+		"  --no-copy-addrs	DEPRECATED:\n"
+		"			Don't copy all addresses to namespace\n"
+		"  --ns-mac-addr ADDR	Set MAC address on tap interface\n"
+		"  --no-splice		Disable inbound socket splicing\n");
 
-	exit(status);
+	_exit(status);
 }
 
 /**
- * usage() - Print usage and exit with failure
- * @name:	Executable name
+ * conf_mode() - Determine passt/pasta's operating mode from command line
+ * @argc:	Argument count
+ * @argv:	Command line arguments
+ *
+ * Return: mode to operate in, PASTA or PASST
  */
-static void usage(const char *name)
+enum passt_modes conf_mode(int argc, char *argv[])
 {
-	print_usage(name, EXIT_FAILURE);
+	int vhost_user = 0;
+	const struct option optvu[] = {
+		{"vhost-user",	no_argument,		&vhost_user,	1 },
+		{ 0 },
+	};
+	char argv0[PATH_MAX], *basearg0;
+	int name;
+
+	optind = 0;
+	do {
+		name = getopt_long(argc, argv, "-:", optvu, NULL);
+	} while (name != -1);
+
+	if (vhost_user)
+		return MODE_VU;
+
+	if (argc < 1)
+		die("Cannot determine argv[0]");
+
+	strncpy(argv0, argv[0], PATH_MAX - 1);
+	basearg0 = basename(argv0);
+	if (strstr(basearg0, "pasta"))
+		return MODE_PASTA;
+
+	if (strstr(basearg0, "passt"))
+		return MODE_PASST;
+
+	die("Cannot determine mode, invoke as \"passt\" or \"pasta\"");
 }
 
 /**
@@ -925,15 +1044,18 @@ static void usage(const char *name)
  */
 static void conf_print(const struct ctx *c)
 {
-	char buf4[INET_ADDRSTRLEN], buf6[INET6_ADDRSTRLEN], ifn[IFNAMSIZ];
+	char buf4[INET_ADDRSTRLEN], buf6[INET6_ADDRSTRLEN];
+	char bufmac[ETH_ADDRSTRLEN], ifn[IFNAMSIZ];
 	int i;
 
-	info("Template interface: %s%s%s%s%s",
-	     c->ifi4 ? if_indextoname(c->ifi4, ifn) : "",
-	     c->ifi4 ? " (IPv4)" : "",
-	     (c->ifi4 && c->ifi6) ? ", " : "",
-	     c->ifi6 ? if_indextoname(c->ifi6, ifn) : "",
-	     c->ifi6 ? " (IPv6)" : "");
+	if (c->ifi4 > 0 || c->ifi6 > 0) {
+		info("Template interface: %s%s%s%s%s",
+		     c->ifi4 > 0 ? if_indextoname(c->ifi4, ifn) : "",
+		     c->ifi4 > 0 ? " (IPv4)" : "",
+		     (c->ifi4 && c->ifi6) ? ", " : "",
+		     c->ifi6 > 0 ? if_indextoname(c->ifi6, ifn) : "",
+		     c->ifi6 > 0 ? " (IPv6)" : "");
+	}
 
 	if (*c->ip4.ifname_out || *c->ip6.ifname_out) {
 		info("Outbound interface: %s%s%s%s%s",
@@ -959,11 +1081,14 @@ static void conf_print(const struct ctx *c)
 		info("Namespace interface: %s", c->pasta_ifn);
 
 	info("MAC:");
-	info("    host: %02x:%02x:%02x:%02x:%02x:%02x",
-	     c->mac[0], c->mac[1], c->mac[2],
-	     c->mac[3], c->mac[4], c->mac[5]);
+	info("    host: %s", eth_ntop(c->our_tap_mac, bufmac, sizeof(bufmac)));
 
 	if (c->ifi4) {
+		if (!IN4_IS_ADDR_UNSPECIFIED(&c->ip4.map_host_loopback))
+			info("    NAT to host 127.0.0.1: %s",
+			     inet_ntop(AF_INET, &c->ip4.map_host_loopback,
+				       buf4, sizeof(buf4)));
+
 		if (!c->no_dhcp) {
 			uint32_t mask;
 
@@ -975,7 +1100,8 @@ static void conf_print(const struct ctx *c)
 			info("    mask: %s",
 			     inet_ntop(AF_INET, &mask,        buf4, sizeof(buf4)));
 			info("    router: %s",
-			     inet_ntop(AF_INET, &c->ip4.gw,   buf4, sizeof(buf4)));
+			     inet_ntop(AF_INET, &c->ip4.guest_gw,
+				       buf4, sizeof(buf4)));
 		}
 
 		for (i = 0; !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns[i]); i++) {
@@ -993,11 +1119,16 @@ static void conf_print(const struct ctx *c)
 	}
 
 	if (c->ifi6) {
+		if (!IN6_IS_ADDR_UNSPECIFIED(&c->ip6.map_host_loopback))
+			info("    NAT to host ::1: %s",
+			     inet_ntop(AF_INET6, &c->ip6.map_host_loopback,
+				       buf6, sizeof(buf6)));
+
 		if (!c->no_ndp && !c->no_dhcpv6)
 			info("NDP/DHCPv6:");
-		else if (!c->no_ndp)
-			info("DHCPv6:");
 		else if (!c->no_dhcpv6)
+			info("DHCPv6:");
+		else if (!c->no_ndp)
 			info("NDP:");
 		else
 			goto dns6;
@@ -1005,9 +1136,10 @@ static void conf_print(const struct ctx *c)
 		info("    assign: %s",
 		     inet_ntop(AF_INET6, &c->ip6.addr, buf6, sizeof(buf6)));
 		info("    router: %s",
-		     inet_ntop(AF_INET6, &c->ip6.gw,   buf6, sizeof(buf6)));
+		     inet_ntop(AF_INET6, &c->ip6.guest_gw, buf6, sizeof(buf6)));
 		info("    our link-local: %s",
-		     inet_ntop(AF_INET6, &c->ip6.addr_ll, buf6, sizeof(buf6)));
+		     inet_ntop(AF_INET6, &c->ip6.our_tap_ll,
+			       buf6, sizeof(buf6)));
 
 dns6:
 		for (i = 0; !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns[i]); i++) {
@@ -1049,7 +1181,7 @@ static int conf_runas(char *opt, unsigned int *uid, unsigned int *gid)
 	if (*endptr) {
 #ifndef GLIBC_NO_STATIC_NSS
 		/* Not numeric, look up as a username */
-		struct passwd *pw;
+		const struct passwd *pw;
 		/* cppcheck-suppress getpwnamCalled */
 		if (!(pw = getpwnam(uopt)) || !(*uid = pw->pw_uid))
 			return -ENOENT;
@@ -1066,7 +1198,7 @@ static int conf_runas(char *opt, unsigned int *uid, unsigned int *gid)
 	if (*endptr) {
 #ifndef GLIBC_NO_STATIC_NSS
 		/* Not numeric, look up as a group name */
-		struct group *gr;
+		const struct group *gr;
 		/* cppcheck-suppress getgrnamCalled */
 		if (!(gr = getgrnam(gopt)))
 			return -ENOENT;
@@ -1107,16 +1239,14 @@ static void conf_ugid(char *runas, uid_t *uid, gid_t *gid)
 		return;
 
 	/* ...otherwise use nobody:nobody */
-	warn("Don't run as root. Changing to nobody...");
+	warn("Started as root, will change to nobody.");
 	{
 #ifndef GLIBC_NO_STATIC_NSS
-		struct passwd *pw;
+		const struct passwd *pw;
 		/* cppcheck-suppress getpwnamCalled */
 		pw = getpwnam("nobody");
-		if (!pw) {
-			perror("getpwnam");
-			exit(EXIT_FAILURE);
-		}
+		if (!pw)
+			die_perror("Can't get password file entry for nobody");
 
 		*uid = pw->pw_uid;
 		*gid = pw->pw_gid;
@@ -1128,6 +1258,104 @@ static void conf_ugid(char *runas, uid_t *uid, gid_t *gid)
 }
 
 /**
+ * conf_nat() - Parse --map-host-loopback or --map-guest-addr option
+ * @arg:	String argument to option
+ * @addr4:	IPv4 to update with parsed address
+ * @addr6:	IPv6 to update with parsed address
+ * @no_map_gw:	--no-map-gw flag, or NULL, updated for "none" argument
+ */
+static void conf_nat(const char *arg, struct in_addr *addr4,
+		     struct in6_addr *addr6, int *no_map_gw)
+{
+	if (strcmp(arg, "none") == 0) {
+		*addr4 = in4addr_any;
+		*addr6 = in6addr_any;
+		if (no_map_gw)
+			*no_map_gw = 1;
+	}
+
+	if (inet_pton(AF_INET6, arg, addr6)	&&
+	    !IN6_IS_ADDR_UNSPECIFIED(addr6)	&&
+	    !IN6_IS_ADDR_LOOPBACK(addr6)	&&
+	    !IN6_IS_ADDR_MULTICAST(addr6))
+		return;
+
+	if (inet_pton(AF_INET, arg, addr4)	&&
+	    !IN4_IS_ADDR_UNSPECIFIED(addr4)	&&
+	    !IN4_IS_ADDR_LOOPBACK(addr4)	&&
+	    !IN4_IS_ADDR_MULTICAST(addr4))
+		return;
+
+	die("Invalid address to remap to host: %s", optarg);
+}
+
+/**
+ * conf_open_files() - Open files as requested by configuration
+ * @c:		Execution context
+ */
+static void conf_open_files(struct ctx *c)
+{
+	if (c->mode != MODE_PASTA && c->fd_tap == -1) {
+		c->fd_tap_listen = sock_unix(c->sock_path);
+
+		if (c->mode == MODE_VU && strcmp(c->repair_path, "none")) {
+			if (!*c->repair_path &&
+			    snprintf_check(c->repair_path,
+					   sizeof(c->repair_path), "%s.repair",
+					   c->sock_path)) {
+				warn("passt-repair path %s not usable",
+				     c->repair_path);
+				c->fd_repair_listen = -1;
+			} else {
+				c->fd_repair_listen = sock_unix(c->repair_path);
+			}
+		} else {
+			c->fd_repair_listen = -1;
+		}
+		c->fd_repair = -1;
+	}
+
+	if (*c->pidfile) {
+		c->pidfile_fd = output_file_open(c->pidfile, O_WRONLY);
+		if (c->pidfile_fd < 0)
+			die_perror("Couldn't open PID file %s", c->pidfile);
+	}
+}
+
+/**
+ * parse_mac - Parse a MAC address from a string
+ * @mac:	Binary MAC address, initialised on success
+ * @str:	String to parse
+ *
+ * Parses @str as an Ethernet MAC address stored in @mac on success.  Exits on
+ * failure.
+ */
+static void parse_mac(unsigned char mac[ETH_ALEN], const char *str)
+{
+	size_t i;
+
+	if (strlen(str) != (ETH_ALEN * 3 - 1))
+		goto fail;
+
+	for (i = 0; i < ETH_ALEN; i++) {
+		const char *octet = str + 3 * i;
+		unsigned long b;
+		char *end;
+
+		errno = 0;
+		b = strtoul(octet, &end, 16);
+		if (b > UCHAR_MAX || errno || end != octet + 2 ||
+		    *end != ((i == ETH_ALEN - 1) ? '\0' : ':'))
+			goto fail;
+		mac[i] = b;
+	}
+	return;
+
+fail:
+	die("Invalid MAC address: %s", str);
+}
+
+/**
  * conf() - Process command-line arguments and set configuration
  * @c:		Execution context
  * @argc:	Argument count
@@ -1135,8 +1363,8 @@ static void conf_ugid(char *runas, uid_t *uid, gid_t *gid)
  */
 void conf(struct ctx *c, int argc, char **argv)
 {
-	int netns_only = 0;
-	struct option options[] = {
+	int netns_only = 0, no_map_gw = 0;
+	const struct option options[] = {
 		{"debug",	no_argument,		NULL,		'd' },
 		{"quiet",	no_argument,		NULL,		'q' },
 		{"foreground",	no_argument,		NULL,		'f' },
@@ -1157,6 +1385,7 @@ void conf(struct ctx *c, int argc, char **argv)
 		{"outbound",	required_argument,	NULL,		'o' },
 		{"dns",		required_argument,	NULL,		'D' },
 		{"search",	required_argument,	NULL,		'S' },
+		{"hostname",	required_argument,	NULL,		'H' },
 		{"no-tcp",	no_argument,		&c->no_tcp,	1 },
 		{"no-udp",	no_argument,		&c->no_udp,	1 },
 		{"no-icmp",	no_argument,		&c->no_icmp,	1 },
@@ -1164,7 +1393,9 @@ void conf(struct ctx *c, int argc, char **argv)
 		{"no-dhcpv6",	no_argument,		&c->no_dhcpv6,	1 },
 		{"no-ndp",	no_argument,		&c->no_ndp,	1 },
 		{"no-ra",	no_argument,		&c->no_ra,	1 },
-		{"no-map-gw",	no_argument,		&c->no_map_gw,	1 },
+		{"no-splice",	no_argument,		&c->no_splice,	1 },
+		{"freebind",	no_argument,		&c->freebind,	1 },
+		{"no-map-gw",	no_argument,		&no_map_gw,	1 },
 		{"ipv4-only",	no_argument,		NULL,		'4' },
 		{"ipv6-only",	no_argument,		NULL,		'6' },
 		{"one-off",	no_argument,		NULL,		'1' },
@@ -1174,7 +1405,6 @@ void conf(struct ctx *c, int argc, char **argv)
 		{"udp-ns",	required_argument,	NULL,		'U' },
 		{"userns",	required_argument,	NULL,		2 },
 		{"netns",	required_argument,	NULL,		3 },
-		{"netns-only",	no_argument,		&netns_only,	1 },
 		{"ns-mac-addr",	required_argument,	NULL,		4 },
 		{"dhcp-dns",	no_argument,		NULL,		5 },
 		{"no-dhcp-dns",	no_argument,		NULL,		6 },
@@ -1191,33 +1421,51 @@ void conf(struct ctx *c, int argc, char **argv)
 		{"config-net",	no_argument,		NULL,		17 },
 		{"no-copy-routes", no_argument,		NULL,		18 },
 		{"no-copy-addrs", no_argument,		NULL,		19 },
+		{"netns-only",	no_argument,		NULL,		20 },
+		{"map-host-loopback", required_argument, NULL,		21 },
+		{"map-guest-addr", required_argument,	NULL,		22 },
+		{"host-lo-to-ns-lo", no_argument, 	NULL,		23 },
+		{"dns-host",	required_argument,	NULL,		24 },
+		{"vhost-user",	no_argument,		NULL,		25 },
+
+		/* vhost-user backend program convention */
+		{"print-capabilities", no_argument,	NULL,		26 },
+		{"socket-path",	required_argument,	NULL,		's' },
+		{"fqdn",	required_argument,	NULL,		27 },
+		{"repair-path",	required_argument,	NULL,		28 },
 		{ 0 },
 	};
-	struct get_bound_ports_ns_arg ns_ports_arg = { .c = c };
+	const char *optstring = "+dqfel:hs:F:I:p:P:m:a:n:M:g:i:o:D:S:H:461t:u:T:U:";
+	const char *logname = (c->mode == MODE_PASTA) ? "pasta" : "passt";
 	char userns[PATH_MAX] = { 0 }, netns[PATH_MAX] = { 0 };
 	bool copy_addrs_opt = false, copy_routes_opt = false;
+	enum fwd_ports_mode fwd_default = FWD_NONE;
 	bool v4_only = false, v6_only = false;
-	char *runas = NULL, *logfile = NULL;
-	struct in6_addr *dns6 = c->ip6.dns;
+	unsigned dns4_idx = 0, dns6_idx = 0;
+	unsigned long max_mtu = IP_MAX_MTU;
 	struct fqdn *dnss = c->dns_search;
-	struct in_addr *dns4 = c->ip4.dns;
 	unsigned int ifi4 = 0, ifi6 = 0;
-	const char *optstring;
-	int name, ret, b, i;
+	const char *logfile = NULL;
 	size_t logsize = 0;
+	char *runas = NULL;
+	long fd_tap_opt;
+	int name, ret;
 	uid_t uid;
 	gid_t gid;
 
 	if (c->mode == MODE_PASTA) {
 		c->no_dhcp_dns = c->no_dhcp_dns_search = 1;
-		optstring = "dqfel:hF:I:p:P:m:a:n:M:g:i:o:D:S:46t:u:T:U:";
-	} else {
-		optstring = "dqfel:hs:F:p:P:m:a:n:M:g:i:o:D:S:461t:u:";
+		fwd_default = FWD_AUTO;
 	}
 
-	c->tcp.fwd_in.mode = c->tcp.fwd_out.mode = 0;
-	c->udp.fwd_in.f.mode = c->udp.fwd_out.f.mode = 0;
+	if (tap_l2_max_len(c) - ETH_HLEN < max_mtu)
+		max_mtu = tap_l2_max_len(c) - ETH_HLEN;
+	c->mtu = ROUND_DOWN(max_mtu, sizeof(uint32_t));
+	c->tcp.fwd_in.mode = c->tcp.fwd_out.mode = FWD_UNSET;
+	c->udp.fwd_in.mode = c->udp.fwd_out.mode = FWD_UNSET;
+	memcpy(c->our_tap_mac, MAC_OUR_LAA, ETH_ALEN);
 
+	optind = 0;
 	do {
 		name = getopt_long(argc, argv, optstring, options, NULL);
 
@@ -1233,6 +1481,8 @@ void conf(struct ctx *c, int argc, char **argv)
 			if (ret <= 0 || ret >= (int)sizeof(userns))
 				die("Invalid userns: %s", optarg);
 
+			netns_only = 0;
+
 			break;
 		case 3:
 			if (c->mode != MODE_PASTA)
@@ -1244,14 +1494,7 @@ void conf(struct ctx *c, int argc, char **argv)
 			if (c->mode != MODE_PASTA)
 				die("--ns-mac-addr is for pasta mode only");
 
-			for (i = 0; i < ETH_ALEN; i++) {
-				errno = 0;
-				b = strtol(optarg + (intptr_t)i * 3, NULL, 16);
-				if (b < 0 || b > UCHAR_MAX || errno)
-					die("Invalid MAC address: %s", optarg);
-
-				c->mac_guest[i] = b;
-			}
+			parse_mac(c->guest_mac, optarg);
 			break;
 		case 5:
 			if (c->mode != MODE_PASTA)
@@ -1260,7 +1503,7 @@ void conf(struct ctx *c, int argc, char **argv)
 			c->no_dhcp_dns = 0;
 			break;
 		case 6:
-			if (c->mode != MODE_PASST)
+			if (c->mode == MODE_PASTA)
 				die("--no-dhcp-dns is for passt mode only");
 
 			c->no_dhcp_dns = 1;
@@ -1272,20 +1515,18 @@ void conf(struct ctx *c, int argc, char **argv)
 			c->no_dhcp_dns_search = 0;
 			break;
 		case 8:
-			if (c->mode != MODE_PASST)
+			if (c->mode == MODE_PASTA)
 				die("--no-dhcp-search is for passt mode only");
 
 			c->no_dhcp_dns_search = 1;
 			break;
 		case 9:
-			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_match)     &&
-			    inet_pton(AF_INET6, optarg, &c->ip6.dns_match) &&
+			if (inet_pton(AF_INET6, optarg, &c->ip6.dns_match) &&
 			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_match)    &&
 			    !IN6_IS_ADDR_LOOPBACK(&c->ip6.dns_match))
 				break;
 
-			if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_match)    &&
-			    inet_pton(AF_INET, optarg, &c->ip4.dns_match) &&
+			if (inet_pton(AF_INET, optarg, &c->ip4.dns_match) &&
 			    !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_match)   &&
 			    !IN4_IS_ADDR_BROADCAST(&c->ip4.dns_match)     &&
 			    !IN4_IS_ADDR_LOOPBACK(&c->ip4.dns_match))
@@ -1300,24 +1541,13 @@ void conf(struct ctx *c, int argc, char **argv)
 			c->no_netns_quit = 1;
 			break;
 		case 11:
-			if (c->trace)
-				die("Multiple --trace options given");
-
-			if (c->quiet)
-				die("Either --trace or --quiet");
-
 			c->trace = c->debug = 1;
+			c->quiet = 0;
 			break;
 		case 12:
-			if (runas)
-				die("Multiple --runas options given");
-
 			runas = optarg;
 			break;
 		case 13:
-			if (logsize)
-				die("Multiple --log-size options given");
-
 			errno = 0;
 			logsize = strtol(optarg, NULL, 0);
 
@@ -1326,14 +1556,11 @@ void conf(struct ctx *c, int argc, char **argv)
 
 			break;
 		case 14:
-			fprintf(stdout,
-				c->mode == MODE_PASST ? "passt " : "pasta ");
-			fprintf(stdout, VERSION_BLOB);
-			exit(EXIT_SUCCESS);
+			FPRINTF(stdout,
+				c->mode == MODE_PASTA ? "pasta " : "passt ");
+			FPRINTF(stdout, VERSION_BLOB);
+			_exit(EXIT_SUCCESS);
 		case 15:
-			if (*c->ip4.ifname_out)
-				die("Redundant outbound interface: %s", optarg);
-
 			ret = snprintf(c->ip4.ifname_out,
 				       sizeof(c->ip4.ifname_out), "%s", optarg);
 			if (ret <= 0 || ret >= (int)sizeof(c->ip4.ifname_out))
@@ -1341,9 +1568,6 @@ void conf(struct ctx *c, int argc, char **argv)
 
 			break;
 		case 16:
-			if (*c->ip6.ifname_out)
-				die("Redundant outbound interface: %s", optarg);
-
 			ret = snprintf(c->ip6.ifname_out,
 				       sizeof(c->ip6.ifname_out), "%s", optarg);
 			if (ret <= 0 || ret >= (int)sizeof(c->ip6.ifname_out))
@@ -1361,146 +1585,172 @@ void conf(struct ctx *c, int argc, char **argv)
 				die("--no-copy-routes is for pasta mode only");
 
 			warn("--no-copy-routes will be dropped soon");
-			c->no_copy_routes = copy_routes_opt = true;
+			c->ip4.no_copy_routes = c->ip6.no_copy_routes = true;
+			copy_routes_opt = true;
 			break;
 		case 19:
 			if (c->mode != MODE_PASTA)
 				die("--no-copy-addrs is for pasta mode only");
 
 			warn("--no-copy-addrs will be dropped soon");
-			c->no_copy_addrs = copy_addrs_opt = true;
+			c->ip4.no_copy_addrs = c->ip6.no_copy_addrs = true;
+			copy_addrs_opt = true;
+			break;
+		case 20:
+			if (c->mode != MODE_PASTA)
+				die("--netns-only is for pasta mode only");
+
+			netns_only = 1;
+			*userns = 0;
+			break;
+		case 21:
+			conf_nat(optarg, &c->ip4.map_host_loopback,
+				 &c->ip6.map_host_loopback, &no_map_gw);
+			break;
+		case 22:
+			conf_nat(optarg, &c->ip4.map_guest_addr,
+				 &c->ip6.map_guest_addr, NULL);
+			break;
+		case 23:
+			if (c->mode != MODE_PASTA)
+				die("--host-lo-to-ns-lo is for pasta mode only");
+			c->host_lo_to_ns_lo = 1;
+			break;
+		case 24:
+			if (inet_pton(AF_INET6, optarg, &c->ip6.dns_host) &&
+			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.dns_host))
+				break;
+
+			if (inet_pton(AF_INET, optarg, &c->ip4.dns_host) &&
+			    !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.dns_host)   &&
+			    !IN4_IS_ADDR_BROADCAST(&c->ip4.dns_host))
+				break;
+
+			die("Invalid host nameserver address: %s", optarg);
+		case 25:
+			/* Already handled in conf_mode() */
+			ASSERT(c->mode == MODE_VU);
+			break;
+		case 26:
+			vu_print_capabilities();
+			break;
+		case 27:
+			if (snprintf_check(c->fqdn, PASST_MAXDNAME,
+					   "%s", optarg))
+				die("Invalid FQDN: %s", optarg);
+			break;
+		case 28:
+			if (c->mode != MODE_VU && strcmp(optarg, "none"))
+				die("--repair-path is for vhost-user mode only");
+
+			if (snprintf_check(c->repair_path,
+					   sizeof(c->repair_path), "%s",
+					   optarg))
+				die("Invalid passt-repair path: %s", optarg);
+
 			break;
 		case 'd':
-			if (c->debug)
-				die("Multiple --debug options given");
-
-			if (c->quiet)
-				die("Either --debug or --quiet");
-
 			c->debug = 1;
+			c->quiet = 0;
 			break;
 		case 'e':
-			if (logfile)
-				die("Can't log to both file and stderr");
-
-			if (c->force_stderr)
-				die("Multiple --stderr options given");
-
-			c->force_stderr = 1;
+			warn("--stderr will be dropped soon");
 			break;
 		case 'l':
-			if (c->force_stderr)
-				die("Can't log to both stderr and file");
-
-			if (logfile)
-				die("Multiple --log-file options given");
-
 			logfile = optarg;
 			break;
 		case 'q':
-			if (c->quiet)
-				die("Multiple --quiet options given");
-
-			if (c->debug)
-				die("Either --debug or --quiet");
-
 			c->quiet = 1;
+			c->debug = c->trace = 0;
 			break;
 		case 'f':
-			if (c->foreground)
-				die("Multiple --foreground options given");
-
 			c->foreground = 1;
 			break;
 		case 's':
-			if (*c->sock_path)
-				die("Multiple --socket options given");
+			if (c->mode == MODE_PASTA)
+				die("-s is for passt / vhost-user mode only");
 
-			ret = snprintf(c->sock_path, UNIX_SOCK_MAX - 1, "%s",
+			ret = snprintf(c->sock_path, sizeof(c->sock_path), "%s",
 				       optarg);
 			if (ret <= 0 || ret >= (int)sizeof(c->sock_path))
 				die("Invalid socket path: %s", optarg);
 
+			c->fd_tap = -1;
 			break;
 		case 'F':
-			if (c->fd_tap >= 0)
-				die("Multiple --fd options given");
-
 			errno = 0;
-			c->fd_tap = strtol(optarg, NULL, 0);
+			fd_tap_opt = strtol(optarg, NULL, 0);
 
-			if (c->fd_tap < 0 || errno)
+			if (errno ||
+			    fd_tap_opt <= STDERR_FILENO || fd_tap_opt > INT_MAX)
 				die("Invalid --fd: %s", optarg);
 
+			c->fd_tap = fd_tap_opt;
 			c->one_off = true;
-
+			*c->sock_path = 0;
 			break;
 		case 'I':
-			if (*c->pasta_ifn)
-				die("Multiple --ns-ifname options given");
+			if (c->mode != MODE_PASTA)
+				die("-I is for pasta mode only");
 
-			ret = snprintf(c->pasta_ifn, IFNAMSIZ - 1, "%s",
+			ret = snprintf(c->pasta_ifn, IFNAMSIZ, "%s",
 				       optarg);
-			if (ret <= 0 || ret >= IFNAMSIZ - 1)
+			if (ret <= 0 || ret >= IFNAMSIZ)
 				die("Invalid interface name: %s", optarg);
 
 			break;
 		case 'p':
-			if (*c->pcap)
-				die("Multiple --pcap options given");
-
 			ret = snprintf(c->pcap, sizeof(c->pcap), "%s", optarg);
 			if (ret <= 0 || ret >= (int)sizeof(c->pcap))
 				die("Invalid pcap path: %s", optarg);
 
 			break;
 		case 'P':
-			if (*c->pid_file)
-				die("Multiple --pid options given");
-
-			ret = snprintf(c->pid_file, sizeof(c->pid_file), "%s",
+			ret = snprintf(c->pidfile, sizeof(c->pidfile), "%s",
 				       optarg);
-			if (ret <= 0 || ret >= (int)sizeof(c->pid_file))
+			if (ret <= 0 || ret >= (int)sizeof(c->pidfile))
 				die("Invalid PID file: %s", optarg);
 
 			break;
-		case 'm':
-			if (c->mtu)
-				die("Multiple --mtu options given");
+		case 'm': {
+			unsigned long mtu;
+			char *e;
 
 			errno = 0;
-			c->mtu = strtol(optarg, NULL, 0);
+			mtu = strtoul(optarg, &e, 0);
 
-			if (!c->mtu) {
-				c->mtu = -1;
-				break;
-			}
-
-			if (c->mtu < ETH_MIN_MTU || c->mtu > (int)ETH_MAX_MTU ||
-			    errno)
+			if (errno || *e)
 				die("Invalid MTU: %s", optarg);
 
-			break;
-		case 'a':
-			if (c->mode == MODE_PASTA)
-				c->no_copy_addrs = 1;
+			if (mtu > max_mtu) {
+				die("MTU %lu too large (max %lu)",
+				    mtu, max_mtu);
+			}
 
-			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr)	&&
-			    inet_pton(AF_INET6, optarg, &c->ip6.addr)	&&
+			c->mtu = mtu;
+			break;
+		}
+		case 'a':
+			if (inet_pton(AF_INET6, optarg, &c->ip6.addr)	&&
 			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr)	&&
 			    !IN6_IS_ADDR_LOOPBACK(&c->ip6.addr)		&&
 			    !IN6_IS_ADDR_V4MAPPED(&c->ip6.addr)		&&
 			    !IN6_IS_ADDR_V4COMPAT(&c->ip6.addr)		&&
-			    !IN6_IS_ADDR_MULTICAST(&c->ip6.addr))
+			    !IN6_IS_ADDR_MULTICAST(&c->ip6.addr)) {
+				if (c->mode == MODE_PASTA)
+					c->ip6.no_copy_addrs = true;
 				break;
+			}
 
-			if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.addr)	&&
-			    inet_pton(AF_INET, optarg, &c->ip4.addr)	&&
+			if (inet_pton(AF_INET, optarg, &c->ip4.addr)	&&
 			    !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.addr)	&&
 			    !IN4_IS_ADDR_BROADCAST(&c->ip4.addr)	&&
 			    !IN4_IS_ADDR_LOOPBACK(&c->ip4.addr)		&&
-			    !IN4_IS_ADDR_MULTICAST(&c->ip4.addr))
+			    !IN4_IS_ADDR_MULTICAST(&c->ip4.addr)) {
+				if (c->mode == MODE_PASTA)
+					c->ip4.no_copy_addrs = true;
 				break;
+			}
 
 			die("Invalid address: %s", optarg);
 			break;
@@ -1511,45 +1761,34 @@ void conf(struct ctx *c, int argc, char **argv)
 
 			break;
 		case 'M':
-			for (i = 0; i < ETH_ALEN; i++) {
-				errno = 0;
-				b = strtol(optarg + (intptr_t)i * 3, NULL, 16);
-				if (b < 0 || b > UCHAR_MAX || errno)
-					die("Invalid MAC address: %s", optarg);
-
-				c->mac[i] = b;
-			}
+			parse_mac(c->our_tap_mac, optarg);
 			break;
 		case 'g':
-			if (c->mode == MODE_PASTA)
-				c->no_copy_routes = 1;
-
-			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.gw)		&&
-			    inet_pton(AF_INET6, optarg, &c->ip6.gw)	&&
-			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.gw)	&&
-			    !IN6_IS_ADDR_LOOPBACK(&c->ip6.gw))
+			if (inet_pton(AF_INET6, optarg, &c->ip6.guest_gw) &&
+			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.guest_gw)	&&
+			    !IN6_IS_ADDR_LOOPBACK(&c->ip6.guest_gw)) {
+				if (c->mode == MODE_PASTA)
+					c->ip6.no_copy_routes = true;
 				break;
+			}
 
-			if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.gw)		&&
-			    inet_pton(AF_INET, optarg, &c->ip4.gw)	&&
-			    !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.gw)	&&
-			    !IN4_IS_ADDR_BROADCAST(&c->ip4.gw)		&&
-			    !IN4_IS_ADDR_LOOPBACK(&c->ip4.gw))
+			if (inet_pton(AF_INET, optarg, &c->ip4.guest_gw) &&
+			    !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.guest_gw)	&&
+			    !IN4_IS_ADDR_BROADCAST(&c->ip4.guest_gw)	&&
+			    !IN4_IS_ADDR_LOOPBACK(&c->ip4.guest_gw)) {
+				if (c->mode == MODE_PASTA)
+					c->ip4.no_copy_routes = true;
 				break;
+			}
 
 			die("Invalid gateway address: %s", optarg);
 			break;
 		case 'i':
-			if (ifi4 || ifi6)
-				die("Redundant interface: %s", optarg);
-
 			if (!(ifi4 = ifi6 = if_nametoindex(optarg)))
-				die("Invalid interface name %s: %s", optarg,
-				    strerror(errno));
+				die_perror("Invalid interface name %s", optarg);
 			break;
 		case 'o':
-			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_out)	  &&
-			    inet_pton(AF_INET6, optarg, &c->ip6.addr_out) &&
+			if (inet_pton(AF_INET6, optarg, &c->ip6.addr_out) &&
 			    !IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_out)	  &&
 			    !IN6_IS_ADDR_LOOPBACK(&c->ip6.addr_out)	  &&
 			    !IN6_IS_ADDR_V4MAPPED(&c->ip6.addr_out)	  &&
@@ -1557,8 +1796,7 @@ void conf(struct ctx *c, int argc, char **argv)
 			    !IN6_IS_ADDR_MULTICAST(&c->ip6.addr_out))
 				break;
 
-			if (IN4_IS_ADDR_UNSPECIFIED(&c->ip4.addr_out)	 &&
-			    inet_pton(AF_INET, optarg, &c->ip4.addr_out) &&
+			if (inet_pton(AF_INET, optarg, &c->ip4.addr_out) &&
 			    !IN4_IS_ADDR_UNSPECIFIED(&c->ip4.addr_out)	 &&
 			    !IN4_IS_ADDR_BROADCAST(&c->ip4.addr_out)	 &&
 			    !IN4_IS_ADDR_MULTICAST(&c->ip4.addr_out))
@@ -1567,49 +1805,16 @@ void conf(struct ctx *c, int argc, char **argv)
 			die("Invalid or redundant outbound address: %s",
 			    optarg);
 			break;
-		case 'D':
-			if (!strcmp(optarg, "none")) {
-				if (c->no_dns)
-					die("Redundant DNS options");
-
-				if (dns4 - c->ip4.dns || dns6 - c->ip6.dns)
-					die("Conflicting DNS options");
-
-				c->no_dns = 1;
-				break;
-			}
-
-			if (c->no_dns)
-				die("Conflicting DNS options");
-
-			if (dns4 - &c->ip4.dns[0] < ARRAY_SIZE(c->ip4.dns) &&
-			    inet_pton(AF_INET, optarg, dns4)) {
-				dns4++;
-				break;
-			}
-
-			if (dns6 - &c->ip6.dns[0] < ARRAY_SIZE(c->ip6.dns) &&
-			    inet_pton(AF_INET6, optarg, dns6)) {
-				dns6++;
-				break;
-			}
-
-			die("Cannot use DNS address %s", optarg);
-			break;
 		case 'S':
 			if (!strcmp(optarg, "none")) {
-				if (c->no_dns_search)
-					die("Redundant DNS search options");
-
-				if (dnss != c->dns_search)
-					die("Conflicting DNS search options");
-
 				c->no_dns_search = 1;
+
+				memset(c->dns_search, 0, sizeof(c->dns_search));
+
 				break;
 			}
 
-			if (c->no_dns_search)
-				die("Conflicting DNS search options");
+			c->no_dns_search = 0;
 
 			if (dnss - c->dns_search < ARRAY_SIZE(c->dns_search)) {
 				ret = snprintf(dnss->n, sizeof(*c->dns_search),
@@ -1623,43 +1828,49 @@ void conf(struct ctx *c, int argc, char **argv)
 
 			die("Cannot use DNS search domain %s", optarg);
 			break;
+		case 'H':
+			if (snprintf_check(c->hostname, PASST_MAXDNAME,
+					   "%s", optarg))
+				die("Invalid hostname: %s", optarg);
+			break;
 		case '4':
 			v4_only = true;
+			v6_only = false;
 			break;
 		case '6':
 			v6_only = true;
+			v4_only = false;
 			break;
 		case '1':
-			if (c->mode != MODE_PASST)
+			if (c->mode == MODE_PASTA)
 				die("--one-off is for passt mode only");
-
-			if (c->one_off)
-				die("Redundant --one-off option");
 
 			c->one_off = true;
 			break;
 		case 't':
 		case 'u':
-		case 'T':
-		case 'U':
+		case 'D':
 			/* Handle these later, once addresses are configured */
 			break;
+		case 'T':
+		case 'U':
+			if (c->mode != MODE_PASTA)
+				die("-%c is for pasta mode only", name);
+
+			/* Handle properly later, once addresses are configured */
+			break;
 		case 'h':
-			log_to_stdout = 1;
-			print_usage(argv[0], EXIT_SUCCESS);
+			usage(argv[0], stdout, EXIT_SUCCESS);
 			break;
 		case '?':
 		default:
-			usage(argv[0]);
+			usage(argv[0], stderr, EXIT_FAILURE);
 			break;
 		}
 	} while (name != -1);
 
-	if (v4_only && v6_only)
-		die("Options ipv4-only and ipv6-only are mutually exclusive");
-
-	if (*c->sock_path && c->fd_tap >= 0)
-		die("Options --socket and --fd are mutually exclusive");
+	if (c->mode != MODE_PASTA)
+		c->no_splice = 1;
 
 	if (c->mode == MODE_PASTA && !c->pasta_conf_ns) {
 		if (copy_routes_opt)
@@ -1676,37 +1887,113 @@ void conf(struct ctx *c, int argc, char **argv)
 
 	conf_ugid(runas, &uid, &gid);
 
-	if (logfile) {
-		logfile_init(c->mode == MODE_PASST ? "passt" : "pasta",
-			     logfile, logsize);
-	}
+	if (logfile)
+		logfile_init(logname, logfile, logsize);
+	else
+		__openlog(logname, 0, LOG_DAEMON);
+
+	if (c->debug)
+		__setlogmask(LOG_UPTO(LOG_DEBUG));
+	else if (c->quiet)
+		__setlogmask(LOG_UPTO(LOG_WARNING));
+	else
+		__setlogmask(LOG_UPTO(LOG_INFO));
+
+	log_conf_parsed = true;		/* Stop printing everything */
 
 	nl_sock_init(c, false);
 	if (!v6_only)
-		c->ifi4 = conf_ip4(ifi4, &c->ip4, c->mac);
+		c->ifi4 = conf_ip4(ifi4, &c->ip4);
 	if (!v4_only)
-		c->ifi6 = conf_ip6(ifi6, &c->ip6, c->mac);
-	if ((!c->ifi4 && !c->ifi6) ||
-	    (*c->ip4.ifname_out && !c->ifi4) ||
+		c->ifi6 = conf_ip6(ifi6, &c->ip6);
+
+	if (c->ifi4 && c->mtu < IPV4_MIN_MTU) {
+		warn("MTU %"PRIu16" is too small for IPv4 (minimum %u)",
+		     c->mtu, IPV4_MIN_MTU);
+	}
+	if (c->ifi6 && c->mtu < IPV6_MIN_MTU) {
+		warn("MTU %"PRIu16" is too small for IPv6 (minimum %u)",
+			     c->mtu, IPV6_MIN_MTU);
+	}
+
+	if ((*c->ip4.ifname_out && !c->ifi4) ||
 	    (*c->ip6.ifname_out && !c->ifi6))
 		die("External interface not usable");
 
-	if (c->ifi4 && IN4_IS_ADDR_UNSPECIFIED(&c->ip4.gw))
-		c->no_map_gw = c->no_dhcp = 1;
 
-	if (c->ifi6 && IN6_IS_ADDR_UNSPECIFIED(&c->ip6.gw))
-		c->no_map_gw = 1;
+	if (!c->ifi4 && !c->ifi6) {
+		info("No external interface as template, switch to local mode");
 
-	/* Inbound port options can be parsed now (after IPv4/IPv6 settings) */
-	optind = 1;
+		conf_ip4_local(&c->ip4);
+		c->ifi4 = -1;
+
+		conf_ip6_local(&c->ip6);
+		c->ifi6 = -1;
+
+		if (!*c->pasta_ifn) {
+			strncpy(c->pasta_ifn, pasta_default_ifn,
+				sizeof(c->pasta_ifn) - 1);
+		}
+	}
+
+	if (c->ifi4 && !no_map_gw &&
+	    IN4_IS_ADDR_UNSPECIFIED(&c->ip4.map_host_loopback))
+		c->ip4.map_host_loopback = c->ip4.guest_gw;
+
+	if (c->ifi6 && !no_map_gw &&
+	    IN6_IS_ADDR_UNSPECIFIED(&c->ip6.map_host_loopback))
+		c->ip6.map_host_loopback = c->ip6.guest_gw;
+
+	if (c->ifi4 && IN4_IS_ADDR_UNSPECIFIED(&c->ip4.guest_gw))
+		c->no_dhcp = 1;
+
+	/* Inbound port options and DNS can be parsed now, after IPv4/IPv6
+	 * settings
+	 */
+	fwd_probe_ephemeral();
+	udp_portmap_clear();
+	optind = 0;
 	do {
-		struct port_fwd *fwd;
-
 		name = getopt_long(argc, argv, optstring, options, NULL);
 
-		if ((name == 't' && (fwd = &c->tcp.fwd_in)) ||
-		    (name == 'u' && (fwd = &c->udp.fwd_in.f))) {
-			conf_ports(c, name, optarg, fwd);
+		if (name == 't') {
+			conf_ports(c, name, optarg, &c->tcp.fwd_in);
+		} else if (name == 'u') {
+			conf_ports(c, name, optarg, &c->udp.fwd_in);
+		} else if (name == 'D') {
+			struct in6_addr dns6_tmp;
+			struct in_addr dns4_tmp;
+
+			if (!strcmp(optarg, "none")) {
+				c->no_dns = 1;
+
+				dns4_idx = 0;
+				memset(c->ip4.dns, 0, sizeof(c->ip4.dns));
+				c->ip4.dns[0]    = (struct in_addr){ 0 };
+				c->ip4.dns_match = (struct in_addr){ 0 };
+				c->ip4.dns_host  = (struct in_addr){ 0 };
+
+				dns6_idx = 0;
+				memset(c->ip6.dns, 0, sizeof(c->ip6.dns));
+				c->ip6.dns_match = (struct in6_addr){ 0 };
+				c->ip6.dns_host  = (struct in6_addr){ 0 };
+
+				continue;
+			}
+
+			c->no_dns = 0;
+
+			if (inet_pton(AF_INET, optarg, &dns4_tmp)) {
+				dns4_idx += add_dns4(c, &dns4_tmp, dns4_idx);
+				continue;
+			}
+
+			if (inet_pton(AF_INET6, optarg, &dns6_tmp)) {
+				dns6_idx += add_dns6(c, &dns6_tmp, dns6_idx);
+				continue;
+			}
+
+			die("Cannot use DNS address %s", optarg);
 		}
 	} while (name != -1);
 
@@ -1714,6 +2001,8 @@ void conf(struct ctx *c, int argc, char **argv)
 		conf_pasta_ns(&netns_only, userns, netns, optind, argc, argv);
 	else if (optind != argc)
 		die("Extra non-option argument: %s", argv[optind]);
+
+	conf_open_files(c);	/* Before any possible setuid() / setgid() */
 
 	isolate_user(uid, gid, !netns_only, userns, c->mode);
 
@@ -1733,16 +2022,14 @@ void conf(struct ctx *c, int argc, char **argv)
 		nl_sock_init(c, true);
 
 	/* ...and outbound port options now that namespaces are set up. */
-	optind = 1;
+	optind = 0;
 	do {
-		struct port_fwd *fwd;
-
 		name = getopt_long(argc, argv, optstring, options, NULL);
 
-		if ((name == 'T' && (fwd = &c->tcp.fwd_out)) ||
-		    (name == 'U' && (fwd = &c->udp.fwd_out.f))) {
-			conf_ports(c, name, optarg, fwd);
-		}
+		if (name == 'T')
+			conf_ports(c, name, optarg, &c->tcp.fwd_out);
+		else if (name == 'U')
+			conf_ports(c, name, optarg, &c->udp.fwd_out);
 	} while (name != -1);
 
 	if (!c->ifi4)
@@ -1751,54 +2038,29 @@ void conf(struct ctx *c, int argc, char **argv)
 	if (!c->ifi6) {
 		c->no_ndp = 1;
 		c->no_dhcpv6 = 1;
+	} else if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr)) {
+		c->no_dhcpv6 = 1;
 	}
-
-	if (!c->mtu)
-		c->mtu = ROUND_DOWN(ETH_MAX_MTU - ETH_HLEN, sizeof(uint32_t));
 
 	get_dns(c);
 
 	if (!*c->pasta_ifn) {
-		if (c->ifi4)
+		if (c->ifi4 > 0)
 			if_indextoname(c->ifi4, c->pasta_ifn);
-		else
+		else if (c->ifi6 > 0)
 			if_indextoname(c->ifi6, c->pasta_ifn);
 	}
 
-	if (c->mode == MODE_PASTA) {
-		c->proc_net_tcp[V4][0] = c->proc_net_tcp[V4][1] = -1;
-		c->proc_net_tcp[V6][0] = c->proc_net_tcp[V6][1] = -1;
-		c->proc_net_udp[V4][0] = c->proc_net_udp[V4][1] = -1;
-		c->proc_net_udp[V6][0] = c->proc_net_udp[V6][1] = -1;
+	if (!c->tcp.fwd_in.mode)
+		c->tcp.fwd_in.mode = fwd_default;
+	if (!c->tcp.fwd_out.mode)
+		c->tcp.fwd_out.mode = fwd_default;
+	if (!c->udp.fwd_in.mode)
+		c->udp.fwd_in.mode = fwd_default;
+	if (!c->udp.fwd_out.mode)
+		c->udp.fwd_out.mode = fwd_default;
 
-		if (!c->tcp.fwd_in.mode || c->tcp.fwd_in.mode == FWD_AUTO) {
-			c->tcp.fwd_in.mode = FWD_AUTO;
-			ns_ports_arg.proto = IPPROTO_TCP;
-			NS_CALL(get_bound_ports_ns, &ns_ports_arg);
-		}
-		if (!c->udp.fwd_in.f.mode || c->udp.fwd_in.f.mode == FWD_AUTO) {
-			c->udp.fwd_in.f.mode = FWD_AUTO;
-			ns_ports_arg.proto = IPPROTO_UDP;
-			NS_CALL(get_bound_ports_ns, &ns_ports_arg);
-		}
-		if (!c->tcp.fwd_out.mode || c->tcp.fwd_out.mode == FWD_AUTO) {
-			c->tcp.fwd_out.mode = FWD_AUTO;
-			get_bound_ports(c, 0, IPPROTO_TCP);
-		}
-		if (!c->udp.fwd_out.f.mode || c->udp.fwd_out.f.mode == FWD_AUTO) {
-			c->udp.fwd_out.f.mode = FWD_AUTO;
-			get_bound_ports(c, 0, IPPROTO_UDP);
-		}
-	} else {
-		if (!c->tcp.fwd_in.mode)
-			c->tcp.fwd_in.mode = FWD_NONE;
-		if (!c->tcp.fwd_out.mode)
-			c->tcp.fwd_out.mode = FWD_NONE;
-		if (!c->udp.fwd_in.f.mode)
-			c->udp.fwd_in.f.mode = FWD_NONE;
-		if (!c->udp.fwd_out.f.mode)
-			c->udp.fwd_out.f.mode = FWD_NONE;
-	}
+	fwd_scan_ports_init(c);
 
 	if (!c->quiet)
 		conf_print(c);

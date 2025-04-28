@@ -33,298 +33,297 @@
 
 #include "packet.h"
 #include "util.h"
+#include "ip.h"
 #include "passt.h"
 #include "tap.h"
 #include "log.h"
+#include "siphash.h"
+#include "inany.h"
 #include "icmp.h"
+#include "flow_table.h"
 
 #define ICMP_ECHO_TIMEOUT	60 /* s, timeout for ICMP socket activity */
 #define ICMP_NUM_IDS		(1U << 16)
 
 /**
- * struct icmp_id_sock - Tracking information for single ICMP echo identifier
- * @sock:	Bound socket for identifier
- * @seq:	Last sequence number sent to tap, host order, -1: not sent yet
- * @ts:		Last associated activity from tap, seconds
+ * ping_at_sidx() - Get ping specific flow at given sidx
+ * @sidx:	Flow and side to retrieve
+ *
+ * Return: ping specific flow at @sidx, or NULL of @sidx is invalid.  Asserts if
+ *         the flow at @sidx is not FLOW_PING4 or FLOW_PING6
  */
-struct icmp_id_sock {
-	int sock;
-	int seq;
-	time_t ts;
-};
+static struct icmp_ping_flow *ping_at_sidx(flow_sidx_t sidx)
+{
+	union flow *flow = flow_at_sidx(sidx);
 
-/* Indexed by ICMP echo identifier */
-static struct icmp_id_sock icmp_id_map[IP_VERSIONS][ICMP_NUM_IDS];
+	if (!flow)
+		return NULL;
 
-/* Bitmaps, activity monitoring needed for identifier */
-static uint8_t icmp_act[IP_VERSIONS][DIV_ROUND_UP(ICMP_NUM_IDS, 8)];
+	ASSERT(flow->f.type == FLOW_PING4 || flow->f.type == FLOW_PING6);
+	return &flow->ping;
+}
 
 /**
- * icmp_sock_handler() - Handle new data from socket
+ * icmp_sock_handler() - Handle new data from ICMP or ICMPv6 socket
  * @c:		Execution context
  * @ref:	epoll reference
- * @events:	epoll events bitmap
- * @now:	Current timestamp, unused
  */
-void icmp_sock_handler(const struct ctx *c, union epoll_ref ref,
-		       uint32_t events, const struct timespec *now)
+void icmp_sock_handler(const struct ctx *c, union epoll_ref ref)
 {
-	union icmp_epoll_ref *iref = &ref.r.p.icmp;
-	struct sockaddr_storage sr;
+	struct icmp_ping_flow *pingf = ping_at_sidx(ref.flowside);
+	const struct flowside *ini = &pingf->f.side[INISIDE];
+	union sockaddr_inany sr;
 	socklen_t sl = sizeof(sr);
 	char buf[USHRT_MAX];
-	uint16_t seq, id;
+	uint16_t seq;
 	ssize_t n;
 
-	(void)events;
-	(void)now;
-
-	n = recvfrom(ref.r.s, buf, sizeof(buf), 0, (struct sockaddr *)&sr, &sl);
-	if (n < 0)
+	if (c->no_icmp)
 		return;
 
-	if (iref->icmp.v6) {
-		struct sockaddr_in6 *sr6 = (struct sockaddr_in6 *)&sr;
-		struct icmp6hdr *ih = (struct icmp6hdr *)buf;
+	ASSERT(pingf);
 
-		id = ntohs(ih->icmp6_identifier);
-		seq = ntohs(ih->icmp6_sequence);
-
-		/* If bind() fails e.g. because of a broken SELinux policy, this
-		 * might happen. Fix up the identifier to match the sent one.
-		 */
-		if (id != iref->icmp.id)
-			ih->icmp6_identifier = htons(iref->icmp.id);
-
-		/* In PASTA mode, we'll get any reply we send, discard them. */
-		if (c->mode == MODE_PASTA) {
-			if (icmp_id_map[V6][id].seq == seq)
-				return;
-
-			icmp_id_map[V6][id].seq = seq;
-		}
-
-		debug("ICMPv6: echo %s to tap, ID: %i, seq: %i",
-		      (ih->icmp6_type == 128) ? "request" : "reply", id, seq);
-
-		tap_icmp6_send(c, &sr6->sin6_addr,
-			       tap_ip6_daddr(c, &sr6->sin6_addr), buf, n);
-	} else {
-		struct sockaddr_in *sr4 = (struct sockaddr_in *)&sr;
-		struct icmphdr *ih = (struct icmphdr *)buf;
-
-		id = ntohs(ih->un.echo.id);
-		seq = ntohs(ih->un.echo.sequence);
-
-		if (id != iref->icmp.id)
-			ih->un.echo.id = htons(iref->icmp.id);
-
-		if (c->mode == MODE_PASTA) {
-
-			if (icmp_id_map[V4][id].seq == seq)
-				return;
-
-			icmp_id_map[V4][id].seq = seq;
-		}
-
-		debug("ICMP: echo %s to tap, ID: %i, seq: %i",
-		      (ih->type == ICMP_ECHO) ? "request" : "reply", id, seq);
-
-		tap_icmp4_send(c, sr4->sin_addr, tap_ip4_daddr(c), buf, n);
+	n = recvfrom(ref.fd, buf, sizeof(buf), 0, &sr.sa, &sl);
+	if (n < 0) {
+		flow_perror(pingf, "recvfrom() error");
+		return;
 	}
+
+	if (pingf->f.type == FLOW_PING4) {
+		struct icmphdr *ih4 = (struct icmphdr *)buf;
+
+		if (sr.sa_family != AF_INET || (size_t)n < sizeof(*ih4) ||
+		    ih4->type != ICMP_ECHOREPLY)
+			goto unexpected;
+
+		/* Adjust packet back to guest-side ID */
+		ih4->un.echo.id = htons(ini->eport);
+		seq = ntohs(ih4->un.echo.sequence);
+	} else if (pingf->f.type == FLOW_PING6) {
+		struct icmp6hdr *ih6 = (struct icmp6hdr *)buf;
+
+		if (sr.sa_family != AF_INET6 || (size_t)n < sizeof(*ih6) ||
+		    ih6->icmp6_type != ICMPV6_ECHO_REPLY)
+			goto unexpected;
+
+		/* Adjust packet back to guest-side ID */
+		ih6->icmp6_identifier = htons(ini->eport);
+		seq = ntohs(ih6->icmp6_sequence);
+	} else {
+		ASSERT(0);
+	}
+
+	/* In PASTA mode, we'll get any reply we send, discard them. */
+	if (c->mode == MODE_PASTA) {
+		if (pingf->seq == seq)
+			return;
+
+		pingf->seq = seq;
+	}
+
+	flow_dbg(pingf, "echo reply to tap, ID: %"PRIu16", seq: %"PRIu16,
+		 ini->eport, seq);
+
+	if (pingf->f.type == FLOW_PING4) {
+		const struct in_addr *saddr = inany_v4(&ini->oaddr);
+		const struct in_addr *daddr = inany_v4(&ini->eaddr);
+
+		ASSERT(saddr && daddr); /* Must have IPv4 addresses */
+		tap_icmp4_send(c, *saddr, *daddr, buf, n);
+	} else if (pingf->f.type == FLOW_PING6) {
+		const struct in6_addr *saddr = &ini->oaddr.a6;
+		const struct in6_addr *daddr = &ini->eaddr.a6;
+
+		tap_icmp6_send(c, saddr, daddr, buf, n);
+	}
+	return;
+
+unexpected:
+	flow_err(pingf, "Unexpected packet on ping socket");
+}
+
+/**
+ * icmp_ping_close() - Close and clean up a ping flow
+ * @c:		Execution context
+ * @pingf:	ping flow entry to close
+ */
+static void icmp_ping_close(const struct ctx *c,
+			    const struct icmp_ping_flow *pingf)
+{
+	epoll_del(c, pingf->sock);
+	close(pingf->sock);
+	flow_hash_remove(c, FLOW_SIDX(pingf, INISIDE));
+}
+
+/**
+ * icmp_ping_new() - Prepare a new ping socket for a new id
+ * @c:		Execution context
+ * @af:		Address family, AF_INET or AF_INET6
+ * @id:		ICMP id for the new socket
+ * @saddr:	Source address
+ * @daddr:	Destination address
+ *
+ * Return: Newly opened ping flow, or NULL on failure
+ */
+static struct icmp_ping_flow *icmp_ping_new(const struct ctx *c,
+					    sa_family_t af, uint16_t id,
+					    const void *saddr, const void *daddr)
+{
+	uint8_t proto = af == AF_INET ? IPPROTO_ICMP : IPPROTO_ICMPV6;
+	uint8_t flowtype = af == AF_INET ? FLOW_PING4 : FLOW_PING6;
+	union epoll_ref ref = { .type = EPOLL_TYPE_PING };
+	union flow *flow = flow_alloc();
+	struct icmp_ping_flow *pingf;
+	const struct flowside *tgt;
+
+	if (!flow)
+		return NULL;
+
+	flow_initiate_af(flow, PIF_TAP, af, saddr, id, daddr, id);
+	if (!(tgt = flow_target(c, flow, proto)))
+		goto cancel;
+
+	if (flow->f.pif[TGTSIDE] != PIF_HOST) {
+		flow_err(flow, "No support for forwarding %s from %s to %s",
+			 proto == IPPROTO_ICMP ? "ICMP" : "ICMPv6",
+			 pif_name(flow->f.pif[INISIDE]),
+			 pif_name(flow->f.pif[TGTSIDE]));
+		goto cancel;
+	}
+
+	pingf = FLOW_SET_TYPE(flow, flowtype, ping);
+
+	pingf->seq = -1;
+
+	ref.flowside = FLOW_SIDX(flow, TGTSIDE);
+	pingf->sock = flowside_sock_l4(c, EPOLL_TYPE_PING, PIF_HOST,
+				       tgt, ref.data);
+
+	if (pingf->sock < 0) {
+		warn("Cannot open \"ping\" socket. You might need to:");
+		warn("  sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"");
+		warn("...echo requests/replies will fail.");
+		goto cancel;
+	}
+
+	if (pingf->sock > FD_REF_MAX)
+		goto cancel;
+
+	flow_dbg(pingf, "new socket %i for echo ID %"PRIu16, pingf->sock, id);
+
+	flow_hash_insert(c, FLOW_SIDX(pingf, INISIDE));
+
+	FLOW_ACTIVATE(pingf);
+
+	return pingf;
+
+cancel:
+	flow_alloc_cancel(flow);
+	return NULL;
 }
 
 /**
  * icmp_tap_handler() - Handle packets from tap
  * @c:		Execution context
+ * @pif:	pif on which the packet is arriving
  * @af:		Address family, AF_INET or AF_INET6
- * @addr:	Destination address
+ * @saddr:	Source address
+ * @daddr:	Destination address
  * @p:		Packet pool, single packet with ICMP/ICMPv6 header
  * @now:	Current timestamp
  *
  * Return: count of consumed packets (always 1, even if malformed)
  */
-int icmp_tap_handler(const struct ctx *c, int af, const void *addr,
+int icmp_tap_handler(const struct ctx *c, uint8_t pif, sa_family_t af,
+		     const void *saddr, const void *daddr,
 		     const struct pool *p, const struct timespec *now)
 {
-	size_t plen;
+	struct icmp_ping_flow *pingf;
+	const struct flowside *tgt;
+	union sockaddr_inany sa;
+	size_t dlen, l4len;
+	uint16_t id, seq;
+	union flow *flow;
+	uint8_t proto;
+	socklen_t sl;
+	void *pkt;
+
+	(void)saddr;
+	ASSERT(pif == PIF_TAP);
 
 	if (af == AF_INET) {
-		union icmp_epoll_ref iref = { .icmp.v6 = 0 };
-		struct sockaddr_in sa = {
-			.sin_family = AF_INET,
-			.sin_addr = { .s_addr = htonl(INADDR_ANY) },
-		};
-		struct icmphdr *ih;
-		int id, s;
+		const struct icmphdr *ih;
 
-		ih = packet_get(p, 0, 0, sizeof(*ih), &plen);
-		if (!ih)
+		if (!(pkt = packet_get(p, 0, 0, sizeof(*ih), &dlen)))
 			return 1;
 
-		if (ih->type != ICMP_ECHO && ih->type != ICMP_ECHOREPLY)
+		ih =  (struct icmphdr *)pkt;
+		l4len = dlen + sizeof(*ih);
+
+		if (ih->type != ICMP_ECHO)
 			return 1;
 
-		sa.sin_port = ih->un.echo.id;
-
-		iref.icmp.id = id = ntohs(ih->un.echo.id);
-
-		if ((s = icmp_id_map[V4][id].sock) <= 0) {
-			const struct in_addr *bind_addr = NULL;
-			const char *bind_if;
-
-			bind_if = *c->ip4.ifname_out ? c->ip4.ifname_out : NULL;
-
-			if (!IN4_IS_ADDR_UNSPECIFIED(&c->ip4.addr_out))
-				bind_addr = &c->ip4.addr_out;
-
-			s = sock_l4(c, AF_INET, IPPROTO_ICMP, bind_addr,
-				    bind_if, id, iref.u32);
-			if (s < 0)
-				goto fail_sock;
-			if (s > SOCKET_MAX) {
-				close(s);
-				return 1;
-			}
-
-			icmp_id_map[V4][id].sock = s;
-
-			debug("ICMP: new socket %i for echo ID %i", s, id);
-		}
-		icmp_id_map[V4][id].ts = now->tv_sec;
-		bitmap_set(icmp_act[V4], id);
-
-		sa.sin_addr = *(struct in_addr *)addr;
-		if (sendto(s, ih, sizeof(*ih) + plen, MSG_NOSIGNAL,
-			   (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-			debug("ICMP: failed to relay request to socket");
-		} else {
-			debug("ICMP: echo %s to socket, ID: %i, seq: %i",
-			      (ih->type == ICMP_ECHO) ? "request" : "reply",
-			      id, ntohs(ih->un.echo.sequence));
-		}
+		proto = IPPROTO_ICMP;
+		id = ntohs(ih->un.echo.id);
+		seq = ntohs(ih->un.echo.sequence);
 	} else if (af == AF_INET6) {
-		union icmp_epoll_ref iref = { .icmp.v6 = 1 };
-		struct sockaddr_in6 sa = {
-			.sin6_family = AF_INET6,
-			.sin6_addr = IN6ADDR_ANY_INIT,
-			.sin6_scope_id = c->ifi6,
-		};
-		struct icmp6hdr *ih;
-		int id, s;
+		const struct icmp6hdr *ih;
 
-		ih = packet_get(p, 0, 0, sizeof(struct icmp6hdr), &plen);
-		if (!ih)
+		if (!(pkt = packet_get(p, 0, 0, sizeof(*ih), &dlen)))
 			return 1;
 
-		if (ih->icmp6_type != 128 && ih->icmp6_type != 129)
+		ih = (struct icmp6hdr *)pkt;
+		l4len = dlen + sizeof(*ih);
+
+		if (ih->icmp6_type != ICMPV6_ECHO_REQUEST)
 			return 1;
 
-		sa.sin6_port = ih->icmp6_identifier;
-
-		iref.icmp.id = id = ntohs(ih->icmp6_identifier);
-		if ((s = icmp_id_map[V6][id].sock) <= 0) {
-			const struct in6_addr *bind_addr = NULL;
-			const char *bind_if;
-
-			bind_if = *c->ip6.ifname_out ? c->ip6.ifname_out : NULL;
-
-			if (!IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr_out))
-				bind_addr = &c->ip6.addr_out;
-
-			s = sock_l4(c, AF_INET6, IPPROTO_ICMPV6, bind_addr,
-				    bind_if, id, iref.u32);
-			if (s < 0)
-				goto fail_sock;
-			if (s > SOCKET_MAX) {
-				close(s);
-				return 1;
-			}
-
-			icmp_id_map[V6][id].sock = s;
-
-			debug("ICMPv6: new socket %i for echo ID %i", s, id);
-		}
-		icmp_id_map[V6][id].ts = now->tv_sec;
-		bitmap_set(icmp_act[V6], id);
-
-		sa.sin6_addr = *(struct in6_addr *)addr;
-		if (sendto(s, ih, sizeof(*ih) + plen, MSG_NOSIGNAL,
-			   (struct sockaddr *)&sa, sizeof(sa)) < 1) {
-			debug("ICMPv6: failed to relay request to socket");
-		} else {
-			debug("ICMPv6: echo %s to socket, ID: %i, seq: %i",
-			      (ih->icmp6_type == 128) ? "request" : "reply",
-			      id, ntohs(ih->icmp6_sequence));
-		}
+		proto = IPPROTO_ICMPV6;
+		id = ntohs(ih->icmp6_identifier);
+		seq = ntohs(ih->icmp6_sequence);
+	} else {
+		ASSERT(0);
 	}
 
-	return 1;
+	flow = flow_at_sidx(flow_lookup_af(c, proto, PIF_TAP,
+					   af, saddr, daddr, id, id));
 
-fail_sock:
-	warn("Cannot open \"ping\" socket. You might need to:");
-	warn("  sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"");
-	warn("...echo requests/replies will fail.");
+	if (flow)
+		pingf = &flow->ping;
+	else if (!(pingf = icmp_ping_new(c, af, id, saddr, daddr)))
+		return 1;
+
+	tgt = &pingf->f.side[TGTSIDE];
+
+	ASSERT(flow_proto[pingf->f.type] == proto);
+	pingf->ts = now->tv_sec;
+
+	pif_sockaddr(c, &sa, &sl, PIF_HOST, &tgt->eaddr, 0);
+	if (sendto(pingf->sock, pkt, l4len, MSG_NOSIGNAL, &sa.sa, sl) < 0) {
+		flow_dbg_perror(pingf, "failed to relay request to socket");
+	} else {
+		flow_dbg(pingf,
+			 "echo request to socket, ID: %"PRIu16", seq: %"PRIu16,
+			 id, seq);
+	}
+
 	return 1;
 }
 
 /**
- * icmp_timer_one() - Handler for timed events related to a given identifier
+ * icmp_ping_timer() - Handler for timed events related to a given flow
  * @c:		Execution context
- * @v6:		Set for IPv6 echo identifier bindings
- * @id:		Echo identifier, host order
- * @ts:		Timestamp from caller
+ * @pingf:	Ping flow to check for timeout
+ * @now:	Current timestamp
+ *
+ * Return: true if the flow is ready to free, false otherwise
  */
-static void icmp_timer_one(const struct ctx *c, int v6, uint16_t id,
-			   const struct timespec *ts)
+bool icmp_ping_timer(const struct ctx *c, const struct icmp_ping_flow *pingf,
+		     const struct timespec *now)
 {
-	struct icmp_id_sock *id_map = &icmp_id_map[v6 ? V6 : V4][id];
+	if (now->tv_sec - pingf->ts <= ICMP_ECHO_TIMEOUT)
+		return false;
 
-	if (ts->tv_sec - id_map->ts <= ICMP_ECHO_TIMEOUT)
-		return;
-
-	bitmap_clear(icmp_act[v6 ? V6 : V4], id);
-
-	epoll_ctl(c->epollfd, EPOLL_CTL_DEL, id_map->sock, NULL);
-	close(id_map->sock);
-	id_map->sock = 0;
-	id_map->seq = -1;
-}
-
-/**
- * icmp_timer() - Scan activity bitmap for identifiers with timed events
- * @c:		Execution context
- * @ts:		Timestamp from caller
- */
-void icmp_timer(const struct ctx *c, const struct timespec *ts)
-{
-	long *word, tmp;
-	unsigned int i;
-	int n, v6 = 0;
-
-v6:
-	word = (long *)icmp_act[v6 ? V6 : V4];
-	for (i = 0; i < ARRAY_SIZE(icmp_act); i += sizeof(long), word++) {
-		tmp = *word;
-		while ((n = ffsl(tmp))) {
-			tmp &= ~(1UL << (n - 1));
-			icmp_timer_one(c, v6, i * 8 + n - 1, ts);
-		}
-	}
-
-	if (!v6) {
-		v6 = 1;
-		goto v6;
-	}
-}
-
-/**
- * icmp_init() - Initialise sequences in ID map to -1 (no sequence sent yet)
- */
-void icmp_init(void)
-{
-	unsigned i;
-
-	for (i = 0; i < ICMP_NUM_IDS; i++)
-		icmp_id_map[V4][i].seq = icmp_id_map[V6][i].seq = -1;
+	icmp_ping_close(c, pingf);
+	return true;
 }

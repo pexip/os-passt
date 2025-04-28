@@ -6,18 +6,27 @@
 #ifndef NETLINK_H
 #define NETLINK_H
 
-enum nl_op {
-	NL_GET,
-	NL_SET,
-	NL_DUP,
-};
+extern int nl_sock;
+extern int nl_sock_ns;
 
 void nl_sock_init(const struct ctx *c, bool ns);
-unsigned int nl_get_ext_if(sa_family_t af);
-void nl_route(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
-	      sa_family_t af, void *gw);
-void nl_addr(enum nl_op op, unsigned int ifi, unsigned int ifi_ns,
-	     sa_family_t af, void *addr, int *prefix_len, void *addr_l);
-void nl_link(int ns, unsigned int ifi, void *mac, int up, int mtu);
+unsigned int nl_get_ext_if(int s, sa_family_t af);
+int nl_route_get_def(int s, unsigned int ifi, sa_family_t af, void *gw);
+int nl_route_set_def(int s, unsigned int ifi, sa_family_t af, const void *gw);
+int nl_route_dup(int s_src, unsigned int ifi_src,
+		 int s_dst, unsigned int ifi_dst, sa_family_t af);
+int nl_addr_get(int s, unsigned int ifi, sa_family_t af,
+		void *addr, int *prefix_len, void *addr_l);
+int nl_addr_set(int s, unsigned int ifi, sa_family_t af,
+		const void *addr, int prefix_len);
+int nl_addr_get_ll(int s, unsigned int ifi, struct in6_addr *addr);
+int nl_addr_set_ll_nodad(int s, unsigned int ifi);
+int nl_addr_dup(int s_src, unsigned int ifi_src,
+		int s_dst, unsigned int ifi_dst, sa_family_t af);
+int nl_link_get_mac(int s, unsigned int ifi, void *mac);
+int nl_link_set_mac(int s, unsigned int ifi, const void *mac);
+int nl_link_set_mtu(int s, unsigned int ifi, int mtu);
+int nl_link_set_flags(int s, unsigned int ifi,
+		      unsigned int set, unsigned int change);
 
 #endif /* NETLINK_H */

@@ -321,7 +321,7 @@ speeding up local connections, and usually requiring NAT. _pasta_:
   protocol
 * ✅ 4 to 50 times IPv4 TCP throughput of existing, conceptually similar
   solutions depending on MTU (UDP and IPv6 hard to compare)
-* 🛠 [_vhost-user_ support](https://bugs.passt.top/show_bug.cgi?id=25) for
+* ✅ [_vhost-user_ support](https://bugs.passt.top/show_bug.cgi?id=25) for
   maximum one copy on every data path and lower request-response latency
 * ⌚ [multithreading](https://bugs.passt.top/show_bug.cgi?id=13)
 * ⌚ [raw IP socket support](https://bugs.passt.top/show_bug.cgi?id=14) if
@@ -338,22 +338,24 @@ speeding up local connections, and usually requiring NAT. _pasta_:
   [_slirp4netns_ replacement](/passt/tree/slirp4netns.sh)
 * ✅ out-of-tree patch for
   [Kata Containers](/passt/tree/contrib/kata-containers) available
-* ⌚ drop-in replacement for VPNKit (rootless Docker)
+* ✅ rootless Docker
+  [network back-end](https://docs.docker.com/engine/security/rootless/#networking-errors)
+  via moby/rootlesskit
 
 ### Availability
-* ✅ official [packages](https://gitlab.com/redhat/centos-stream/rpms/passt) for
-  CentOS Stream
-* ✅ official [packages](https://tracker.debian.org/pkg/passt) for Debian
-* ✅ official [packages](https://src.fedoraproject.org/rpms/passt) for Fedora
-* ✅ official [packages](https://packages.ubuntu.com/lunar/passt) for Ubuntu
-* ✅ unofficial [packages](https://aur.archlinux.org/packages/passt-git) for
-  Arch Linux
-* ✅ unofficial
-  [packages](https://copr.fedorainfracloud.org/coprs/sbrivio/passt/) for EPEL,
-  Mageia
-* 🛠 official
-  [packages](https://build.opensuse.org/package/show/Virtualization:containers/passt)
-  for openSUSE
+* official packages for:
+    * ✅ [Alpine Linux](https://pkgs.alpinelinux.org/packages?name=passt)
+    * ✅ [Arch Linux](https://archlinux.org/packages/extra/x86_64/passt/) ([aarch64](https://archlinuxarm.org/packages/aarch64/passt), [i486](https://www.archlinux32.org/packages/?q=passt))
+    * ✅ [CentOS Stream](https://gitlab.com/redhat/centos-stream/rpms/passt)
+    * ✅ [Debian](https://tracker.debian.org/pkg/passt)
+    * ✅ [Fedora](https://src.fedoraproject.org/rpms/passt)
+    * ✅ [Gentoo](https://packages.gentoo.org/packages/net-misc/passt)
+    * ✅ [GNU Guix](https://packages.guix.gnu.org/packages/passt/)
+    * ✅ [OpenSUSE](https://build.opensuse.org/package/requests/Virtualization:containers/passt)
+    * ✅ [Ubuntu](https://launchpad.net/ubuntu/+source/passt)
+    * ✅ [Void Linux](https://voidlinux.org/packages/?q=passt)
+* unofficial packages for:
+    * ✅ [EPEL, Mageia](https://copr.fedorainfracloud.org/coprs/sbrivio/passt/)
 * ✅ unofficial [packages](https://passt.top/builds/latest/x86_64/) from x86_64
   static builds for other RPM-based distributions
 * ✅ unofficial [packages](https://passt.top/builds/latest/x86_64/) from x86_64
@@ -398,7 +400,7 @@ services:
   and nameserver using SLAAC
 * [DHCPv6 server](/passt/tree/dhcpv6.c): a simple
   implementation handing out one single IPv6 address to the guest or namespace,
-  namely, the the same address as the first one configured for the upstream host
+  namely, the same address as the first one configured for the upstream host
   interface, and passing the nameservers configured on the host
 
 ## Addresses
@@ -408,13 +410,13 @@ upstream interface of the host, and the same default gateway as the default
 gateway of the host. Addresses are translated in case the guest is seen using a
 different address from the assigned one.
 
-For IPv6, the guest or namespace is assigned, via SLAAC, the same prefix as the
-upstream interface of the host, the same default route as the default route of
-the host, and, if a DHCPv6 client is running in the guest or namespace, also the
-same address as the upstream address of the host. This means that, with a DHCPv6
-client in the guest or namespace, addresses don't need to be translated. Should
-the client use a different address, the destination address is translated for
-packets going to the guest or to the namespace.
+For IPv6, the guest or namespace is assigned, via SLAAC, a prefix derived from
+the address of the upstream interface of the host, the same default route as the
+default route of the host, and, if a DHCPv6 client is running in the guest or
+namespace, also the same address as the upstream address of the host. This means
+that, with a DHCPv6 client in the guest or namespace, addresses don't need to be
+translated. Should the client use a different address, the destination address
+is translated for packets going to the guest or to the namespace.
 
 ### Local connections with _passt_
 

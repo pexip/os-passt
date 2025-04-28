@@ -6,7 +6,7 @@
 #ifndef CONF_H
 #define CONF_H
 
+enum passt_modes conf_mode(int argc, char *argv[]);
 void conf(struct ctx *c, int argc, char **argv);
-void get_bound_ports(struct ctx *c, int ns, uint8_t proto);
 
 #endif /* CONF_H */

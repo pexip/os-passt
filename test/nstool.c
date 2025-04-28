@@ -31,10 +31,15 @@
 
 #define	ARRAY_SIZE(a)	((int)(sizeof(a) / sizeof((a)[0])))
 
-#define die(...)				\
-	do {					\
-		fprintf(stderr, __VA_ARGS__);	\
-		exit(1);			\
+#define die(...)						\
+	do {							\
+		fprintf(stderr, "nstool: " __VA_ARGS__);	\
+		exit(1);					\
+	} while (0)
+
+#define err(...)						\
+	do {							\
+		fprintf(stderr, "nstool: " __VA_ARGS__);	\
 	} while (0)
 
 struct ns_type {
@@ -156,6 +161,9 @@ static int connect_ctl(const char *sockpath, bool wait,
 
 static void cmd_hold(int argc, char *argv[])
 {
+	struct sigaction sa = {
+		.sa_handler = SIG_IGN,
+	};
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, PF_UNIX);
 	struct sockaddr_un addr;
 	const char *sockpath = argv[1];
@@ -185,6 +193,10 @@ static void cmd_hold(int argc, char *argv[])
 	if (!getcwd(info.cwd, sizeof(info.cwd)))
 		die("getcwd(): %s\n", strerror(errno));
 
+	rc = sigaction(SIGPIPE, &sa, NULL);
+	if (rc)
+		die("sigaction(SIGPIPE): %s\n", strerror(errno));
+
 	do {
 		int afd = accept(fd, NULL, NULL);
 		char buf;
@@ -193,17 +205,21 @@ static void cmd_hold(int argc, char *argv[])
 			die("accept(): %s\n", strerror(errno));
 
 		rc = write(afd, &info, sizeof(info));
-		if (rc < 0)
-			die("write(): %s\n", strerror(errno));
+		if (rc < 0) {
+			err("holder write() to control socket: %s\n",
+			    strerror(errno));
+		}
 		if ((size_t)rc < sizeof(info))
-			die("short write() on control socket\n");
+			err("holder short write() on control socket\n");
 
 		rc = read(afd, &buf, sizeof(buf));
-		if (rc < 0)
-			die("read(): %s\n", strerror(errno));
+		if (rc < 0) {
+			err("holder read() on control socket: %s\n",
+			    strerror(errno));
+		}
 
 		close(afd);
-	} while (rc == 0);
+	} while (rc <= 0);
 
 	unlink(sockpath);
 }
@@ -345,21 +361,43 @@ static int openns(const char *fmt, ...)
 	return fd;
 }
 
+static pid_t sig_pid;
+static void sig_propagate(int signum)
+{
+	int err;
+
+	err = kill(sig_pid, signum);
+	if (err)
+		die("Propagating %s: %s\n", strsignal(signum), strerror(errno));
+}
+
 static void wait_for_child(pid_t pid)
 {
-	int status;
+	struct sigaction sa = {
+		.sa_handler = sig_propagate,
+		.sa_flags = SA_RESETHAND,
+	};
+	int status, err;
+
+	sig_pid = pid;
+	err = sigaction(SIGTERM, &sa, NULL);
+	if (err)
+		die("sigaction(SIGTERM): %s\n", strerror(errno));
 
 	/* Match the child's exit status, if possible */
 	for (;;) {
 		pid_t rc;
 
 		rc = waitpid(pid, &status, WUNTRACED);
-		if (rc < 0)
+		if (rc < 0) {
+			if (errno == EINTR)
+				continue;
 			die("waitpid() on %d: %s\n", pid, strerror(errno));
+		}
 		if (rc != pid)
 			die("waitpid() on %d returned %d", pid, rc);
 		if (WIFSTOPPED(status)) {
-			/* Stop the parent to patch */
+			/* Stop the parent to match */
 			kill(getpid(), SIGSTOP);
 			/* We must have resumed, resume the child */
 			kill(pid, SIGCONT);
@@ -508,7 +546,7 @@ static void cmd_exec(int argc, char *argv[])
 	/* CHILD */
 	if (argc > optind + 1) {
 		exe = argv[optind + 1];
-		xargs = (const char * const*)(argv + optind + 1);
+		xargs = (const char *const *)(argv + optind + 1);
 	} else {
 		exe = getenv("SHELL");
 		if (!exe)
