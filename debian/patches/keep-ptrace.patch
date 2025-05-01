@@ -1,8 +1,8 @@
-diff --git a/isolation.c b/isolation.c
-index 1866724..60b4657 100644
---- a/isolation.c
-+++ b/isolation.c
-@@ -194,19 +194,20 @@ void isolate_initial(void)
+Index: passt/isolation.c
+===================================================================
+--- passt.orig/isolation.c
++++ passt/isolation.c
+@@ -196,19 +196,20 @@ void isolate_initial(int argc, char **ar
  	 * retain SETUID and SYS_ADMIN, but we might as well.  We drop
  	 * further capabilites in isolate_user() and
  	 * isolate_prefork().
@@ -26,4 +26,4 @@ index 1866724..60b4657 100644
 +		keep |= BIT(CAP_SETFCAP);
  
  	drop_caps_ep_except(keep);
- }
+ 

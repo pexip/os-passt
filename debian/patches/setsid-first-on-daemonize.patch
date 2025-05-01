@@ -1,8 +1,8 @@
-diff --git a/util.c b/util.c
-index 1d00404..6fbd013 100644
---- a/util.c
-+++ b/util.c
-@@ -447,8 +447,11 @@ void write_pidfile(int fd, pid_t pid)
+Index: passt/util.c
+===================================================================
+--- passt.orig/util.c
++++ passt/util.c
+@@ -499,8 +499,11 @@ int output_file_open(const char *path, i
   */
  int __daemon(int pidfile_fd, int devnull_fd)
  {
@@ -14,4 +14,4 @@ index 1d00404..6fbd013 100644
 +	pid = fork();
  	if (pid == -1) {
  		perror("fork");
- 		exit(EXIT_FAILURE);
+ 		_exit(EXIT_FAILURE);
