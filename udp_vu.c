@@ -58,34 +58,15 @@ static size_t udp_vu_hdrlen(bool v6)
 }
 
 /**
- * udp_vu_sock_info() - get socket information
- * @s:		Socket to get information from
- * @s_in:	Socket address (output)
- *
- * Return: 0 if socket address can be read, -1 otherwise
- */
-static int udp_vu_sock_info(int s, union sockaddr_inany *s_in)
-{
-	struct msghdr msg = {
-		.msg_name = s_in,
-		.msg_namelen = sizeof(union sockaddr_inany),
-	};
-
-	return recvmsg(s, &msg, MSG_PEEK | MSG_DONTWAIT);
-}
-
-/**
  * udp_vu_sock_recv() - Receive datagrams from socket into vhost-user buffers
  * @c:		Execution context
  * @s:		Socket to receive from
- * @events:	epoll events bitmap
  * @v6:		Set for IPv6 connections
  * @dlen:	Size of received data (output)
  *
  * Return: Number of iov entries used to store the datagram
  */
-static int udp_vu_sock_recv(const struct ctx *c, int s, uint32_t events,
-			    bool v6, ssize_t *dlen)
+static int udp_vu_sock_recv(const struct ctx *c, int s, bool v6, ssize_t *dlen)
 {
 	struct vu_dev *vdev = c->vdev;
 	struct vu_virtq *vq = &vdev->vq[VHOST_USER_RX_QUEUE];
@@ -94,9 +75,6 @@ static int udp_vu_sock_recv(const struct ctx *c, int s, uint32_t events,
 	size_t off, hdrlen;
 
 	ASSERT(!c->no_udp);
-
-	if (!(events & EPOLLIN))
-		return 0;
 
 	/* compute L2 header length */
 	hdrlen = udp_vu_hdrlen(v6);
@@ -214,125 +192,27 @@ static void udp_vu_csum(const struct flowside *toside, int iov_used)
 }
 
 /**
- * udp_vu_listen_sock_handler() - Handle new data from socket
+ * udp_vu_sock_to_tap() - Forward datagrams from socket to tap
  * @c:		Execution context
- * @ref:	epoll reference
- * @events:	epoll events bitmap
- * @now:	Current timestamp
+ * @s:		Socket to read data from
+ * @n:		Maximum number of datagrams to forward
+ * @tosidx:	Flow & side to forward data from @s to
  */
-void udp_vu_listen_sock_handler(const struct ctx *c, union epoll_ref ref,
-				uint32_t events, const struct timespec *now)
+void udp_vu_sock_to_tap(const struct ctx *c, int s, int n, flow_sidx_t tosidx)
 {
-	struct vu_dev *vdev = c->vdev;
-	struct vu_virtq *vq = &vdev->vq[VHOST_USER_RX_QUEUE];
-	int i;
-
-	if (udp_sock_errs(c, ref, events) < 0) {
-		err("UDP: Unrecoverable error on listening socket:"
-		    " (%s port %hu)", pif_name(ref.udp.pif), ref.udp.port);
-		return;
-	}
-
-	for (i = 0; i < UDP_MAX_FRAMES; i++) {
-		const struct flowside *toside;
-		union sockaddr_inany s_in;
-		flow_sidx_t sidx;
-		uint8_t pif;
-		ssize_t dlen;
-		int iov_used;
-		bool v6;
-
-		if (udp_vu_sock_info(ref.fd, &s_in) < 0)
-			break;
-
-		sidx = udp_flow_from_sock(c, ref, &s_in, now);
-		pif = pif_at_sidx(sidx);
-
-		if (pif != PIF_TAP) {
-			if (flow_sidx_valid(sidx)) {
-				flow_sidx_t fromsidx = flow_sidx_opposite(sidx);
-				struct udp_flow *uflow = udp_at_sidx(sidx);
-
-				flow_err(uflow,
-					"No support for forwarding UDP from %s to %s",
-					pif_name(pif_at_sidx(fromsidx)),
-					pif_name(pif));
-			} else {
-				debug("Discarding 1 datagram without flow");
-			}
-
-			continue;
-		}
-
-		toside = flowside_at_sidx(sidx);
-
-		v6 = !(inany_v4(&toside->eaddr) && inany_v4(&toside->oaddr));
-
-		iov_used = udp_vu_sock_recv(c, ref.fd, events, v6, &dlen);
-		if (iov_used <= 0)
-			break;
-
-		udp_vu_prepare(c, toside, dlen);
-		if (*c->pcap) {
-			udp_vu_csum(toside, iov_used);
-			pcap_iov(iov_vu, iov_used,
-				 sizeof(struct virtio_net_hdr_mrg_rxbuf));
-		}
-		vu_flush(vdev, vq, elem, iov_used);
-	}
-}
-
-/**
- * udp_vu_reply_sock_handler() - Handle new data from flow specific socket
- * @c:		Execution context
- * @ref:	epoll reference
- * @events:	epoll events bitmap
- * @now:	Current timestamp
- */
-void udp_vu_reply_sock_handler(const struct ctx *c, union epoll_ref ref,
-			        uint32_t events, const struct timespec *now)
-{
-	flow_sidx_t tosidx = flow_sidx_opposite(ref.flowside);
 	const struct flowside *toside = flowside_at_sidx(tosidx);
-	struct udp_flow *uflow = udp_at_sidx(ref.flowside);
-	int from_s = uflow->s[ref.flowside.sidei];
+	bool v6 = !(inany_v4(&toside->eaddr) && inany_v4(&toside->oaddr));
 	struct vu_dev *vdev = c->vdev;
 	struct vu_virtq *vq = &vdev->vq[VHOST_USER_RX_QUEUE];
 	int i;
 
-	ASSERT(!c->no_udp);
-
-	if (udp_sock_errs(c, ref, events) < 0) {
-		flow_err(uflow, "Unrecoverable error on reply socket");
-		flow_err_details(uflow);
-		udp_flow_close(c, uflow);
-		return;
-	}
-
-	for (i = 0; i < UDP_MAX_FRAMES; i++) {
-		uint8_t topif = pif_at_sidx(tosidx);
+	for (i = 0; i < n; i++) {
 		ssize_t dlen;
 		int iov_used;
-		bool v6;
 
-		ASSERT(uflow);
-
-		if (topif != PIF_TAP) {
-			uint8_t frompif = pif_at_sidx(ref.flowside);
-
-			flow_err(uflow,
-				 "No support for forwarding UDP from %s to %s",
-				 pif_name(frompif), pif_name(topif));
-			continue;
-		}
-
-		v6 = !(inany_v4(&toside->eaddr) && inany_v4(&toside->oaddr));
-
-		iov_used = udp_vu_sock_recv(c, from_s, events, v6, &dlen);
+		iov_used = udp_vu_sock_recv(c, s, v6, &dlen);
 		if (iov_used <= 0)
 			break;
-		flow_trace(uflow, "Received 1 datagram on reply socket");
-		uflow->ts = now->tv_sec;
 
 		udp_vu_prepare(c, toside, dlen);
 		if (*c->pcap) {

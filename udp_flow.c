@@ -9,10 +9,12 @@
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <netinet/udp.h>
 
 #include "util.h"
 #include "passt.h"
 #include "flow_table.h"
+#include "udp_internal.h"
 
 #define UDP_CONN_TIMEOUT	180 /* s, timeout for ephemeral or local bind */
 
@@ -41,116 +43,141 @@ struct udp_flow *udp_at_sidx(flow_sidx_t sidx)
  */
 void udp_flow_close(const struct ctx *c, struct udp_flow *uflow)
 {
+	unsigned sidei;
+
 	if (uflow->closed)
 		return; /* Nothing to do */
 
-	if (uflow->s[INISIDE] >= 0) {
-		/* The listening socket needs to stay in epoll */
-		close(uflow->s[INISIDE]);
-		uflow->s[INISIDE] = -1;
+	flow_foreach_sidei(sidei) {
+		flow_hash_remove(c, FLOW_SIDX(uflow, sidei));
+		if (uflow->s[sidei] >= 0) {
+			epoll_del(c, uflow->s[sidei]);
+			close(uflow->s[sidei]);
+			uflow->s[sidei] = -1;
+		}
 	}
-
-	if (uflow->s[TGTSIDE] >= 0) {
-		/* But the flow specific one needs to be removed */
-		epoll_del(c, uflow->s[TGTSIDE]);
-		close(uflow->s[TGTSIDE]);
-		uflow->s[TGTSIDE] = -1;
-	}
-	flow_hash_remove(c, FLOW_SIDX(uflow, INISIDE));
-	if (!pif_is_socket(uflow->f.pif[TGTSIDE]))
-		flow_hash_remove(c, FLOW_SIDX(uflow, TGTSIDE));
 
 	uflow->closed = true;
+}
+
+/**
+ * udp_flow_sock() - Create, bind and connect a flow specific UDP socket
+ * @c:		Execution context
+ * @uflow:	UDP flow to open socket for
+ * @sidei:	Side of @uflow to open socket for
+ *
+ * Return: fd of new socket on success, -ve error code on failure
+ */
+static int udp_flow_sock(const struct ctx *c,
+			 struct udp_flow *uflow, unsigned sidei)
+{
+	const struct flowside *side = &uflow->f.side[sidei];
+	uint8_t pif = uflow->f.pif[sidei];
+	union {
+		flow_sidx_t sidx;
+		uint32_t data;
+	} fref = { .sidx = FLOW_SIDX(uflow, sidei) };
+	int s;
+
+	s = flowside_sock_l4(c, EPOLL_TYPE_UDP, pif, side, fref.data);
+	if (s < 0) {
+		flow_dbg_perror(uflow, "Couldn't open flow specific socket");
+		return s;
+	}
+
+	if (flowside_connect(c, s, pif, side) < 0) {
+		int rc = -errno;
+		flow_dbg_perror(uflow, "Couldn't connect flow socket");
+		return rc;
+	}
+
+	/* It's possible, if unlikely, that we could receive some packets in
+	 * between the bind() and connect() which may or may not be for this
+	 * flow.  Being UDP we could just discard them, but it's not ideal.
+	 *
+	 * There's also a tricky case if a bunch of datagrams for a new flow
+	 * arrive in rapid succession, the first going to the original listening
+	 * socket and later ones going to this new socket.  If we forwarded the
+	 * datagrams from the new socket immediately here they would go before
+	 * the datagram which established the flow.  Again, not strictly wrong
+	 * for UDP, but not ideal.
+	 *
+	 * So, we flag that the new socket is in a transient state where it
+	 * might have datagrams for a different flow queued.  Before the next
+	 * epoll cycle, udp_flow_defer() will flush out any such datagrams, and
+	 * thereafter everything on the new socket should be strictly for this
+	 * flow.
+	 */
+	if (sidei)
+		uflow->flush1 = true;
+	else
+		uflow->flush0 = true;
+
+	return s;
 }
 
 /**
  * udp_flow_new() - Common setup for a new UDP flow
  * @c:		Execution context
  * @flow:	Initiated flow
- * @s_ini:	Initiating socket (or -1)
  * @now:	Timestamp
  *
  * Return: UDP specific flow, if successful, NULL on failure
+ *
+ * #syscalls getsockname
  */
 static flow_sidx_t udp_flow_new(const struct ctx *c, union flow *flow,
-				int s_ini, const struct timespec *now)
+				const struct timespec *now)
 {
 	struct udp_flow *uflow = NULL;
 	const struct flowside *tgt;
-	uint8_t tgtpif;
+	unsigned sidei;
 
 	if (!(tgt = flow_target(c, flow, IPPROTO_UDP)))
 		goto cancel;
-	tgtpif = flow->f.pif[TGTSIDE];
 
 	uflow = FLOW_SET_TYPE(flow, FLOW_UDP, udp);
 	uflow->ts = now->tv_sec;
 	uflow->s[INISIDE] = uflow->s[TGTSIDE] = -1;
+	uflow->ttl[INISIDE] = uflow->ttl[TGTSIDE] = 0;
 
-	if (s_ini >= 0) {
-		/* When using auto port-scanning the listening port could go
-		 * away, so we need to duplicate the socket
-		 */
-		uflow->s[INISIDE] = fcntl(s_ini, F_DUPFD_CLOEXEC, 0);
-		if (uflow->s[INISIDE] < 0) {
-			flow_perror(uflow,
-				    "Couldn't duplicate listening socket");
+	flow_foreach_sidei(sidei) {
+		if (pif_is_socket(uflow->f.pif[sidei]))
+			if ((uflow->s[sidei] = udp_flow_sock(c, uflow, sidei)) < 0)
+				goto cancel;
+	}
+
+	if (uflow->s[TGTSIDE] >= 0 && inany_is_unspecified(&tgt->oaddr)) {
+		/* When we target a socket, we connect() it, but might not
+		 * always bind(), leaving the kernel to pick our address.  In
+		 * that case connect() will implicitly bind() the socket, but we
+		 * need to determine its local address so that we can match
+		 * reply packets back to the correct flow.  Update the flow with
+		 * the information from getsockname() */
+		union sockaddr_inany sa;
+		socklen_t sl = sizeof(sa);
+		in_port_t port;
+
+		if (getsockname(uflow->s[TGTSIDE], &sa.sa, &sl) < 0 ||
+		    inany_from_sockaddr(&uflow->f.side[TGTSIDE].oaddr,
+					&port, &sa) < 0) {
+			flow_perror(uflow, "Unable to determine local address");
+			goto cancel;
+		}
+		if (port != tgt->oport) {
+			flow_err(uflow, "Unexpected local port");
 			goto cancel;
 		}
 	}
 
-	if (pif_is_socket(tgtpif)) {
-		struct mmsghdr discard[UIO_MAXIOV] = { 0 };
-		union {
-			flow_sidx_t sidx;
-			uint32_t data;
-		} fref = {
-			.sidx = FLOW_SIDX(flow, TGTSIDE),
-		};
-		int rc;
-
-		uflow->s[TGTSIDE] = flowside_sock_l4(c, EPOLL_TYPE_UDP_REPLY,
-						     tgtpif, tgt, fref.data);
-		if (uflow->s[TGTSIDE] < 0) {
-			flow_dbg_perror(uflow,
-					"Couldn't open socket for spliced flow");
-			goto cancel;
-		}
-
-		if (flowside_connect(c, uflow->s[TGTSIDE], tgtpif, tgt) < 0) {
-			flow_dbg_perror(uflow, "Couldn't connect flow socket");
-			goto cancel;
-		}
-
-		/* It's possible, if unlikely, that we could receive some
-		 * unrelated packets in between the bind() and connect() of this
-		 * socket.  For now we just discard these.  We could consider
-		 * trying to redirect these to an appropriate handler, if we
-		 * need to.
-		 */
-		rc = recvmmsg(uflow->s[TGTSIDE], discard, ARRAY_SIZE(discard),
-			      MSG_DONTWAIT, NULL);
-		if (rc >= ARRAY_SIZE(discard)) {
-			flow_dbg(uflow,
-				 "Too many (%d) spurious reply datagrams", rc);
-			goto cancel;
-		} else if (rc > 0) {
-			flow_trace(uflow,
-				   "Discarded %d spurious reply datagrams", rc);
-		} else if (errno != EAGAIN) {
-			flow_perror(uflow,
-				    "Unexpected error discarding datagrams");
-		}
-	}
-
-	flow_hash_insert(c, FLOW_SIDX(uflow, INISIDE));
-
-	/* If the target side is a socket, it will be a reply socket that knows
-	 * its own flowside.  But if it's tap, then we need to look it up by
-	 * hash.
+	/* Tap sides always need to be looked up by hash.  Socket sides don't
+	 * always, but sometimes do (receiving packets on a socket not specific
+	 * to one flow).  Unconditionally hash both sides so all our bases are
+	 * covered
 	 */
-	if (!pif_is_socket(tgtpif))
-		flow_hash_insert(c, FLOW_SIDX(uflow, TGTSIDE));
+	flow_foreach_sidei(sidei)
+		flow_hash_insert(c, FLOW_SIDX(uflow, sidei));
+
 	FLOW_ACTIVATE(uflow);
 
 	return FLOW_SIDX(uflow, TGTSIDE);
@@ -163,9 +190,11 @@ cancel:
 }
 
 /**
- * udp_flow_from_sock() - Find or create UDP flow for "listening" socket
+ * udp_flow_from_sock() - Find or create UDP flow for incoming datagram
  * @c:		Execution context
- * @ref:	epoll reference of the receiving socket
+ * @pif:	Interface the datagram is arriving from
+ * @dst:	Our (local) address to which the datagram is arriving
+ * @port:	Our (local) port number to which the datagram is arriving
  * @s_in:	Source socket address, filled in by recvmmsg()
  * @now:	Timestamp
  *
@@ -174,7 +203,8 @@ cancel:
  * Return: sidx for the destination side of the flow for this packet, or
  *         FLOW_SIDX_NONE if we couldn't find or create a flow.
  */
-flow_sidx_t udp_flow_from_sock(const struct ctx *c, union epoll_ref ref,
+flow_sidx_t udp_flow_from_sock(const struct ctx *c, uint8_t pif,
+			       const union inany_addr *dst, in_port_t port,
 			       const union sockaddr_inany *s_in,
 			       const struct timespec *now)
 {
@@ -183,9 +213,7 @@ flow_sidx_t udp_flow_from_sock(const struct ctx *c, union epoll_ref ref,
 	union flow *flow;
 	flow_sidx_t sidx;
 
-	ASSERT(ref.type == EPOLL_TYPE_UDP_LISTEN);
-
-	sidx = flow_lookup_sa(c, IPPROTO_UDP, ref.udp.pif, s_in, ref.udp.port);
+	sidx = flow_lookup_sa(c, IPPROTO_UDP, pif, s_in, dst, port);
 	if ((uflow = udp_at_sidx(sidx))) {
 		uflow->ts = now->tv_sec;
 		return flow_sidx_opposite(sidx);
@@ -195,12 +223,11 @@ flow_sidx_t udp_flow_from_sock(const struct ctx *c, union epoll_ref ref,
 		char sastr[SOCKADDR_STRLEN];
 
 		debug("Couldn't allocate flow for UDP datagram from %s %s",
-		      pif_name(ref.udp.pif),
-		      sockaddr_ntop(s_in, sastr, sizeof(sastr)));
+		      pif_name(pif), sockaddr_ntop(s_in, sastr, sizeof(sastr)));
 		return FLOW_SIDX_NONE;
 	}
 
-	ini = flow_initiate_sa(flow, ref.udp.pif, s_in, ref.udp.port);
+	ini = flow_initiate_sa(flow, pif, s_in, dst, port);
 
 	if (!inany_is_unicast(&ini->eaddr) ||
 	    ini->eport == 0 || ini->oport == 0) {
@@ -213,7 +240,7 @@ flow_sidx_t udp_flow_from_sock(const struct ctx *c, union epoll_ref ref,
 		return FLOW_SIDX_NONE;
 	}
 
-	return udp_flow_new(c, flow, ref.fd, now);
+	return udp_flow_new(c, flow, now);
 }
 
 /**
@@ -269,17 +296,45 @@ flow_sidx_t udp_flow_from_tap(const struct ctx *c,
 		return FLOW_SIDX_NONE;
 	}
 
-	return udp_flow_new(c, flow, -1, now);
+	return udp_flow_new(c, flow, now);
+}
+
+/**
+ * udp_flush_flow() - Flush datagrams that might not be for this flow
+ * @c:		Execution context
+ * @uflow:	Flow to handle
+ * @sidei:	Side of the flow to flush
+ * @now:	Current timestamp
+ */
+static void udp_flush_flow(const struct ctx *c,
+			   const struct udp_flow *uflow, unsigned sidei,
+			   const struct timespec *now)
+{
+	/* We don't know exactly where the datagrams will come from, but we know
+	 * they'll have an interface and oport matching this flow */
+	udp_sock_fwd(c, uflow->s[sidei], uflow->f.pif[sidei],
+		     uflow->f.side[sidei].oport, now);
 }
 
 /**
  * udp_flow_defer() - Deferred per-flow handling (clean up aborted flows)
+ * @c:		Execution context
  * @uflow:	Flow to handle
+ * @now:	Current timestamp
  *
  * Return: true if the connection is ready to free, false otherwise
  */
-bool udp_flow_defer(const struct udp_flow *uflow)
+bool udp_flow_defer(const struct ctx *c, struct udp_flow *uflow,
+		    const struct timespec *now)
 {
+	if (uflow->flush0) {
+		udp_flush_flow(c, uflow, INISIDE, now);
+		uflow->flush0 = false;
+	}
+	if (uflow->flush1) {
+		udp_flush_flow(c, uflow, TGTSIDE, now);
+		uflow->flush1 = false;
+	}
 	return uflow->closed;
 }
 

@@ -71,7 +71,7 @@ int sock_l4_sa(const struct ctx *c, enum epoll_type type,
 	case EPOLL_TYPE_UDP_LISTEN:
 		freebind = c->freebind;
 		/* fallthrough */
-	case EPOLL_TYPE_UDP_REPLY:
+	case EPOLL_TYPE_UDP:
 		proto = IPPROTO_UDP;
 		socktype = SOCK_DGRAM | SOCK_NONBLOCK;
 		break;
@@ -109,11 +109,15 @@ int sock_l4_sa(const struct ctx *c, enum epoll_type type,
 		debug("Failed to set SO_REUSEADDR on socket %i", fd);
 
 	if (proto == IPPROTO_UDP) {
+		int pktinfo = af == AF_INET ? IP_PKTINFO : IPV6_RECVPKTINFO;
+		int recverr = af == AF_INET ? IP_RECVERR : IPV6_RECVERR;
 		int level = af == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
-		int opt = af == AF_INET ? IP_RECVERR : IPV6_RECVERR;
 
-		if (setsockopt(fd, level, opt, &y, sizeof(y)))
+		if (setsockopt(fd, level, recverr, &y, sizeof(y)))
 			die_perror("Failed to set RECVERR on socket %i", fd);
+
+		if (setsockopt(fd, level, pktinfo, &y, sizeof(y)))
+			die_perror("Failed to set PKTINFO on socket %i", fd);
 	}
 
 	if (ifname && *ifname) {
@@ -871,7 +875,9 @@ void close_open_files(int argc, char **argv)
 			errno = 0;
 			fd = strtol(optarg, NULL, 0);
 
-			if (errno || fd <= STDERR_FILENO || fd > INT_MAX)
+			if (errno ||
+			    (fd != STDIN_FILENO && fd <= STDERR_FILENO) ||
+			    fd > INT_MAX)
 				die("Invalid --fd: %s", optarg);
 		}
 	} while (name != -1);
@@ -1016,4 +1022,23 @@ void encode_domain_name(char *buf, const char *domain_name)
 			p[i] = domain_name[i];
 	}
 	p[i] = 0L;
+}
+
+/**
+ * abort_with_msg() - Print error message and abort
+ * @fmt:	Format string
+ * @...:	Format parameters
+ */
+void abort_with_msg(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vlogmsg(true, false, LOG_CRIT, fmt, ap);
+	va_end(ap);
+
+	/* This may actually cause a SIGSYS instead of SIGABRT, due to seccomp,
+	 * but that will still get the job done.
+	 */
+	abort();
 }

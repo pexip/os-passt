@@ -520,20 +520,21 @@ swap:
 		int more = 0;
 
 retry:
-		readlen = splice(conn->s[fromsidei], NULL,
-				 conn->pipe[fromsidei][1], NULL,
-				 c->tcp.pipe_size,
-				 SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-		flow_trace(conn, "%zi from read-side call", readlen);
-		if (readlen < 0) {
-			if (errno == EINTR)
-				goto retry;
+		do
+			readlen = splice(conn->s[fromsidei], NULL,
+					 conn->pipe[fromsidei][1], NULL,
+					 c->tcp.pipe_size,
+					 SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+		while (readlen < 0 && errno == EINTR);
 
-			if (errno != EAGAIN)
-				goto close;
-		} else if (!readlen) {
+		if (readlen < 0 && errno != EAGAIN)
+			goto close;
+
+		flow_trace(conn, "%zi from read-side call", readlen);
+
+		if (!readlen) {
 			eof = 1;
-		} else {
+		} else if (readlen > 0) {
 			never_read = 0;
 
 			if (readlen >= (long)c->tcp.pipe_size * 90 / 100)
@@ -543,10 +544,16 @@ retry:
 				conn_flag(c, conn, lowat_act_flag);
 		}
 
-eintr:
-		written = splice(conn->pipe[fromsidei][0], NULL,
-				 conn->s[!fromsidei], NULL, c->tcp.pipe_size,
-				 SPLICE_F_MOVE | more | SPLICE_F_NONBLOCK);
+		do
+			written = splice(conn->pipe[fromsidei][0], NULL,
+					 conn->s[!fromsidei], NULL,
+					 c->tcp.pipe_size,
+					 SPLICE_F_MOVE | more | SPLICE_F_NONBLOCK);
+		while (written < 0 && errno == EINTR);
+
+		if (written < 0 && errno != EAGAIN)
+			goto close;
+
 		flow_trace(conn, "%zi from write-side call (passed %zi)",
 			   written, c->tcp.pipe_size);
 
@@ -578,12 +585,6 @@ eintr:
 		conn->written[fromsidei] += written > 0 ? written : 0;
 
 		if (written < 0) {
-			if (errno == EINTR)
-				goto eintr;
-
-			if (errno != EAGAIN)
-				goto close;
-
 			if (conn->read[fromsidei] == conn->written[fromsidei])
 				break;
 
