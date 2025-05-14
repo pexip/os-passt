@@ -1,0 +1,44 @@
+Description: Fix Podman issue #26073 (assertion failed on outbound broadcast packets)
+
+This patch is the equivalent of upstream commits eea8a76caf85 ("flow:
+fix podman issue #26073") and 8ec134109eb1 ("flow: close socket fd on
+error"), and is needed to ensure we don't unexpectedly terminate on
+failure to connect() UDP sockets on new UDP outbound flows, as well as
+avoiding a file descriptor leak in that case.
+
+This issue was originally reported as Podman issue #26073:
+
+  https://github.com/containers/podman/issues/26073
+
+and, at least in that specific case, the connect() failure is caused
+by an outbound message directed to an IPv4 broadcast address, which
+leads to a new UDP flow directed to 255.255.255.255, which we can't
+connect() to.
+
+On connect() failure, we didn't remove the UDP socket from the epoll
+list, and leave the flow table in an inconsistent state, which would
+typically cause unexpected termination on a subsequent flow creation.
+
+Further, we also need to close the socket corresponding to the failed
+UDP flow, otherwise we'll (resource-wise) leak a file descriptor.
+
+Author: Stefano Brivio <sbrivio@redhat.com>
+Origin: upstream, commit:eea8a76caf85
+Bug: https://github.com/containers/podman/issues/26073
+Forwarded: not-needed
+Applied-Upstream: 2025_05_12.8ec1341, commit:eea8a76caf85
+Last-Update: 2025-05-14
+
+--- passt-0.0~git20250503.587980c.orig/udp_flow.c
++++ passt-0.0~git20250503.587980c/udp_flow.c
+@@ -87,6 +87,10 @@ static int udp_flow_sock(const struct ct
+ 
+ 	if (flowside_connect(c, s, pif, side) < 0) {
+ 		int rc = -errno;
++
++		epoll_del(c, s);
++		close(s);
++
+ 		flow_dbg_perror(uflow, "Couldn't connect flow socket");
+ 		return rc;
+ 	}
