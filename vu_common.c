@@ -36,11 +36,15 @@ int vu_packet_check_range(void *buf, const char *ptr, size_t len)
 	struct vu_dev_region *dev_region;
 
 	for (dev_region = buf; dev_region->mmap_addr; dev_region++) {
+		uintptr_t base_addr = dev_region->mmap_addr +
+			dev_region->mmap_offset;
 		/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
-		char *m = (char *)(uintptr_t)dev_region->mmap_addr;
+		const char *base = (const char *)base_addr;
 
-		if (m <= ptr &&
-		    ptr + len <= m + dev_region->mmap_offset + dev_region->size)
+		ASSERT(base_addr >= dev_region->mmap_addr);
+
+		if (len <= dev_region->size && base <= ptr &&
+		    (size_t)(ptr - base) <= dev_region->size - len)
 			return 0;
 	}
 
@@ -191,7 +195,7 @@ static void vu_handle_tx(struct vu_dev *vdev, int index,
 			tap_add_packet(vdev->context,
 				       elem[count].out_sg[0].iov_len - hdrlen,
 				       (char *)elem[count].out_sg[0].iov_base +
-				        hdrlen);
+				       hdrlen, now);
 		} else {
 			/* vnet header can be in a separate iovec */
 			if (elem[count].out_num != 2) {
@@ -203,7 +207,8 @@ static void vu_handle_tx(struct vu_dev *vdev, int index,
 			} else {
 				tap_add_packet(vdev->context,
 					       elem[count].out_sg[1].iov_len,
-					       (char *)elem[count].out_sg[1].iov_base);
+					       (char *)elem[count].out_sg[1].iov_base,
+					       now);
 			}
 		}
 

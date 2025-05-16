@@ -1,3 +1,31 @@
+passt (0.0~git20250503.587980c-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20250503.587980c:
+    - Fix potential assertion trigger on heavy UDP traffic,
+      https://github.com/containers/podman/issues/25959
+    - Fix potential infinite loop while handling multicast
+      traffic
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Sun, 04 May 2025 11:43:12 +0200
+
+passt (0.0~git20250415.2340bbf-1) unstable; urgency=medium
+
+  * New upstream version 0.0~git20250415.2340bbf:
+    - ICMP messages for UDP failures now relayed to container / guest,
+      traceroute works (from container / guest),
+        https://bugs.passt.top/show_bug.cgi?id=64
+    - Fix potential splice() loop when one system call is interrupted
+      on TCP spliced path,
+        https://github.com/containers/podman/issues/23686#issuecomment-2779347687
+    - Fix source address selection for UDP flows when upstream
+      interface has multiple addresses,
+        https://bugs.passt.top/show_bug.cgi?id=99
+    - Fix mapping of loopback DNS resolvers via --dns-forward when
+      --no-map-gw is given as well,
+        https://bugs.passt.top/show_bug.cgi?id=111
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Tue, 15 Apr 2025 21:18:29 +0200
+
 passt (0.0~git20250320.32f6212-1+pexip25u1) pexip-trixie; urgency=medium
 
   * Initial trixie build

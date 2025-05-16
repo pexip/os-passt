@@ -1546,9 +1546,8 @@ static void tcp_conn_from_tap(const struct ctx *c, sa_family_t af,
 
 	if (c->mode == MODE_VU) { /* To rebind to same oport after migration */
 		sl = sizeof(sa);
-		if (!getsockname(s, &sa.sa, &sl))
-			inany_from_sockaddr(&tgt->oaddr, &tgt->oport, &sa);
-		else
+		if (getsockname(s, &sa.sa, &sl) ||
+		    inany_from_sockaddr(&tgt->oaddr, &tgt->oport, &sa) < 0)
 			err_perror("Can't get local address for socket %i", s);
 	}
 
@@ -2201,12 +2200,11 @@ void tcp_listen_handler(const struct ctx *c, union epoll_ref ref,
 	 * mode only, below.
 	 */
 	ini = flow_initiate_sa(flow, ref.tcp_listen.pif, &sa,
-			       ref.tcp_listen.port);
+			       NULL, ref.tcp_listen.port);
 
 	if (c->mode == MODE_VU) { /* Rebind to same address after migration */
-		if (!getsockname(s, &sa.sa, &sl))
-			inany_from_sockaddr(&ini->oaddr, &ini->oport, &sa);
-		else
+		if (getsockname(s, &sa.sa, &sl) ||
+		    inany_from_sockaddr(&ini->oaddr, &ini->oport, &sa) < 0)
 			err_perror("Can't get local address for socket %i", s);
 	}
 
@@ -3414,12 +3412,7 @@ fail:
 static int tcp_flow_repair_socket(struct ctx *c, struct tcp_tap_conn *conn)
 {
 	sa_family_t af = CONN_V4(conn) ? AF_INET : AF_INET6;
-	const struct flowside *sockside = HOSTFLOW(conn);
-	union sockaddr_inany a;
-	socklen_t sl;
 	int s, rc;
-
-	pif_sockaddr(c, &a, &sl, PIF_HOST, &sockside->oaddr, sockside->oport);
 
 	if ((conn->sock = socket(af, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
 				 IPPROTO_TCP)) < 0) {
@@ -3435,12 +3428,6 @@ static int tcp_flow_repair_socket(struct ctx *c, struct tcp_tap_conn *conn)
 
 	tcp_sock_set_nodelay(s);
 
-	if (bind(s, &a.sa, sizeof(a))) {
-		rc = -errno;
-		flow_perror(conn, "Failed to bind socket for migrated flow");
-		goto err;
-	}
-
 	if ((rc = tcp_flow_repair_on(c, conn)))
 		goto err;
 
@@ -3450,6 +3437,30 @@ err:
 	close(s);
 	conn->sock = -1;
 	return rc;
+}
+
+/**
+ * tcp_flow_repair_bind() - Bind socket in repair mode
+ * @c:		Execution context
+ * @conn:	Pointer to the TCP connection structure
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int tcp_flow_repair_bind(const struct ctx *c, struct tcp_tap_conn *conn)
+{
+	const struct flowside *sockside = HOSTFLOW(conn);
+	union sockaddr_inany a;
+	socklen_t sl;
+
+	pif_sockaddr(c, &a, &sl, PIF_HOST, &sockside->oaddr, sockside->oport);
+
+	if (bind(conn->sock, &a.sa, sizeof(a))) {
+		int rc = -errno;
+		flow_perror(conn, "Failed to bind socket for migrated flow");
+		return rc;
+	}
+
+	return 0;
 }
 
 /**
@@ -3616,6 +3627,9 @@ int tcp_flow_migrate_target_ext(struct ctx *c, struct tcp_tap_conn *conn, int fd
 
 	if (conn->sock < 0)
 		/* We weren't able to create the socket, discard flow */
+		goto fail;
+
+	if (tcp_flow_repair_bind(c, conn))
 		goto fail;
 
 	if (tcp_flow_repair_timestamp(conn, &t))

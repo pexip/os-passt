@@ -61,27 +61,22 @@
 #define STRINGIFY(x)	#x
 #define STR(x)		STRINGIFY(x)
 
-#ifdef CPPCHECK_6936
+void abort_with_msg(const char *fmt, ...)
+	__attribute__((format(printf, 1, 2), noreturn));
+
 /* Some cppcheck versions get confused by aborts inside a loop, causing
  * it to give false positive uninitialised variable warnings later in
  * the function, because it doesn't realise the non-initialising path
  * already exited.  See https://trac.cppcheck.net/ticket/13227
+ *
+ * Therefore, avoid using the usual do while wrapper we use to force the macro
+ * to act like a single statement requiring a ';'.
  */
-#define ASSERT(expr)		\
-	((expr) ? (void)0 : abort())
-#else
+#define ASSERT_WITH_MSG(expr, ...)					\
+	((expr) ? (void)0 : abort_with_msg(__VA_ARGS__))
 #define ASSERT(expr)							\
-	do {								\
-		if (!(expr)) {						\
-			err("ASSERTION FAILED in %s (%s:%d): %s",	\
-			    __func__, __FILE__, __LINE__, STRINGIFY(expr)); \
-			/* This may actually SIGSYS, due to seccomp,	\
-			 * but that will still get the job done		\
-			 */						\
-			abort();					\
-		}							\
-	} while (0)
-#endif
+	ASSERT_WITH_MSG((expr), "ASSERTION FAILED in %s (%s:%d): %s",	\
+			__func__, __FILE__, __LINE__, STRINGIFY(expr))
 
 #ifdef P_tmpdir
 #define TMPDIR		P_tmpdir
@@ -375,6 +370,16 @@ static inline int wrap_accept4(int sockfd, struct sockaddr *addr,
 }
 #define accept4(s, addr, addrlen, flags) \
 	wrap_accept4((s), (addr), (addrlen), (flags))
+
+static inline int wrap_getsockname(int sockfd, struct sockaddr *addr,
+/* cppcheck-suppress constParameterPointer */
+				   socklen_t *addrlen)
+{
+	sa_init(addr, addrlen);
+	return getsockname(sockfd, addr, addrlen);
+}
+#define getsockname(s, addr, addrlen) \
+	wrap_getsockname((s), (addr), (addrlen))
 
 #define PASST_MAXDNAME 254 /* 253 (RFC 1035) + 1 (the terminator) */
 void encode_domain_name(char *buf, const char *domain_name);

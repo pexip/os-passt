@@ -75,9 +75,28 @@ CHECK_FRAME_LEN(L2_MAX_LEN_PASTA);
 CHECK_FRAME_LEN(L2_MAX_LEN_PASST);
 CHECK_FRAME_LEN(L2_MAX_LEN_VU);
 
+/* We try size the packet pools so that we can use a single batch for the entire
+ * packet buffer.  This might be exceeded for vhost-user, though, which uses its
+ * own buffers rather than pkt_buf.
+ *
+ * This is just a tuning parameter, the code will work with slightly more
+ * overhead if it's incorrect.  So, we estimate based on the minimum practical
+ * frame size - an empty UDP datagram - rather than the minimum theoretical
+ * frame size.
+ *
+ * FIXME: Profile to work out how big this actually needs to be to amortise
+ *        per-batch syscall overheads
+ */
+#define TAP_MSGS_IP4							\
+	DIV_ROUND_UP(sizeof(pkt_buf),					\
+		     ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr))
+#define TAP_MSGS_IP6							\
+	DIV_ROUND_UP(sizeof(pkt_buf),					\
+		     ETH_HLEN + sizeof(struct ipv6hdr) + sizeof(struct udphdr))
+
 /* IPv4 (plus ARP) and IPv6 message batches from tap/guest to IP handlers */
-static PACKET_POOL_NOINIT(pool_tap4, TAP_MSGS, pkt_buf);
-static PACKET_POOL_NOINIT(pool_tap6, TAP_MSGS, pkt_buf);
+static PACKET_POOL_NOINIT(pool_tap4, TAP_MSGS_IP4, pkt_buf);
+static PACKET_POOL_NOINIT(pool_tap6, TAP_MSGS_IP6, pkt_buf);
 
 #define TAP_SEQS		128 /* Different L4 tuples in one batch */
 #define FRAGMENT_MSG_RATE	10  /* # seconds between fragment warnings */
@@ -540,6 +559,7 @@ PACKET_POOL_DECL(pool_l4, UIO_MAXIOV, pkt_buf);
  * struct l4_seq4_t - Message sequence for one protocol handler call, IPv4
  * @msgs:	Count of messages in sequence
  * @protocol:	Protocol number
+ * @ttl:	Time to live
  * @source:	Source port
  * @dest:	Destination port
  * @saddr:	Source address
@@ -548,6 +568,7 @@ PACKET_POOL_DECL(pool_l4, UIO_MAXIOV, pkt_buf);
  */
 static struct tap4_l4_t {
 	uint8_t protocol;
+	uint8_t ttl;
 
 	uint16_t source;
 	uint16_t dest;
@@ -567,6 +588,7 @@ static struct tap4_l4_t {
  * @dest:	Destination port
  * @saddr:	Source address
  * @daddr:	Destination address
+ * @hop_limit:	Hop limit
  * @msg:	Array of messages that can be handled in a single call
  */
 static struct tap6_l4_t {
@@ -578,6 +600,8 @@ static struct tap6_l4_t {
 
 	struct in6_addr saddr;
 	struct in6_addr daddr;
+
+	uint8_t hop_limit;
 
 	struct pool_l4_t p;
 } tap6_l4[TAP_SEQS /* Arbitrary: TAP_MSGS in theory, so limit in users */];
@@ -767,7 +791,8 @@ resume:
 #define L4_MATCH(iph, uh, seq)							\
 	((seq)->protocol == (iph)->protocol &&					\
 	 (seq)->source   == (uh)->source    && (seq)->dest  == (uh)->dest &&	\
-	 (seq)->saddr.s_addr == (iph)->saddr && (seq)->daddr.s_addr == (iph)->daddr)
+	 (seq)->saddr.s_addr == (iph)->saddr &&				\
+	 (seq)->daddr.s_addr == (iph)->daddr && (seq)->ttl == (iph)->ttl)
 
 #define L4_SET(iph, uh, seq)						\
 	do {								\
@@ -776,6 +801,7 @@ resume:
 		(seq)->dest		= (uh)->dest;			\
 		(seq)->saddr.s_addr	= (iph)->saddr;			\
 		(seq)->daddr.s_addr	= (iph)->daddr;			\
+		(seq)->ttl		= (iph)->ttl;			\
 	} while (0)
 
 		if (seq && L4_MATCH(iph, uh, seq) && seq->p.count < UIO_MAXIOV)
@@ -824,7 +850,7 @@ append:
 			for (k = 0; k < p->count; )
 				k += udp_tap_handler(c, PIF_TAP, AF_INET,
 						     &seq->saddr, &seq->daddr,
-						     p, k, now);
+						     seq->ttl, p, k, now);
 		}
 	}
 
@@ -947,7 +973,8 @@ resume:
 		 (seq)->dest == (uh)->dest                 &&		\
 		 (seq)->flow_lbl == ip6_get_flow_lbl(ip6h) &&		\
 		 IN6_ARE_ADDR_EQUAL(&(seq)->saddr, saddr)  &&		\
-		 IN6_ARE_ADDR_EQUAL(&(seq)->daddr, daddr))
+		 IN6_ARE_ADDR_EQUAL(&(seq)->daddr, daddr)  &&		\
+		 (seq)->hop_limit == (ip6h)->hop_limit)
 
 #define L4_SET(ip6h, proto, uh, seq)					\
 	do {								\
@@ -957,6 +984,7 @@ resume:
 		(seq)->flow_lbl	= ip6_get_flow_lbl(ip6h);		\
 		(seq)->saddr	= *saddr;				\
 		(seq)->daddr	= *daddr;				\
+		(seq)->hop_limit = (ip6h)->hop_limit;			\
 	} while (0)
 
 		if (seq && L4_MATCH(ip6h, proto, uh, seq) &&
@@ -1007,7 +1035,7 @@ append:
 			for (k = 0; k < p->count; )
 				k += udp_tap_handler(c, PIF_TAP, AF_INET6,
 						     &seq->saddr, &seq->daddr,
-						     p, k, now);
+						     seq->hop_limit, p, k, now);
 		}
 	}
 
@@ -1042,8 +1070,10 @@ void tap_handler(struct ctx *c, const struct timespec *now)
  * @c:		Execution context
  * @l2len:	Total L2 packet length
  * @p:		Packet buffer
+ * @now:	Current timestamp
  */
-void tap_add_packet(struct ctx *c, ssize_t l2len, char *p)
+void tap_add_packet(struct ctx *c, ssize_t l2len, char *p,
+		    const struct timespec *now)
 {
 	const struct ethhdr *eh;
 
@@ -1059,9 +1089,17 @@ void tap_add_packet(struct ctx *c, ssize_t l2len, char *p)
 	switch (ntohs(eh->h_proto)) {
 	case ETH_P_ARP:
 	case ETH_P_IP:
+		if (pool_full(pool_tap4)) {
+			tap4_handler(c, pool_tap4, now);
+			pool_flush(pool_tap4);
+		}
 		packet_add(pool_tap4, l2len, p);
 		break;
 	case ETH_P_IPV6:
+		if (pool_full(pool_tap6)) {
+			tap6_handler(c, pool_tap6, now);
+			pool_flush(pool_tap6);
+		}
 		packet_add(pool_tap6, l2len, p);
 		break;
 	default:
@@ -1142,7 +1180,7 @@ static void tap_passt_input(struct ctx *c, const struct timespec *now)
 		p += sizeof(uint32_t);
 		n -= sizeof(uint32_t);
 
-		tap_add_packet(c, l2len, p);
+		tap_add_packet(c, l2len, p, now);
 
 		p += l2len;
 		n -= l2len;
@@ -1207,7 +1245,7 @@ static void tap_pasta_input(struct ctx *c, const struct timespec *now)
 		    len > (ssize_t)L2_MAX_LEN_PASTA)
 			continue;
 
-		tap_add_packet(c, len, pkt_buf + n);
+		tap_add_packet(c, len, pkt_buf + n, now);
 	}
 
 	tap_handler(c, now);
@@ -1405,8 +1443,8 @@ void tap_sock_update_pool(void *base, size_t size)
 {
 	int i;
 
-	pool_tap4_storage = PACKET_INIT(pool_tap4, TAP_MSGS, base, size);
-	pool_tap6_storage = PACKET_INIT(pool_tap6, TAP_MSGS, base, size);
+	pool_tap4_storage = PACKET_INIT(pool_tap4, TAP_MSGS_IP4, base, size);
+	pool_tap6_storage = PACKET_INIT(pool_tap6, TAP_MSGS_IP6, base, size);
 
 	for (i = 0; i < TAP_SEQS; i++) {
 		tap4_l4[i].p = PACKET_INIT(pool_l4, UIO_MAXIOV, base, size);
