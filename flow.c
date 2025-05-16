@@ -396,18 +396,27 @@ const struct flowside *flow_initiate_af(union flow *flow, uint8_t pif,
  * @flow:	Flow to change state
  * @pif:	pif of the initiating side
  * @ssa:	Source socket address
+ * @daddr:	Destination address (may be NULL)
  * @dport:	Destination port
  *
  * Return: pointer to the initiating flowside information
  */
 struct flowside *flow_initiate_sa(union flow *flow, uint8_t pif,
 				  const union sockaddr_inany *ssa,
+				  const union inany_addr *daddr,
 				  in_port_t dport)
 {
 	struct flowside *ini = &flow->f.side[INISIDE];
 
-	inany_from_sockaddr(&ini->eaddr, &ini->eport, ssa);
-	if (inany_v4(&ini->eaddr))
+	if (inany_from_sockaddr(&ini->eaddr, &ini->eport, ssa) < 0) {
+		char str[SOCKADDR_STRLEN];
+
+		ASSERT_WITH_MSG(0, "Bad socket address %s",
+				sockaddr_ntop(ssa, str, sizeof(str)));
+	}
+	if (daddr)
+		ini->oaddr = *daddr;
+	else if (inany_v4(&ini->eaddr))
 		ini->oaddr = inany_any4;
 	else
 		ini->oaddr = inany_any6;
@@ -751,19 +760,30 @@ flow_sidx_t flow_lookup_af(const struct ctx *c,
  * @proto:	Protocol of the flow (IP L4 protocol number)
  * @pif:	Interface of the flow
  * @esa:	Socket address of the endpoint
+ * @oaddr:	Our address (may be NULL)
  * @oport:	Our port number
  *
  * Return: sidx of the matching flow & side, FLOW_SIDX_NONE if not found
  */
 flow_sidx_t flow_lookup_sa(const struct ctx *c, uint8_t proto, uint8_t pif,
-			   const void *esa, in_port_t oport)
+			   const void *esa,
+			   const union inany_addr *oaddr, in_port_t oport)
 {
 	struct flowside side = {
 		.oport = oport,
 	};
 
-	inany_from_sockaddr(&side.eaddr, &side.eport, esa);
-	if (inany_v4(&side.eaddr))
+	if (inany_from_sockaddr(&side.eaddr, &side.eport, esa) < 0) {
+		char str[SOCKADDR_STRLEN];
+
+		warn("Flow lookup on bad socket address %s",
+		     sockaddr_ntop(esa, str, sizeof(str)));
+		return FLOW_SIDX_NONE;
+	}
+
+	if (oaddr)
+		side.oaddr = *oaddr;
+	else if (inany_v4(&side.eaddr))
 		side.oaddr = inany_any4;
 	else
 		side.oaddr = inany_any6;
@@ -780,6 +800,7 @@ void flow_defer_handler(const struct ctx *c, const struct timespec *now)
 {
 	struct flow_free_cluster *free_head = NULL;
 	unsigned *last_next = &flow_first_free;
+	bool to_free[FLOW_MAX] = { 0 };
 	bool timer = false;
 	union flow *flow;
 
@@ -790,9 +811,44 @@ void flow_defer_handler(const struct ctx *c, const struct timespec *now)
 
 	ASSERT(!flow_new_entry); /* Incomplete flow at end of cycle */
 
-	flow_foreach_slot(flow) {
+	/* Check which flows we might need to close first, but don't free them
+	 * yet as it's not safe to do that in the middle of flow_foreach().
+	 */
+	flow_foreach(flow) {
 		bool closed = false;
 
+		switch (flow->f.type) {
+		case FLOW_TYPE_NONE:
+			ASSERT(false);
+			break;
+		case FLOW_TCP:
+			closed = tcp_flow_defer(&flow->tcp);
+			break;
+		case FLOW_TCP_SPLICE:
+			closed = tcp_splice_flow_defer(&flow->tcp_splice);
+			if (!closed && timer)
+				tcp_splice_timer(c, &flow->tcp_splice);
+			break;
+		case FLOW_PING4:
+		case FLOW_PING6:
+			if (timer)
+				closed = icmp_ping_timer(c, &flow->ping, now);
+			break;
+		case FLOW_UDP:
+			closed = udp_flow_defer(c, &flow->udp, now);
+			if (!closed && timer)
+				closed = udp_flow_timer(c, &flow->udp, now);
+			break;
+		default:
+			/* Assume other flow types don't need any handling */
+			;
+		}
+
+		to_free[FLOW_IDX(flow)] = closed;
+	}
+
+	/* Second step: actually free the flows */
+	flow_foreach_slot(flow) {
 		switch (flow->f.state) {
 		case FLOW_STATE_FREE: {
 			unsigned skip = flow->free.n;
@@ -825,59 +881,30 @@ void flow_defer_handler(const struct ctx *c, const struct timespec *now)
 			break;
 
 		case FLOW_STATE_ACTIVE:
-			/* Nothing to do */
-			break;
+			if (to_free[FLOW_IDX(flow)]) {
+				flow_set_state(&flow->f, FLOW_STATE_FREE);
+				memset(flow, 0, sizeof(*flow));
 
-		default:
-			ASSERT(false);
-		}
-
-		switch (flow->f.type) {
-		case FLOW_TYPE_NONE:
-			ASSERT(false);
-			break;
-		case FLOW_TCP:
-			closed = tcp_flow_defer(&flow->tcp);
-			break;
-		case FLOW_TCP_SPLICE:
-			closed = tcp_splice_flow_defer(&flow->tcp_splice);
-			if (!closed && timer)
-				tcp_splice_timer(c, &flow->tcp_splice);
-			break;
-		case FLOW_PING4:
-		case FLOW_PING6:
-			if (timer)
-				closed = icmp_ping_timer(c, &flow->ping, now);
-			break;
-		case FLOW_UDP:
-			closed = udp_flow_defer(&flow->udp);
-			if (!closed && timer)
-				closed = udp_flow_timer(c, &flow->udp, now);
-			break;
-		default:
-			/* Assume other flow types don't need any handling */
-			;
-		}
-
-		if (closed) {
-			flow_set_state(&flow->f, FLOW_STATE_FREE);
-			memset(flow, 0, sizeof(*flow));
-
-			if (free_head) {
-				/* Add slot to current free cluster */
-				ASSERT(FLOW_IDX(flow) ==
-				       FLOW_IDX(free_head) + free_head->n);
-				free_head->n++;
-				flow->free.n = flow->free.next = 0;
+				if (free_head) {
+					/* Add slot to current free cluster */
+					ASSERT(FLOW_IDX(flow) ==
+					    FLOW_IDX(free_head) + free_head->n);
+					free_head->n++;
+					flow->free.n = flow->free.next = 0;
+				} else {
+					/* Create new free cluster */
+					free_head = &flow->free;
+					free_head->n = 1;
+					*last_next = FLOW_IDX(flow);
+					last_next = &free_head->next;
+				}
 			} else {
-				/* Create new free cluster */
-				free_head = &flow->free;
-				free_head->n = 1;
-				*last_next = FLOW_IDX(flow);
-				last_next = &free_head->next;
+				free_head = NULL;
 			}
-		} else {
-			free_head = NULL;
+			break;
+
+		default:
+			ASSERT(false);
 		}
 	}
 

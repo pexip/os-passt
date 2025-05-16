@@ -8,8 +8,6 @@
 
 #include "tap.h" /* needed by udp_meta_t */
 
-#define UDP_MAX_FRAMES		32  /* max # of frames to receive at once */
-
 /**
  * struct udp_payload_t - UDP header and data for inbound messages
  * @uh:		UDP header
@@ -30,5 +28,7 @@ size_t udp_update_hdr4(struct iphdr *ip4h, struct udp_payload_t *bp,
 size_t udp_update_hdr6(struct ipv6hdr *ip6h, struct udp_payload_t *bp,
                        const struct flowside *toside, size_t dlen,
 		       bool no_udp_csum);
-int udp_sock_errs(const struct ctx *c, union epoll_ref ref, uint32_t events);
+void udp_sock_fwd(const struct ctx *c, int s, uint8_t frompif,
+		  in_port_t port, const struct timespec *now);
+
 #endif /* UDP_INTERNAL_H */
