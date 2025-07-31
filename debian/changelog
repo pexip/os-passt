@@ -1,3 +1,9 @@
+passt (0.0~git20250503.587980c-2) unstable; urgency=high
+
+  * Fix potential failed assertion on outbound broadcast packets
+
+ -- Stefano Brivio <sbrivio@redhat.com>  Wed, 14 May 2025 17:00:48 +0200
+
 passt (0.0~git20250503.587980c-1+pexip25u1) pexip-trixie; urgency=medium
 
   * New upstream release
