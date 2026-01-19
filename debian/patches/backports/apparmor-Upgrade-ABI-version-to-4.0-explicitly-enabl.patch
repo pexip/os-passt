@@ -1,0 +1,134 @@
+From 81c6fb64cebf3d90610d365be4305be1fa0060fe Mon Sep 17 00:00:00 2001
+From: Stefano Brivio <sbrivio@redhat.com>
+Date: Sat, 10 Jan 2026 14:15:44 +0100
+Subject: [PATCH] apparmor: Upgrade ABI version to 4.0, explicitly enable user
+ namespace creation
+
+In the 3.0 AppArmor ABI version we currently use, user namespace rules
+are not supported, and, as long as we load confined profiles, those
+implicitly allow creation of user namespaces.
+
+However, ABI version 4.0 introduces rules for user namespaces, and if
+we don't specify any, we can't create user namespaces, see:
+
+  https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction
+
+This wouldn't affect us in general, given that we're using the 3.0
+ABI, but libvirt's policy uses 4.0 instead, and if our abstractions
+are used from there, no matter what ABI policy version we declare,
+rules for user namespace creation now match ABI policy version 4.0.
+
+As a result, when libvirtd runs as root, and its profile includes
+passt's abstraction, cf. commit 66769c2de825 ("apparmor: Workaround
+for unconfined libvirtd when triggered by unprivileged user"), passt
+can't detach user namespaces and will fail to start, as reported by
+Niklas:
+
+  ERROR    internal error: Child process (passt --one-off --socket /run/libvirt/qemu/passt/1-haos-net0.socket --pid /run/libvirt/qemu/passt/1-haos-net0-passt.pid --tcp-ports 8123) unexpected exit status 1: Multiple interfaces with IPv6 routes, picked first
+  UNIX domain socket bound at /run/libvirt/qemu/passt/1-haos-net0.socket
+  Couldn't create user namespace: Permission denied
+
+This isn't a problem with libvirtd running as regular user, because
+in that case, as a workaround, passt currently runs under its own
+profile, not as a libvirtd subprofile (see commit referenced above).
+
+Given that ABI 4.0 has been around for a while, being introduced in
+July 2023, finally take the step to upgrade to it and explicitly
+enable user namespace creation.
+
+No further changes are needed in the existing policies to match new
+features introduced in AppArmor 4.0.
+
+Reported-by: Niklas Edmundsson <nikke@accum.se>
+Link: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1124801
+Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+
+Origin: upstream, commit:faab79cfd56a
+Bug-Debian: https://bugs.debian.org/1124801
+Forwarded: not-needed
+Applied-Ustream: 2026_01_17.81c97f6, commit:faab79cfd56a
+Last-Update: 2026-01-18
+---
+ contrib/apparmor/abstractions/passt   | 3 ++-
+ contrib/apparmor/abstractions/pasta   | 2 +-
+ contrib/apparmor/usr.bin.passt        | 2 +-
+ contrib/apparmor/usr.bin.passt-repair | 2 +-
+ contrib/apparmor/usr.bin.pasta        | 2 +-
+ 5 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/contrib/apparmor/abstractions/passt b/contrib/apparmor/abstractions/passt
+index 43fd63f..033d093 100644
+--- a/contrib/apparmor/abstractions/passt
++++ b/contrib/apparmor/abstractions/passt
+@@ -11,7 +11,7 @@
+ # Copyright (c) 2022 Red Hat GmbH
+ # Author: Stefano Brivio <sbrivio@redhat.com>
+ 
+-  abi <abi/3.0>,
++  abi <abi/4.0>,
+ 
+   include <abstractions/base>
+ 
+@@ -24,6 +24,7 @@
+   capability setpcap,
+   capability net_admin,
+   capability sys_ptrace,
++  userns,
+ 
+   /					r,	# isolate_prefork(), isolation.c
+   mount options=(rw, runbindable) -> /,
+diff --git a/contrib/apparmor/abstractions/pasta b/contrib/apparmor/abstractions/pasta
+index 9f73bee..251d4a2 100644
+--- a/contrib/apparmor/abstractions/pasta
++++ b/contrib/apparmor/abstractions/pasta
+@@ -11,7 +11,7 @@
+ # Copyright (c) 2022 Red Hat GmbH
+ # Author: Stefano Brivio <sbrivio@redhat.com>
+ 
+-  abi <abi/3.0>,
++  abi <abi/4.0>,
+ 
+   include <abstractions/passt>
+ 
+diff --git a/contrib/apparmor/usr.bin.passt b/contrib/apparmor/usr.bin.passt
+index 62a4514..c123a86 100644
+--- a/contrib/apparmor/usr.bin.passt
++++ b/contrib/apparmor/usr.bin.passt
+@@ -11,7 +11,7 @@
+ # Copyright (c) 2022 Red Hat GmbH
+ # Author: Stefano Brivio <sbrivio@redhat.com>
+ 
+-abi <abi/3.0>,
++abi <abi/4.0>,
+ 
+ include <tunables/global>
+ 
+diff --git a/contrib/apparmor/usr.bin.passt-repair b/contrib/apparmor/usr.bin.passt-repair
+index 901189d..23ff1ce 100644
+--- a/contrib/apparmor/usr.bin.passt-repair
++++ b/contrib/apparmor/usr.bin.passt-repair
+@@ -11,7 +11,7 @@
+ # Copyright (c) 2025 Red Hat GmbH
+ # Author: Stefano Brivio <sbrivio@redhat.com>
+ 
+-abi <abi/3.0>,
++abi <abi/4.0>,
+ 
+ #include <tunables/global>
+ 
+diff --git a/contrib/apparmor/usr.bin.pasta b/contrib/apparmor/usr.bin.pasta
+index 2483968..56b5024 100644
+--- a/contrib/apparmor/usr.bin.pasta
++++ b/contrib/apparmor/usr.bin.pasta
+@@ -11,7 +11,7 @@
+ # Copyright (c) 2022 Red Hat GmbH
+ # Author: Stefano Brivio <sbrivio@redhat.com>
+ 
+-abi <abi/3.0>,
++abi <abi/4.0>,
+ 
+ include <tunables/global>
+ 
+-- 
+2.43.0
+
