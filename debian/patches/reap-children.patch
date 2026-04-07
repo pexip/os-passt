@@ -1,3 +1,5 @@
+Ensure that all exited children are reaped properly
+
 --- passt.orig/pasta.c
 +++ passt/pasta.c
 @@ -87,6 +87,18 @@ void pasta_child_handler(int signal)

@@ -1,3 +1,5 @@
+Call setsid first on daemonize.
+
 Index: passt/util.c
 ===================================================================
 --- passt.orig/util.c

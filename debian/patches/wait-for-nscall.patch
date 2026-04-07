@@ -1,3 +1,5 @@
+Explicitly wait for child to exit in NS_CALL
+
 --- passt.orig/util.h
 +++ passt/util.h
 @@ -17,6 +17,7 @@

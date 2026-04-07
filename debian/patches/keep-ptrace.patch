@@ -1,3 +1,6 @@
+Always retain CAP_SYS_PTRACE initially so that we can join
+existing netns paths in the same userns
+
 Index: passt/isolation.c
 ===================================================================
 --- passt.orig/isolation.c
